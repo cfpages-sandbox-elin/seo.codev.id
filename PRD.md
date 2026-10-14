@@ -26,9 +26,9 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **BLD-01** | Compile fullstack client & worker bundle (`pnpm build`) | ✅ Completed | Assistant | `dist/client`, `dist/server`, `dist/open_seo_audit`, `tsc` 0 errors |
 | **DOC-01** | Author 9-service Cloudflare Free Tier audit in MD hub | ✅ Completed | Assistant | `KNOWLEDGE/CLOUDFLARE_FREE_TIER/` (9 docs + index) |
 | **DOC-02** | Author master deployment plan in MD hub | ✅ Completed | Assistant | `PLANS/SEO-CODEV-ID-DEPLOYMENT-PLAN.md` |
-| **FRK-01** | Create GitHub fork with upstream remote tracking | 🔄 In Progress | Assistant / Syamsul | Fork created with `origin` and `upstream` tracking |
-| **CFG-01** | Create `.env.selfhost` configuration file | ⏳ Pending | Assistant | Template generated from `deploy/.env.selfhost.example` |
-| **CFG-02** | Configure `deploy/alchemy/alchemy.run.ts` for `seo.codev.id` | ⏳ Pending | Assistant | Custom domain support added to selfhost stage |
+| **FRK-01** | Create GitHub fork with upstream remote tracking | ✅ Completed | Assistant | `cfpages-sandbox-elin/seo.codev.id` live with `origin` + `upstream` |
+| **CFG-01** | Create `.env.selfhost` configuration file | ✅ Completed | Assistant | `.env.selfhost` generated with `CUSTOM_DOMAIN=seo.codev.id` |
+| **CFG-02** | Configure `deploy/alchemy/alchemy.run.ts` for `seo.codev.id` | ✅ Completed | Assistant | Custom domain & Zero Trust Access support committed (`e884f819`) |
 | **CFG-03** | Provide DataForSEO API credentials | ⏳ Pending | Syamsul | `DATAFORSEO_API_KEY` set in `.env.selfhost` |
 | **CFG-04** | Set authorized team emails | ⏳ Pending | Syamsul | `ACCESS_ALLOWED_EMAILS` set in `.env.selfhost` |
 | **AUTH-01**| Authenticate Cloudflare CLI (`pnpm alchemy login`) | ⏳ Pending | Syamsul | Scope `access:write` enabled |
