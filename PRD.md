@@ -42,11 +42,11 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **MOD-02** | Implement `src/custom/serpCache.ts` (R2 SERP Deduplication Engine) | ✅ Completed | Assistant | Zero-cost 24h shared SERP cache for sister domains |
 | **MOD-03** | Thin hook injection in `src/server/lib/dataforseo/serp.ts` | ✅ Completed | Assistant | 2-line clean hook preserving upstream mergeability |
 | **MOD-04** | Unit tests for SERP caching & multi-site deduplication | ✅ Completed | Assistant | 100% vitest pass for `serpCache.test.ts` & `serp.test.ts` |
-| **CLS-01** | Define 13 canonical Vertical Clusters mapping for 87 domains | ✅ Completed | Assistant | Codified from `PORTFOLIO/PROJECTS_CATEGORIES.md` |
-| **CLS-02** | Migrate D1 database: 13 cluster projects + 87 tracked domain configs | ✅ Completed | Assistant | 13 cluster projects & 90 domain configs active in D1 |
-| **DOC-03** | Document Cluster Model & Fork-Safe Module Guide in MD Hub | 🔄 In Progress | Assistant | `KNOWLEDGE-OPEN-SEO.md` and `MEMORY.md` updated |
+| **CLS-01** | Define 13 canonical Vertical Clusters mapping for 87 domains | ✅ Completed | Assistant | Reconciled against `PROJECTS_GITHUB.md` & `PROJECTS_CATEGORIES.md` |
+| **CLS-02** | Migrate D1 database: 13 cluster projects + 226 verified domains/subdomains | ✅ Completed | Assistant | Eradicated 31 hallucinated domains (e.g. `partisi.id` -> `partisi.co.id`); 226 live sites & subdomains active in D1 |
+| **DOC-03** | Document Cluster Model & Ground-Truth Subdomain Guide in MD Hub | ✅ Completed | Assistant | `KNOWLEDGE-OPEN-SEO.md` updated with 226 ground-truth site catalog |
 | **REV-01** | Run Open Code Review (`ocr review`) on custom modules | ✅ Completed | Assistant | Clean gate verification before publication (delegation mode) |
-| **PUB-01** | Commit & push to GitHub fork and sync private MD Git mirror | ✅ Completed | Assistant | Parity with remote main verified (`884665b5`) |
+| **PUB-01** | Commit & push to GitHub fork and sync private MD Git mirror | ✅ Completed | Assistant | Parity with remote main verified (`884665b5`, `6bd791de`) |
 
 ---
 
