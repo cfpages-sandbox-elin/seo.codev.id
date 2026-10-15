@@ -37,7 +37,16 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **ZTR-01** | Configure Zero Trust Access Application & Gate | ✅ Completed | Syamsul / Assistant | Zero Trust Access active for `admin@alampintar.org` and `email@codev.id` |
 | **OPS-01** | Add R2 7-day lifecycle expiration rule | ✅ Completed | Assistant | Bucket `open-seo-r2-selfhost` active with auto-expiry |
 | **OPS-02** | Validate runtime edge response | ✅ Completed | Assistant | Edge returns 302 login redirect to Zero Trust team gate |
-| **MCP-01** | Connect local AI agents (Codex, Claude Code) to `/mcp` | ⏳ Ready | Assistant | Agent MCP loopback ready to connect |
+| **MCP-01** | Connect local AI agents (Codex, Claude, agy, cmdc) to `/mcp` | ✅ Completed | Assistant | Cross-harness MCP registered across 7 AI tools |
+| **MOD-01** | Architecture: Create isolated custom extension directory `src/custom/` | ✅ Completed | Assistant | Isolate fork modifications from upstream code |
+| **MOD-02** | Implement `src/custom/serpCache.ts` (R2 SERP Deduplication Engine) | ✅ Completed | Assistant | Zero-cost 24h shared SERP cache for sister domains |
+| **MOD-03** | Thin hook injection in `src/server/lib/dataforseo/serp.ts` | ✅ Completed | Assistant | 2-line clean hook preserving upstream mergeability |
+| **MOD-04** | Unit tests for SERP caching & multi-site deduplication | ✅ Completed | Assistant | 100% vitest pass for `serpCache.test.ts` & `serp.test.ts` |
+| **CLS-01** | Define 13 canonical Vertical Clusters mapping for 87 domains | ✅ Completed | Assistant | Codified from `PORTFOLIO/PROJECTS_CATEGORIES.md` |
+| **CLS-02** | Migrate D1 database: 13 cluster projects + 87 tracked domain configs | ✅ Completed | Assistant | 13 cluster projects & 90 domain configs active in D1 |
+| **DOC-03** | Document Cluster Model & Fork-Safe Module Guide in MD Hub | 🔄 In Progress | Assistant | `KNOWLEDGE-OPEN-SEO.md` and `MEMORY.md` updated |
+| **REV-01** | Run Open Code Review (`ocr review`) on custom modules | ✅ Completed | Assistant | Clean gate verification before publication (delegation mode) |
+| **PUB-01** | Commit & push to GitHub fork and sync private MD Git mirror | 🔄 In Progress | Assistant | Parity with remote main verified |
 
 ---
 

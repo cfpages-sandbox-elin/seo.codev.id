@@ -7,6 +7,7 @@ vi.mock("@/server/lib/runtime-env", () => ({
 import { DataforseoChargedTaskError } from "@/server/lib/dataforseo/envelope";
 import {
   fetchLiveSerp,
+  fetchRankCheckSerp,
   fetchLocalSerpTaskResult,
   fetchRankCheckTaskResult,
   postLocalSerpTasks,
@@ -55,6 +56,72 @@ describe("live SERP", () => {
       data: [],
       billing: { costUsd: 0.002 },
     });
+  });
+});
+
+describe("fetchRankCheckSerp", () => {
+  it("fetches live SERP and finds organic match for target domain", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn<typeof fetch>().mockResolvedValue(
+        Response.json({
+          status_code: 20000,
+          tasks: [
+            {
+              status_code: 20000,
+              path: ["v3", "serp", "google", "organic", "live", "advanced"],
+              cost: 0.002,
+              result: [
+                {
+                  items: [
+                    {
+                      type: "organic",
+                      rank_group: 1,
+                      rank_absolute: 1,
+                      domain: "competitor.com",
+                      url: "https://competitor.com",
+                    },
+                    {
+                      type: "organic",
+                      rank_group: 2,
+                      rank_absolute: 2,
+                      domain: "toiletcubicle.co.id",
+                      url: "https://toiletcubicle.co.id/partisi",
+                    },
+                    {
+                      type: "organic",
+                      rank_group: 3,
+                      rank_absolute: 3,
+                      domain: "cubicle.id",
+                      url: "https://cubicle.id/harga",
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        }),
+      ),
+    );
+
+    const res1 = await fetchRankCheckSerp({
+      keyword: "partisi toilet",
+      keywordId: "kw-1",
+      locationCode: 2360,
+      languageCode: "id",
+      device: "mobile",
+      targetDomain: "toiletcubicle.co.id",
+      depth: 20,
+    });
+
+    expect(res1.data).toEqual({
+      keywordId: "kw-1",
+      keyword: "partisi toilet",
+      position: 2,
+      url: "https://toiletcubicle.co.id/partisi",
+      serpFeatures: ["organic"],
+    });
+    expect(res1.billing.costUsd).toBe(0.002);
   });
 });
 

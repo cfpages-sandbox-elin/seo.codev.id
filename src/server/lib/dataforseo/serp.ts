@@ -14,8 +14,14 @@ import {
   type DataforseoItemsTask,
   type DataforseoTaskLike,
   failedResponseError,
+  type DataforseoApiCallCost,
 } from "@/server/lib/dataforseo/envelope";
 import { AppError } from "@/server/lib/errors";
+import {
+  CACHED_SERP_BILLING,
+  getCachedSerp,
+  setCachedSerp,
+} from "@/custom/serpCache";
 
 // Default depth for keyword SERP analysis. DataForSEO crawls (and bills) one
 // Google page of 10 results at a time, and the crawls are sequential, so depth
@@ -87,19 +93,39 @@ const serpSnapshotItemSchema = z
 
 export type SerpLiveItem = z.infer<typeof serpSnapshotItemSchema>;
 
-export async function fetchLiveSerp(input: {
+/**
+ * Shared live SERP fetcher with automatic 24-hour R2 caching and multi-tenant deduplication.
+ * Multiple sites or projects checking rankings for the exact same keyword in the same market
+ * will hit this shared cache, eliminating redundant DataForSEO SERP scraping and costs.
+ */
+async function getOrFetchLiveSerpItems(input: {
   keyword: string;
   locationCode: number;
   languageCode: string;
   depth?: number;
-  /** Canonical DataForSEO name of a city, county, or region for a local SERP. */
   locationName?: string;
   device?: "desktop" | "mobile";
-}): Promise<DataforseoApiResponse<SerpLiveItem[]>> {
+}): Promise<{ items: SerpLiveItem[]; billing: DataforseoApiCallCost }> {
+  const depth = clampSerpDepth(input.depth ?? SERP_ANALYSIS_DEPTH);
   const device = input.device ?? "desktop";
   const locationParams = input.locationName
     ? { location_name: input.locationName }
     : { location_code: input.locationCode };
+
+  const cacheParams = {
+    keyword: input.keyword,
+    locationCode: input.locationCode,
+    languageCode: input.languageCode,
+    locationName: input.locationName,
+    device,
+    depth,
+  };
+
+  const cached = await getCachedSerp(cacheParams);
+  if (cached) {
+    return { items: cached, billing: CACHED_SERP_BILLING };
+  }
+
   const response = await dataforseoPost(
     "/v3/serp/google/organic/live/advanced",
     [
@@ -109,20 +135,41 @@ export async function fetchLiveSerp(input: {
         language_code: input.languageCode,
         device,
         os: device === "desktop" ? "windows" : "android",
-        depth: clampSerpDepth(input.depth ?? SERP_ANALYSIS_DEPTH),
+        depth,
       },
     ],
   );
+
   // DataForSEO uses a task error for a valid empty SERP. Keep the charged
   // response in the normal billing path and return an empty item list.
   const task = assertOk(response, { treatNoResultsAsEmpty: true });
+  const items = parseTaskItems(
+    "google-organic-live-advanced",
+    task,
+    serpSnapshotItemSchema,
+  );
+
+  await setCachedSerp(cacheParams, items);
+
   return {
-    data: parseTaskItems(
-      "google-organic-live-advanced",
-      task,
-      serpSnapshotItemSchema,
-    ),
+    items,
     billing: buildTaskBilling(task),
+  };
+}
+
+export async function fetchLiveSerp(input: {
+  keyword: string;
+  locationCode: number;
+  languageCode: string;
+  depth?: number;
+  /** Canonical DataForSEO name of a city, county, or region for a local SERP. */
+  locationName?: string;
+  device?: "desktop" | "mobile";
+}): Promise<DataforseoApiResponse<SerpLiveItem[]>> {
+  const res = await getOrFetchLiveSerpItems(input);
+  return {
+    data: res.items,
+    billing: res.billing,
   };
 }
 
@@ -169,37 +216,18 @@ export async function fetchRankCheckSerp(input: {
   targetDomain: string;
   depth: number;
 }): Promise<DataforseoApiResponse<RankCheckResult>> {
-  const depth = clampSerpDepth(input.depth);
-  const locationParams = input.locationName
-    ? { location_name: input.locationName }
-    : { location_code: input.locationCode };
-  const response = await dataforseoPost(
-    "/v3/serp/google/organic/live/advanced",
-    [
-      {
-        keyword: input.keyword,
-        ...locationParams,
-        language_code: input.languageCode,
-        device: input.device,
-        os: input.device === "desktop" ? "windows" : "android",
-        depth,
-        ...stopCrawlOnTarget(input.targetDomain),
-      },
-    ],
-  );
-
-  // "No Search Results" (40501) is valid for obscure/new keywords — treat as an
-  // empty result set rather than failing the whole rank-tracking run.
-  const task = assertOk(response, { treatNoResultsAsEmpty: true });
-  const items = parseTaskItems(
-    "google-organic-live-advanced",
-    task,
-    serpSnapshotItemSchema,
-  );
+  const res = await getOrFetchLiveSerpItems({
+    keyword: input.keyword,
+    locationCode: input.locationCode,
+    languageCode: input.languageCode,
+    locationName: input.locationName,
+    device: input.device,
+    depth: input.depth,
+  });
 
   return {
-    data: buildRankCheckResult(input, items),
-    billing: buildTaskBilling(task),
+    data: buildRankCheckResult(input, res.items),
+    billing: res.billing,
   };
 }
 
