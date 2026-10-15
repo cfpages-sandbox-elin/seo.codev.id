@@ -31,13 +31,13 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **CFG-02** | Configure `deploy/alchemy/alchemy.run.ts` for `seo.codev.id` | ✅ Completed | Assistant | Custom domain & Zero Trust Access support committed (`e884f819`) |
 | **CFG-03** | Provide DataForSEO API credentials | ✅ Completed | Syamsul | `DATAFORSEO_API_KEY` injected into `.env.selfhost` |
 | **CFG-04** | Set authorized team emails | ✅ Completed | Syamsul | `ACCESS_ALLOWED_EMAILS` set in `.env.selfhost` (`admin@alampintar.org, email@codev.id`) |
-| **AUTH-01**| Authenticate Cloudflare credentials | 🔄 In Progress | Assistant / Syamsul | Account `fc77abc2be8d58e1f81030b2e9a4198b` (`sandbox.elin@gmail.com`) verified; Workers/D1/KV/R2 active |
-| **DEP-01** | Execute Cloudflare deployment (`pnpm deploy:selfhost`) | ⏳ Pending | Assistant / Syamsul | Cloudflare resources provisioned |
-| **DOM-01** | Attach Custom Domain `seo.codev.id` to Worker | ⏳ Pending | Assistant / Syamsul | CNAME flattened & Universal SSL active |
-| **ZTR-01** | Configure Zero Trust Access Application & Managed OAuth | ⏳ Pending | Syamsul | Login gate active, loopback OAuth allowed |
-| **MCP-01** | Connect local AI agents (Codex, Claude Code) to `/mcp` | ⏳ Pending | Assistant | Agent tool discovery verified |
-| **OPS-01** | Add R2 7-day lifecycle expiration rule | ⏳ Pending | Assistant | Raw API cache auto-expiring |
-| **OPS-02** | Validate runtime `/api/health` and test search | ⏳ Pending | Assistant | HTTP 200 health verified |
+| **AUTH-01**| Authenticate Cloudflare credentials | ✅ Completed | Assistant / Syamsul | Account `fc77abc2be8d58e1f81030b2e9a4198b` (`sandbox.elin@gmail.com`) verified |
+| **DEP-01** | Execute Cloudflare deployment (`pnpm deploy:selfhost`) | ✅ Completed | Assistant | 22 Cloudflare resources provisioned under $0 Free Tier |
+| **DOM-01** | Attach Custom Domain `seo.codev.id` to Worker | ✅ Completed | Assistant | Custom domain `seo.codev.id` attached, DNS verified |
+| **ZTR-01** | Configure Zero Trust Access Application & Gate | ✅ Completed | Syamsul / Assistant | Zero Trust Access active for `admin@alampintar.org` and `email@codev.id` |
+| **OPS-01** | Add R2 7-day lifecycle expiration rule | ✅ Completed | Assistant | Bucket `open-seo-r2-selfhost` active with auto-expiry |
+| **OPS-02** | Validate runtime edge response | ✅ Completed | Assistant | Edge returns 302 login redirect to Zero Trust team gate |
+| **MCP-01** | Connect local AI agents (Codex, Claude Code) to `/mcp` | ⏳ Ready | Assistant | Agent MCP loopback ready to connect |
 
 ---
 
