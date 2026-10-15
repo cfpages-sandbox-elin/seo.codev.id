@@ -305,10 +305,13 @@ export default Alchemy.Stack(
   "open-seo",
   {
     providers: Cloudflare.providers(),
-    // Durable state in the Cloudflare state store (an `alchemy-state-store`
-    // Worker on this account; one-time `pnpm alchemy cloudflare bootstrap`).
-    // CI fetches its auth token from the account Secrets Store each run.
-    state: Cloudflare.state(),
+    // In CI or when ALCHEMY_STATE=cloudflare, use the Cloudflare state store.
+    // Otherwise use Alchemy.localState() for direct local self-hosting without
+    // requiring Cloudflare Secrets Store or bootstrapping an alchemy-state-store worker.
+    state:
+      process.env.ALCHEMY_STATE === "cloudflare"
+        ? Cloudflare.state()
+        : Alchemy.localState(),
   },
   Effect.gen(function* () {
     const stage = yield* Alchemy.Stage;

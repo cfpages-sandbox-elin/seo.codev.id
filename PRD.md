@@ -29,9 +29,9 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **FRK-01** | Create GitHub fork with upstream remote tracking | ✅ Completed | Assistant | `cfpages-sandbox-elin/seo.codev.id` live with `origin` + `upstream` |
 | **CFG-01** | Create `.env.selfhost` configuration file | ✅ Completed | Assistant | `.env.selfhost` generated with `CUSTOM_DOMAIN=seo.codev.id` |
 | **CFG-02** | Configure `deploy/alchemy/alchemy.run.ts` for `seo.codev.id` | ✅ Completed | Assistant | Custom domain & Zero Trust Access support committed (`e884f819`) |
-| **CFG-03** | Provide DataForSEO API credentials | ⏳ Pending | Syamsul | `DATAFORSEO_API_KEY` set in `.env.selfhost` |
-| **CFG-04** | Set authorized team emails | ⏳ Pending | Syamsul | `ACCESS_ALLOWED_EMAILS` set in `.env.selfhost` |
-| **AUTH-01**| Authenticate Cloudflare CLI (`pnpm alchemy login`) | ⏳ Pending | Syamsul | Scope `access:write` enabled |
+| **CFG-03** | Provide DataForSEO API credentials | ✅ Completed | Syamsul | `DATAFORSEO_API_KEY` injected into `.env.selfhost` |
+| **CFG-04** | Set authorized team emails | ✅ Completed | Syamsul | `ACCESS_ALLOWED_EMAILS` set in `.env.selfhost` (`admin@alampintar.org, email@codev.id`) |
+| **AUTH-01**| Authenticate Cloudflare credentials | 🔄 In Progress | Assistant / Syamsul | Account `fc77abc2be8d58e1f81030b2e9a4198b` (`sandbox.elin@gmail.com`) verified; Workers/D1/KV/R2 active |
 | **DEP-01** | Execute Cloudflare deployment (`pnpm deploy:selfhost`) | ⏳ Pending | Assistant / Syamsul | Cloudflare resources provisioned |
 | **DOM-01** | Attach Custom Domain `seo.codev.id` to Worker | ⏳ Pending | Assistant / Syamsul | CNAME flattened & Universal SSL active |
 | **ZTR-01** | Configure Zero Trust Access Application & Managed OAuth | ⏳ Pending | Syamsul | Login gate active, loopback OAuth allowed |
