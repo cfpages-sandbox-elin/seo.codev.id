@@ -47,6 +47,10 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **DOC-03** | Document Cluster Model & Ground-Truth Subdomain Guide in MD Hub | ✅ Completed | Assistant | `KNOWLEDGE-OPEN-SEO.md` updated with 226 ground-truth site catalog |
 | **REV-01** | Run Open Code Review (`ocr review`) on custom modules | ✅ Completed | Assistant | Clean gate verification before publication (delegation mode) |
 | **PUB-01** | Commit & push to GitHub fork and sync private MD Git mirror | ✅ Completed | Assistant | Parity with remote main verified (`884665b5`, `6bd791de`) |
+| **GSC-01** | OAuth Credentials & Secret Injection (`GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `BETTER_AUTH_SECRET`) | ✅ Completed | Assistant | Injected into `.env.selfhost` without credential exposure |
+| **GSC-02** | Reconcile Worker runtime environment (`pnpm alchemy deploy --yes`) | ✅ Completed | Assistant | Worker bindings updated on Cloudflare, `googleOAuthConfigured` enabled |
+| **GSC-03** | Google Cloud Console Configuration (Redirect URIs & Search Console API) | 🔄 In Progress | Syamsul / Assistant | Instructions prepared for Google Cloud Console setup |
+| **GSC-04** | Verify Search Console OAuth flow & Property linking on `seo.codev.id` | ⏳ Pending | Syamsul / Assistant | Awaiting Google Cloud Console redirect URI registration |
 
 ---
 
