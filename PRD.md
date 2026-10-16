@@ -61,9 +61,9 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **FLEET-PUB** | Commit & Push to Pilot Repos via Git Database API | ✅ Completed | Assistant | Zero-disk upgrades delivered across Wave 1 repos |
 | **FLEET-WV1** | Pilot Fleet Execution: Toilet.Cubicle.co.id, kaca.co.id, Partisi.co.id | ✅ Completed | Assistant | 1,029 pages modified, +10,074 internal links, +17,911 alts enriched |
 | **FLEET-WV2** | Wave 2 Rollout: 8 High-Priority Repos (epoxy, Basmi, besi, etc.) | ✅ Completed | Assistant | 25,418 pages modified, +638,933 internal links, +643,842 alts enriched |
-| **FLEET-BCK** | Sync OneDrive MD Hub & Scripts to Private Git Mirror | 🔄 In Progress | Assistant | Publish-MDGitBackup.ps1 verified clean on remote main |
+| **FLEET-BCK** | Sync OneDrive MD Hub & Scripts to Private Git Mirror | ✅ Completed | Assistant | Published commit 778cc482, private parity verified |
 | **FLEET-LOG** | Upsert durable milestone entry in `%OneDrive%\MD\LOGS.md` | ✅ Completed | Assistant | Stable thread ID keyed update naming Gemini harness |
-| **FLEET-AUD** | Re-run Cluster Audits on `seo.codev.id` to verify zero 404 / alt issues | ⏳ Pending | Assistant | Verify audit remediation on live platform |
+| **FLEET-AUD** | Re-run Cluster Audits on `seo.codev.id` to verify zero 404 / alt issues | ✅ Completed | Assistant | 3 cluster audits launched via Cloudflare Workflows (`kaca.co.id`, `epoxy.co.id`, `partisi.co.id`) |
 
 
 ---
