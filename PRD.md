@@ -53,6 +53,17 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **GSC-04** | Verify Search Console OAuth flow & Property linking on `seo.codev.id` | ⏳ Pending | Syamsul / Assistant | Awaiting Google Cloud Console redirect URI registration |
 | **AUD-01** | Execute Site Audits across all 13 Vertical Clusters via Cloudflare Workflows | ✅ Completed | Assistant | 15 audits executed, 100% crawl completed in D1 |
 | **AUD-02** | Technical SEO Issue Diagnostic & Root-Cause Remediation Blueprint | ✅ Completed | Assistant | Discovered hardcoded `noindex` on `partisi.co.id`, Cloudflare `/cdn-cgi/` 404 links, and metadata fixes |
+| **FLEET-DES** | Engineering Design for Fleet Robots.txt & Heuristic 80/20 Image Alt Engine | ✅ Completed | Assistant | Authored `OPERATIONS/PROJECTS/ENGINEERING_DESIGN_ROBOTS_AND_IMAGE_SEO.md` |
+| **FLEET-ENG** | Implement High-Efficiency Heuristic Python Engine (`fix_seo_images_and_robots.py`) | ✅ Completed | Assistant | Permalinks heuristic, 80/20 Pareto Tier-1 weighting, byte-level regex |
+| **FLEET-WF** | Create Canonical GitHub Actions Workflow (`seo-image-and-robots-fix.yml`) | ✅ Completed | Assistant | Packaged in `%OneDrive%\MD\YAML\canonical` |
+| **FLEET-TST** | Verify & Benchmark on Local Checkout (`Toilet.Cubicle.co.id`) | ✅ Completed | Assistant | Verified robots.txt, 80/20 link distribution, alt attributes, clean diff |
+| **FLEET-OCR** | Run Open Code Review (`ocr review`) on Script and Workflow | ✅ Completed | Assistant | Clean gate verification via delegation model |
+| **FLEET-PUB** | Commit & Push to Pilot Repos via Git Database API | ✅ Completed | Assistant | Zero-disk upgrades delivered across Wave 1 repos |
+| **FLEET-WV1** | Pilot Fleet Execution: Toilet.Cubicle.co.id, kaca.co.id, Partisi.co.id | ✅ Completed | Assistant | 1,029 pages modified, +10,074 internal links, +17,911 alts enriched |
+| **FLEET-WV2** | Wave 2 Rollout: 8 High-Priority Repos (epoxy, Basmi, besi, etc.) | ✅ Completed | Assistant | 25,418 pages modified, +638,933 internal links, +643,842 alts enriched |
+| **FLEET-BCK** | Sync OneDrive MD Hub & Scripts to Private Git Mirror | 🔄 In Progress | Assistant | Publish-MDGitBackup.ps1 verified clean on remote main |
+| **FLEET-LOG** | Upsert durable milestone entry in `%OneDrive%\MD\LOGS.md` | ✅ Completed | Assistant | Stable thread ID keyed update naming Gemini harness |
+| **FLEET-AUD** | Re-run Cluster Audits on `seo.codev.id` to verify zero 404 / alt issues | ⏳ Pending | Assistant | Verify audit remediation on live platform |
 
 
 ---
