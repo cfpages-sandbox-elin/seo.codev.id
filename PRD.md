@@ -51,6 +51,9 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **GSC-02** | Reconcile Worker runtime environment (`pnpm alchemy deploy --yes`) | ✅ Completed | Assistant | Worker bindings updated on Cloudflare, `googleOAuthConfigured` enabled |
 | **GSC-03** | Google Cloud Console Configuration (Redirect URIs & Search Console API) | 🔄 In Progress | Syamsul / Assistant | Instructions prepared for Google Cloud Console setup |
 | **GSC-04** | Verify Search Console OAuth flow & Property linking on `seo.codev.id` | ⏳ Pending | Syamsul / Assistant | Awaiting Google Cloud Console redirect URI registration |
+| **AUD-01** | Execute Site Audits across all 13 Vertical Clusters via Cloudflare Workflows | ✅ Completed | Assistant | 15 audits executed, 100% crawl completed in D1 |
+| **AUD-02** | Technical SEO Issue Diagnostic & Root-Cause Remediation Blueprint | ✅ Completed | Assistant | Discovered hardcoded `noindex` on `partisi.co.id`, Cloudflare `/cdn-cgi/` 404 links, and metadata fixes |
+
 
 ---
 
