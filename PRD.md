@@ -65,9 +65,9 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **FLEET-LOG** | Upsert durable milestone entry in `%OneDrive%\MD\LOGS.md` | ✅ Completed | Assistant | Stable thread ID keyed update naming Gemini harness |
 | **FLEET-AUD** | Re-run Cluster Audits on `seo.codev.id` to verify zero 404 / alt issues | ✅ Completed | Assistant | 3 cluster audits launched via Cloudflare Workflows (`kaca.co.id`, `epoxy.co.id`, `partisi.co.id`) |
 | **FLEET-FULL-ENG** | Engine & Workflow Patch: Eradicate `[skip ci]` to guarantee Cloudflare Pages production deploys | ✅ Completed | Assistant | Removed `[skip ci]` from commit step in `seo-image-and-robots-fix.yml`, synced to mirror |
-| **FLEET-FULL-RUN** | Full Fleet Rollout: Zero-Disk Git Database API Upgrade & Dispatch across 243 Remaining Repos | 🔄 In Progress | Assistant | Bounded batch execution with rate-limit pacing and automatic Actions dispatch |
-| **FLEET-FULL-VFY** | Full Fleet Verification: Audit CI run conclusions, commits, and Cloudflare Pages triggers | ⏳ Pending | Assistant | Conservation partition: 254 in-scope = 11 prior + 243 newly completed; 0 pending |
-| **FLEET-FULL-LOG** | Durable Documentation & Private Git Backup Mirror Parity for 254-Repo Fleet | ⏳ Pending | Assistant | Update `LOGS.md`, `ENGINEERING_DESIGN_ROBOTS_AND_IMAGE_SEO.md`, and Git mirror |
+| **FLEET-FULL-RUN** | Full Fleet Rollout: Zero-Disk Git Database API Upgrade & Dispatch across 243 Remaining Repos | ✅ Completed | Assistant | 243 remaining repositories upgraded and dispatched via Git Database API; 0 MB disk consumed |
+| **FLEET-FULL-VFY** | Full Fleet Verification: Audit CI run conclusions, commits, and Cloudflare Pages triggers | ✅ Completed | Assistant | 100% verified conservation partition: 254 in-scope compliant (11 prior + 243 newly completed; 0 pending, 2 excluded); resolved flat HTML globbing and directory edge cases |
+| **FLEET-FULL-LOG** | Durable Documentation & Private Git Backup Mirror Parity for 254-Repo Fleet | ✅ Completed | Assistant | Engineering design doc Section 6 updated, LOGS.md row 18 upserted, and private Git mirror synced |
 
 
 ---
