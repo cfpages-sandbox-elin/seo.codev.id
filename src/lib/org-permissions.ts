@@ -19,6 +19,8 @@ const statement = {
   project: ["create", "delete"],
   // GSC/GA4 connect, re-point, disconnect.
   integration: ["manage"],
+  // Helicopter view across the 87-domain portfolio fleet.
+  fleet: ["view"],
 } as const;
 
 export const orgAccessControl = createAccessControl(statement);
@@ -29,17 +31,20 @@ export const orgRoles = {
     billing: ["manage"],
     project: ["create", "delete"],
     integration: ["manage"],
+    fleet: ["view"],
   }),
   admin: orgAccessControl.newRole({
     ...adminAc.statements,
     project: ["create", "delete"],
     integration: ["manage"],
+    fleet: ["view"],
   }),
   // Defined from day one so exposing it later is UI-only; not offered in the
   // invite picker yet. Members can view everything and run research, but not
   // manage the org, billing, projects, or integrations.
   member: orgAccessControl.newRole({
     ...memberAc.statements,
+    fleet: ["view"],
   }),
 };
 

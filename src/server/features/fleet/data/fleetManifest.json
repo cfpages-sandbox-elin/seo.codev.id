@@ -1,0 +1,808 @@
+[
+  {
+    "canonicalHost": "kaca.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admfiresafety/kaca.co.id",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "besi.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adistyputriharli/besi.co.id",
+    "clusterSlug": "besi"
+  },
+  {
+    "canonicalHost": "concrete.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adistyputriharli/Concrete.co.id",
+    "clusterSlug": "concrete"
+  },
+  {
+    "canonicalHost": "epoxy.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adistyputriharli/epoxy.co.id",
+    "clusterSlug": "epoxy"
+  },
+  {
+    "canonicalHost": "epoxylantai.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admtravelbos/epoxylantai.co.id",
+    "clusterSlug": "epoxy"
+  },
+  {
+    "canonicalHost": "kontraktorepoxy.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "epoxy"
+  },
+  {
+    "canonicalHost": "partisi.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adistyputriharli/Partisi.co.id",
+    "clusterSlug": "partisi"
+  },
+  {
+    "canonicalHost": "partisiruangan.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "partisi"
+  },
+  {
+    "canonicalHost": "cubicle.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "cubicle.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "kubikel.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "kubikel.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "toiletcubicle.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admkaca/toilet.cubicle.co.id",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "toiletphenolic.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "phenolic.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admfiresafety/phenolic.id",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "almini.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "kacafilm.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adistyputriharli/KacaFilm.co.id",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "kacatempered.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "kawat.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adminalampintar/kawat.id",
+    "clusterSlug": "besi"
+  },
+  {
+    "canonicalHost": "kayu.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "furnitur"
+  },
+  {
+    "canonicalHost": "galvalume.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "besi"
+  },
+  {
+    "canonicalHost": "steel.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "besi"
+  },
+  {
+    "canonicalHost": "lantai.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "epoxy"
+  },
+  {
+    "canonicalHost": "material.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 3",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "plafond.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "partisi"
+  },
+  {
+    "canonicalHost": "bengkel-las.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "bengkel"
+  },
+  {
+    "canonicalHost": "bengkel.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "bengkel"
+  },
+  {
+    "canonicalHost": "berat.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admtravelbos/alat.berat.id",
+    "clusterSlug": "bengkel"
+  },
+  {
+    "canonicalHost": "cutting.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "bengkel"
+  },
+  {
+    "canonicalHost": "fasad.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "jalan.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "concrete"
+  },
+  {
+    "canonicalHost": "pabrikasi.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "bengkel"
+  },
+  {
+    "canonicalHost": "portabel.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adistyputriharli/Portabel.id",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "trowel.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adistyputriharli/trowel.id",
+    "clusterSlug": "epoxy"
+  },
+  {
+    "canonicalHost": "tukang.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "bengkel"
+  },
+  {
+    "canonicalHost": "elevator.co.id",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admfiresafety/Elevator.co.id",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "firesafety.co.id",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "safety.co.id",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admtravelbos/Safety.co.id",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "pumps.id",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admfiresafety/pumps.id",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "genset.co.id",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "hvac-r.id",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "lampu.co.id",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "kolam.co.id",
+    "category": "Landscape and pools",
+    "categoryEmoji": "🌿",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "taman"
+  },
+  {
+    "canonicalHost": "kolam.id",
+    "category": "Landscape and pools",
+    "categoryEmoji": "🌿",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "taman"
+  },
+  {
+    "canonicalHost": "kontraktorkolam.co.id",
+    "category": "Landscape and pools",
+    "categoryEmoji": "🌿",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "taman"
+  },
+  {
+    "canonicalHost": "saung.id",
+    "category": "Landscape and pools",
+    "categoryEmoji": "🌿",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "taman"
+  },
+  {
+    "canonicalHost": "taman.co.id",
+    "category": "Landscape and pools",
+    "categoryEmoji": "🌿",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "taman"
+  },
+  {
+    "canonicalHost": "basmi.co.id",
+    "category": "Building hygiene",
+    "categoryEmoji": "🧹",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adistyputriharli/Basmi.co.id",
+    "clusterSlug": "basmi"
+  },
+  {
+    "canonicalHost": "advert.id",
+    "category": "Advertising and media",
+    "categoryEmoji": "📣",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adminalampintar/advert.id",
+    "clusterSlug": "advert"
+  },
+  {
+    "canonicalHost": "outdooradvertising.co.id",
+    "category": "Advertising and media",
+    "categoryEmoji": "📣",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admfiresafety/OutdoorAdvertising.co.id",
+    "clusterSlug": "advert"
+  },
+  {
+    "canonicalHost": "cetak.co.id",
+    "category": "Printing and production",
+    "categoryEmoji": "🖨️",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "advert"
+  },
+  {
+    "canonicalHost": "furnitur.co.id",
+    "category": "Furniture and interiors",
+    "categoryEmoji": "🪑",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "furnitur"
+  },
+  {
+    "canonicalHost": "florist.co.id",
+    "category": "Flowers and floristry",
+    "categoryEmoji": "🌸",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-adminalampintar/Florist.co.id",
+    "clusterSlug": "florist"
+  },
+  {
+    "canonicalHost": "floral.id",
+    "category": "Flowers and floristry",
+    "categoryEmoji": "🌸",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "florist"
+  },
+  {
+    "canonicalHost": "weddingevent.co.id",
+    "category": "Weddings and events",
+    "categoryEmoji": "💍",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "florist"
+  },
+  {
+    "canonicalHost": "katering.co.id",
+    "category": "Food and catering",
+    "categoryEmoji": "🍽️",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "florist"
+  },
+  {
+    "canonicalHost": "panggung.id",
+    "category": "Event infrastructure",
+    "categoryEmoji": "🎪",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "florist"
+  },
+  {
+    "canonicalHost": "suvenir.id",
+    "category": "Souvenirs and gifts",
+    "categoryEmoji": "🎁",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "florist"
+  },
+  {
+    "canonicalHost": "franchisee.id",
+    "category": "Franchise network",
+    "categoryEmoji": "🤝",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "react_spa",
+    "clusterSlug": "franchise"
+  },
+  {
+    "canonicalHost": "franchisor.id",
+    "category": "Franchise network",
+    "categoryEmoji": "🤝",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "react_spa",
+    "repoName": "cfpages-admtravelbos/Franchisor.id",
+    "clusterSlug": "franchise"
+  },
+  {
+    "canonicalHost": "entrepreneurship.id",
+    "category": "Entrepreneurship",
+    "categoryEmoji": "🚀",
+    "tier": "Tier 2",
+    "siteIntent": "brand",
+    "platform": "wordpress_static",
+    "clusterSlug": "franchise"
+  },
+  {
+    "canonicalHost": "duit.co.id",
+    "category": "Financial education",
+    "categoryEmoji": "💰",
+    "tier": "Tier 2",
+    "siteIntent": "brand",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-alamcodevid/duit.co.id",
+    "clusterSlug": "franchise"
+  },
+  {
+    "canonicalHost": "denah.id",
+    "category": "Architecture and design",
+    "categoryEmoji": "🏡",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "furnitur"
+  },
+  {
+    "canonicalHost": "sertifikat.co.id",
+    "category": "Certificates and documents",
+    "categoryEmoji": "📜",
+    "tier": "Tier 2",
+    "siteIntent": "utility",
+    "platform": "wordpress_static",
+    "clusterSlug": "codev"
+  },
+  {
+    "canonicalHost": "jemaah.id",
+    "category": "Religious and community",
+    "categoryEmoji": "🕌",
+    "tier": "Tier 3",
+    "siteIntent": "brand",
+    "platform": "wordpress_static",
+    "clusterSlug": "codev"
+  },
+  {
+    "canonicalHost": "alampintar.org",
+    "category": "Education and social",
+    "categoryEmoji": "🎓",
+    "tier": "Tier 2",
+    "siteIntent": "brand",
+    "platform": "wordpress_static",
+    "clusterSlug": "codev"
+  },
+  {
+    "canonicalHost": "codev.id",
+    "category": "Software and code",
+    "categoryEmoji": "💻",
+    "tier": "Tier 1",
+    "siteIntent": "brand",
+    "platform": "astro",
+    "clusterSlug": "codev"
+  },
+  {
+    "canonicalHost": "lusmo.id",
+    "category": "Company identity",
+    "categoryEmoji": "🏢",
+    "tier": "Tier 2",
+    "siteIntent": "brand",
+    "platform": "wordpress_static",
+    "clusterSlug": "codev"
+  },
+  {
+    "canonicalHost": "coiner.dev",
+    "category": "Crypto technology",
+    "categoryEmoji": "🪙",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "react_spa",
+    "clusterSlug": "codev"
+  },
+  {
+    "canonicalHost": "filtrasi.com",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "repoName": "cfpages-admfiresafety/Filtrasi.com",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "syamsulalam.com",
+    "category": "Personal identity",
+    "categoryEmoji": "👤",
+    "tier": "Tier 2",
+    "siteIntent": "brand",
+    "platform": "wordpress_static",
+    "clusterSlug": "codev"
+  },
+  {
+    "canonicalHost": "pramanadwijaya.com",
+    "category": "Personal identity",
+    "categoryEmoji": "👤",
+    "tier": "Tier 3",
+    "siteIntent": "brand",
+    "platform": "wordpress_static",
+    "clusterSlug": "codev"
+  },
+  {
+    "canonicalHost": "acp.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "batu.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "taman"
+  },
+  {
+    "canonicalHost": "canopy.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "genteng.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "partisi"
+  },
+  {
+    "canonicalHost": "interior.co.id",
+    "category": "Furniture and interiors",
+    "categoryEmoji": "🪑",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "furnitur"
+  },
+  {
+    "canonicalHost": "pagar.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "besi"
+  },
+  {
+    "canonicalHost": "pintu.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "kaca"
+  },
+  {
+    "canonicalHost": "renovasi.co.id",
+    "category": "Construction trades",
+    "categoryEmoji": "🏗️",
+    "tier": "Tier 1",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "bengkel"
+  },
+  {
+    "canonicalHost": "rooftop.co.id",
+    "category": "Landscape and pools",
+    "categoryEmoji": "🌿",
+    "tier": "Tier 2",
+    "siteIntent": "lead_gen",
+    "platform": "wordpress_static",
+    "clusterSlug": "taman"
+  },
+  {
+    "canonicalHost": "sanitair.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "cubicle"
+  },
+  {
+    "canonicalHost": "tangga.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "besi"
+  },
+  {
+    "canonicalHost": "teralis.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "besi"
+  },
+  {
+    "canonicalHost": "ventilasi.co.id",
+    "category": "Systems and safety",
+    "categoryEmoji": "⚙️",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "safety"
+  },
+  {
+    "canonicalHost": "wallpaper.co.id",
+    "category": "Furniture and interiors",
+    "categoryEmoji": "🪑",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "furnitur"
+  },
+  {
+    "canonicalHost": "wastafel.co.id",
+    "category": "Construction materials",
+    "categoryEmoji": "🧱",
+    "tier": "Tier 2",
+    "siteIntent": "commercial",
+    "platform": "wordpress_static",
+    "clusterSlug": "cubicle"
+  }
+]

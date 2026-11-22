@@ -22,12 +22,17 @@ function TableCard({ className, ...props }: React.ComponentProps<"div">) {
 function Table({
   className,
   containerClassName,
+  containerProps,
   ...props
-}: React.ComponentProps<"table"> & { containerClassName?: string }) {
+}: React.ComponentProps<"table"> & {
+  containerClassName?: string;
+  containerProps?: React.ComponentProps<"div">;
+}) {
   return (
     <div
       data-slot="table-container"
       className={cn("relative w-full overflow-x-auto", containerClassName)}
+      {...containerProps}
     >
       <table
         data-slot="table"

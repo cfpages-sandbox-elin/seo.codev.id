@@ -6,6 +6,7 @@ import {
   ClipboardCheck,
   FileText,
   Globe,
+  Layers,
   LayoutDashboard,
   Link2,
   MessageSquare,
@@ -95,11 +96,17 @@ const aiNavItem = linkOptions({
   icon: Bot,
 });
 
+const fleetNavItem = linkOptions({
+  to: "/onsite" as const,
+  label: "Fleet Health",
+  icon: Layers,
+});
+
 // Shown only when no project is selected; with a project, Agent setup lives in
 // the "AI Tools" group below.
 export const connectNavGroup = {
   label: "AI Tools",
-  items: [aiNavItem],
+  items: [aiNavItem, fleetNavItem],
 };
 
 function getProjectNavItems(projectId: string) {
@@ -155,6 +162,7 @@ export function getProjectNavGroups(projectId: string) {
         byPath("/p/$projectId/reports"),
         byPath("/p/$projectId/context"),
         aiNavItem,
+        fleetNavItem,
       ],
     },
   ];
