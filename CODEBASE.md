@@ -467,3 +467,11 @@ The [Round 17 report](REPORT-SOL-OPENSEO-AGGREGATED-FLEET-VIEW-ROUND-17-2026-11-
 - **F10 (Matrix Accessibility & Focus Preservation)**: In `FleetMatrixRow.tsx`, promoted domain cell to `<TableHead scope="row">`. In `FleetOverviewView.tsx`, kept the "Reset to triage priority" button mounted with `aria-disabled={sortField === "triage"}` so keyboard focus is never destroyed when triage priority is activated. Differentiated zero-enrolled roster from filter empty states.
 - **Dual-Dialect Schema Parity**: 371/371 Vitest tests passing across SQLite and PostgreSQL, with 100% clean Oxlint (0 warnings, 0 errors) and strict TypeScript compilation.
 
+### Stage 2 Live Edge Deployment & Production Verification (2026-11-22)
+
+- **Production D1 Migration**: Migration `0056_modern_zarda.sql` successfully applied to Cloudflare production D1 database `open-seo-db-selfhost` (`b11700fc-47e9-4eb3-a323-a024d7a2fbaa`). All 10 fleet tables (`fleet_change_events`, `fleet_change_verifications`, `fleet_issue_occurrences`, `fleet_remediation_jobs`, `fleet_roster_members`, `fleet_roster_versions`, `fleet_rule_results`, `fleet_run_items`, `fleet_runs`, `fleet_snapshots`) verified present.
+- **Canonical Roster Seeding**: Approved 87-domain canonical portfolio manifest (`roster-shared-workspace-2026-11-22-v1`, SHA-256 `1185d7b9ee550f2b1bd19e75f5432790c754753a993009cd72d069d6fa91c22f`) seeded into production D1 with all 87 members active and mapped to live projects.
+- **Live Worker Deployment**: Deployed production Worker `open-seo-selfhost` and aux worker `open-seo-selfhost-audit` to `https://seo.codev.id` via Alchemy (`deploy:selfhost`), binding `FEATURE_FLEET_VIEW="true"` and `FLEET_VIEW_ORGANIZATION_ID="shared-workspace"`.
+- **Live Edge Wire Verification**: Verified `https://seo.codev.id/onsite` returns HTTP 302 redirect to Cloudflare Access Zero Trust login (`broken-hill-4163.cloudflareaccess.com`) preserving `redirect_url=%2Fonsite`, eliminating the previous 404 route error.
+
+

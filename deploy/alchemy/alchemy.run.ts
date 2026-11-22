@@ -299,6 +299,8 @@ const dataEnv = {
   // Alchemy reconciles worker vars on every deploy, so the telemetry opt-out
   // must live in the env file — a dashboard-set var would be wiped.
   OPENSEO_TELEMETRY_DISABLED: optionalVar("OPENSEO_TELEMETRY_DISABLED"),
+  FEATURE_FLEET_VIEW: optionalVar("FEATURE_FLEET_VIEW"),
+  FLEET_VIEW_ORGANIZATION_ID: optionalVar("FLEET_VIEW_ORGANIZATION_ID"),
 };
 
 export default Alchemy.Stack(

@@ -19,8 +19,8 @@ import { Route as VerifyEmailRouteImport } from './routes/verify-email'
 import { Route as Char91DotwellKnownChar93OpenaiAppsChallengeRouteImport } from './routes/[.well-known]/openai-apps-challenge'
 import { Route as AppIndexRouteImport } from './routes/_app/index'
 import { Route as AppAiRouteImport } from './routes/_app/ai'
-import { Route as AppOnsiteRouteImport } from './routes/_app/onsite'
 import { Route as AppBillingRouteImport } from './routes/_app/billing'
+import { Route as AppOnsiteRouteImport } from './routes/_app/onsite'
 import { Route as AppProjectsRouteImport } from './routes/_app/projects'
 import { Route as AppSettingsRouteImport } from './routes/_app/settings'
 import { Route as AppSupportRouteImport } from './routes/_app/support'
@@ -121,14 +121,14 @@ const AppAiRoute = AppAiRouteImport.update({
   path: '/ai',
   getParentRoute: () => AppRouteRoute,
 } as any)
-const AppOnsiteRoute = AppOnsiteRouteImport.update({
-  id: '/onsite',
-  path: '/onsite',
-  getParentRoute: () => AppRouteRoute,
-} as any)
 const AppBillingRoute = AppBillingRouteImport.update({
   id: '/billing',
   path: '/billing',
+  getParentRoute: () => AppRouteRoute,
+} as any)
+const AppOnsiteRoute = AppOnsiteRouteImport.update({
+  id: '/onsite',
+  path: '/onsite',
   getParentRoute: () => AppRouteRoute,
 } as any)
 const AppProjectsRoute = AppProjectsRouteImport.update({
@@ -414,8 +414,8 @@ export interface FileRoutesByFullPath {
   '/verify-email': typeof VerifyEmailRoute
   '/.well-known/openai-apps-challenge': typeof Char91DotwellKnownChar93OpenaiAppsChallengeRoute
   '/ai': typeof AppAiRoute
-  '/onsite': typeof AppOnsiteRoute
   '/billing': typeof AppBillingRoute
+  '/onsite': typeof AppOnsiteRoute
   '/projects': typeof AppProjectsRoute
   '/settings': typeof AppSettingsRouteWithChildren
   '/support': typeof AppSupportRoute
@@ -476,8 +476,8 @@ export interface FileRoutesByTo {
   '/verify-email': typeof VerifyEmailRoute
   '/.well-known/openai-apps-challenge': typeof Char91DotwellKnownChar93OpenaiAppsChallengeRoute
   '/ai': typeof AppAiRoute
-  '/onsite': typeof AppOnsiteRoute
   '/billing': typeof AppBillingRoute
+  '/onsite': typeof AppOnsiteRoute
   '/projects': typeof AppProjectsRoute
   '/support': typeof AppSupportRoute
   '/sign-in': typeof AuthSignInRoute
@@ -536,8 +536,8 @@ export interface FileRoutesById {
   '/verify-email': typeof VerifyEmailRoute
   '/.well-known/openai-apps-challenge': typeof Char91DotwellKnownChar93OpenaiAppsChallengeRoute
   '/_app/ai': typeof AppAiRoute
-  '/_app/onsite': typeof AppOnsiteRoute
   '/_app/billing': typeof AppBillingRoute
+  '/_app/onsite': typeof AppOnsiteRoute
   '/_app/projects': typeof AppProjectsRoute
   '/_app/settings': typeof AppSettingsRouteWithChildren
   '/_app/support': typeof AppSupportRoute
@@ -601,9 +601,8 @@ export interface FileRouteTypes {
     | '/verify-email'
     | '/.well-known/openai-apps-challenge'
     | '/ai'
-    | '/onsite'
-    | '/onsite'
     | '/billing'
+    | '/onsite'
     | '/projects'
     | '/settings'
     | '/support'
@@ -664,9 +663,8 @@ export interface FileRouteTypes {
     | '/verify-email'
     | '/.well-known/openai-apps-challenge'
     | '/ai'
-    | '/onsite'
-    | '/onsite'
     | '/billing'
+    | '/onsite'
     | '/projects'
     | '/support'
     | '/sign-in'
@@ -724,8 +722,8 @@ export interface FileRouteTypes {
     | '/verify-email'
     | '/.well-known/openai-apps-challenge'
     | '/_app/ai'
-    | '/_app/onsite'
     | '/_app/billing'
+    | '/_app/onsite'
     | '/_app/projects'
     | '/_app/settings'
     | '/_app/support'
@@ -873,18 +871,18 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AppAiRouteImport
       parentRoute: typeof AppRouteRoute
     }
-    '/_app/onsite': {
-      id: '/_app/onsite'
-      path: '/onsite'
-      fullPath: '/onsite'
-      preLoaderRoute: typeof AppOnsiteRouteImport
-      parentRoute: typeof AppRouteRoute
-    }
     '/_app/billing': {
       id: '/_app/billing'
       path: '/billing'
       fullPath: '/billing'
       preLoaderRoute: typeof AppBillingRouteImport
+      parentRoute: typeof AppRouteRoute
+    }
+    '/_app/onsite': {
+      id: '/_app/onsite'
+      path: '/onsite'
+      fullPath: '/onsite'
+      preLoaderRoute: typeof AppOnsiteRouteImport
       parentRoute: typeof AppRouteRoute
     }
     '/_app/projects': {
@@ -1363,8 +1361,8 @@ const AppPProjectIdRouteRouteWithChildren =
 
 interface AppRouteRouteChildren {
   AppAiRoute: typeof AppAiRoute
-  AppOnsiteRoute: typeof AppOnsiteRoute
   AppBillingRoute: typeof AppBillingRoute
+  AppOnsiteRoute: typeof AppOnsiteRoute
   AppProjectsRoute: typeof AppProjectsRoute
   AppSettingsRoute: typeof AppSettingsRouteWithChildren
   AppSupportRoute: typeof AppSupportRoute
@@ -1377,8 +1375,8 @@ interface AppRouteRouteChildren {
 
 const AppRouteRouteChildren: AppRouteRouteChildren = {
   AppAiRoute: AppAiRoute,
-  AppOnsiteRoute: AppOnsiteRoute,
   AppBillingRoute: AppBillingRoute,
+  AppOnsiteRoute: AppOnsiteRoute,
   AppProjectsRoute: AppProjectsRoute,
   AppSettingsRoute: AppSettingsRouteWithChildren,
   AppSupportRoute: AppSupportRoute,

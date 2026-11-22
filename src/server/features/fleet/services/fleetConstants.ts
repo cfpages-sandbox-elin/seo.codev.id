@@ -112,3 +112,58 @@ export function parseUtcTimestampMs(value?: string | null): number {
   const ms = Date.parse(iso);
   return Number.isFinite(ms) && new Date(ms).toISOString() === iso ? ms : NaN;
 }
+
+/**
+ * Exact Rubric v1 integer arithmetic using rational fractions per PRD §3 (Sol F04).
+ */
+export function computeCanonicalRubricV1Score(pillars: {
+  technical: number;
+  mobilePerf: number;
+  schema: number;
+  onPage: number;
+  ai: number;
+  links: number;
+}): {
+  numerator: number;
+  exactScore: number;
+  flooredScore: number;
+  grade: FleetOfficialGrade;
+} {
+  const pTech = multiplyFractions(
+    numberToFraction(pillars.technical),
+    fraction(BigInt(RUBRIC_V1_WEIGHTS.technical), 100n),
+  );
+  const pMob = multiplyFractions(
+    numberToFraction(pillars.mobilePerf),
+    fraction(BigInt(RUBRIC_V1_WEIGHTS.mobilePerf), 100n),
+  );
+  const pSch = multiplyFractions(
+    numberToFraction(pillars.schema),
+    fraction(BigInt(RUBRIC_V1_WEIGHTS.schema), 100n),
+  );
+  const pOnP = multiplyFractions(
+    numberToFraction(pillars.onPage),
+    fraction(BigInt(RUBRIC_V1_WEIGHTS.onPage), 100n),
+  );
+  const pAi = multiplyFractions(
+    numberToFraction(pillars.ai),
+    fraction(BigInt(RUBRIC_V1_WEIGHTS.ai), 100n),
+  );
+  const pLink = multiplyFractions(
+    numberToFraction(pillars.links),
+    fraction(BigInt(RUBRIC_V1_WEIGHTS.links), 100n),
+  );
+
+  const total = addFractions(
+    addFractions(addFractions(pTech, pMob), addFractions(pSch, pOnP)),
+    addFractions(pAi, pLink),
+  );
+
+  const exactScore = Number(total.n) / Number(total.d);
+  const flooredScore = Number(total.n / total.d);
+  const grade = gradeFor(flooredScore);
+  const numerator = Number((total.n * 10000n) / total.d);
+
+  return { numerator, exactScore, flooredScore, grade };
+}
+
