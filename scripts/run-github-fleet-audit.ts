@@ -304,17 +304,13 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
 
   const candidateFiles = htmlFiles.slice(0, maxPages);
 
-  // Helper to map repo path to public page URL
+  // Helper to map repo path to public page URL using canonical served identities (Sol Snippet 3)
   const pathToUrl = (path: string): string => {
-    let sub = path;
-    if (sub === "index.html" || sub === "index.htm") return `https://${domain}/`;
-    if (sub.endsWith("/index.html")) {
-      return `https://${domain}/${sub.slice(0, -10)}/`;
-    }
-    if (sub.endsWith("/index.htm")) {
-      return `https://${domain}/${sub.slice(0, -9)}/`;
-    }
-    return `https://${domain}/${sub}`;
+    const segments = path.split("/").map(encodeURIComponent);
+    const isDirectoryIndex = /^(?:index\.html|index\.htm)$/i.test(segments.at(-1) ?? "");
+    if (isDirectoryIndex) segments.pop();
+    const pathname = "/" + segments.join("/") + (isDirectoryIndex && segments.length ? "/" : "");
+    return `https://${domain}${pathname}`;
   };
 
   // 3. Fetch and analyze HTML files with paced concurrency
@@ -415,40 +411,44 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
             hreflangTags: analysis.hreflangTags,
             hasStructuredData: analysis.hasStructuredData,
             isIndexable: !analysis.robotsMeta?.toLowerCase().includes("noindex"),
-            crawlDepth: file.path === "index.html" ? 0 : file.path.split("/").length,
-            inSitemap: true,
+            crawlDepth: 0,
+            inSitemap: false,
           };
 
           crawledPages.push(pageResult);
 
-          // Page-level issues
-          const issues = runPageReporters(pageResult);
+          // Page-level issues (filter out unmeasured runtime-only issues e.g. deep-page)
+          const issues = runPageReporters(pageResult).filter(
+            (iss) => (iss.issueType as string) !== "deep-page"
+          );
           detectedIssues.push(...issues);
 
-          // Check internal links against known repository routes
+          // Check internal links against known repository routes using URL resolution (Sol Snippet 3)
           for (const link of analysis.links) {
-            if (link.isInternal) {
-              const targetNorm = normalizeRoute(link.targetUrl);
-              const normPageUrl = normalizeRoute(pageUrl);
+            if (link.isInternal && link.targetUrl) {
+              try {
+                const servedUrl = new URL(pageUrl);
+                const target = new URL(link.targetUrl, servedUrl);
+                if (target.origin === servedUrl.origin) {
+                  const normTarget = normalizeRoute(`https://${domain}${target.pathname}`);
+                  const normPageUrl = normalizeRoute(pageUrl);
 
-              if (targetNorm && targetNorm !== normPageUrl) {
-                if (validRouteSet.has(targetNorm)) {
-                  inboundLinkCounts.set(targetNorm, (inboundLinkCounts.get(targetNorm) || 0) + 1);
-                } else if (
-                  link.targetUrl.startsWith(`https://${domain}`) ||
-                  link.targetUrl.startsWith(`http://${domain}`) ||
-                  link.targetUrl.startsWith("/")
-                ) {
-                  // Internal dead link confirmed
-                  detectedIssues.push({
-                    issueType: "broken-internal-link",
-                    pageId,
-                    pageUrl,
-                    dedupeKey: link.targetUrl,
-                    details: { targetUrl: link.targetUrl, targetStatus: 404 },
-                  });
+                  if (normTarget && normTarget !== normPageUrl) {
+                    if (validRouteSet.has(normTarget)) {
+                      inboundLinkCounts.set(normTarget, (inboundLinkCounts.get(normTarget) || 0) + 1);
+                    } else {
+                      // Internal dead link confirmed
+                      detectedIssues.push({
+                        issueType: "broken-internal-link",
+                        pageId,
+                        pageUrl,
+                        dedupeKey: link.targetUrl,
+                        details: { targetUrl: link.targetUrl },
+                      });
+                    }
+                  }
                 }
-              }
+              } catch {}
             }
           }
         } catch (fetchErr: any) {
@@ -552,24 +552,30 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       executeD1SqlStatements(issueSqlLines);
     }
 
-    // Stage 4: Atomic compare-and-set flip to final status
+    // Stage 4: Atomic compare-and-set flip to final status with child row count reconciliation (Sol P1-5)
     executeD1SqlStatements([
       `UPDATE audits
-       SET status = '${finalStatus}',
+       SET status = 'completed',
            current_phase = 'completed',
            pages_crawled = ${processedCount},
            pages_total = ${htmlFiles.length},
            completed_at = datetime('now')
-       WHERE id = '${auditId}' AND status = 'running';`,
+       WHERE id = '${auditId}'
+         AND status = 'running'
+         AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = '${auditId}') = ${crawledPages.length}
+         AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') = ${detectedIssues.length};`,
     ]);
 
-    // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration
+    // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration strictly scoped to organization and approved roster (Sol P1-6)
     try {
       const rosterRows = runD1Query(
         `SELECT m.id AS member_id, m.version_id, v.organization_id
          FROM fleet_roster_members m
          JOIN fleet_roster_versions v ON v.id = m.version_id
+         JOIN projects p ON p.id = m.project_id
          WHERE m.canonical_host = '${domain.replace(/'/g, "''")}'
+           AND p.organization_id = 'shared-workspace'
+           AND v.organization_id = 'shared-workspace'
          ORDER BY v.approved_at DESC LIMIT 1;`
       );
 
@@ -584,17 +590,18 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
           Math.min(100, Math.round(100 - (detectedIssues.length / Math.max(1, htmlFiles.length)) * 100))
         );
         const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
+        const coverage = Math.round((processedCount / Math.max(1, htmlFiles.length)) * 100);
 
         const diagnosticSql = [
           `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
            VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, datetime('now'), datetime('now'));`,
           `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
            VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', 'completed', 1, datetime('now'), datetime('now'));`,
-          `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, observed_at)
-           VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', 100, 'diagnostic', ${score}, ${score}, ${score}, datetime('now'));`
+          `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_and_perf, score_schema, score_ai_search, observed_at)
+           VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', ${score}, ${score}, ${score}, NULL, NULL, NULL, datetime('now'));`
         ];
         executeD1SqlStatements(diagnosticSql);
-        console.log(`[DIAGNOSTIC] Recorded fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score})`);
+        console.log(`[DIAGNOSTIC] Recorded fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%)`);
       }
     } catch (diagErr: any) {
       console.warn(`[WARN] Diagnostic fleet series linking skipped:`, diagErr?.message || diagErr);
@@ -634,9 +641,18 @@ async function main() {
 
   console.log("=== OpenSEO Zero-Limit GitHub Repository Audit Runner ===");
   const targetDomain = args.values.domain?.toLowerCase().trim();
-  const limit = args.values.limit ? parseInt(args.values.limit, 10) : undefined;
+  const rawLimit = args.values.limit ? parseInt(args.values.limit, 10) : undefined;
+  const limit = rawLimit && Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
   const force = !!args.values.force;
-  const maxPages = parseInt(args.values["max-pages"] || "10000", 10);
+  const isAll = !!args.values.all;
+  const rawMaxPages = parseInt(args.values["max-pages"] || "10000", 10);
+  const maxPages = Number.isFinite(rawMaxPages) && rawMaxPages > 0 ? rawMaxPages : 10000;
+
+  // Sol P1-2: Require explicit execution scope (fail closed against unintended global audits)
+  if (!targetDomain && !isAll && !limit) {
+    console.error("[ERROR] Missing explicit execution scope. Please specify --domain <canonical-host>, --all, or --limit <n>.");
+    process.exit(1);
+  }
 
   // Load project mappings from D1
   const projectRows = runD1Query(
@@ -655,27 +671,27 @@ async function main() {
   console.log(`Loaded ${repoMappings.size} repository mappings from manifest & PROJECTS_GITHUB.md.`);
 
   let candidates: RepoMapping[] = [];
-  for (const [dom, m] of repoMappings.entries()) {
-    const projId = projectIdByDomain.get(dom);
-    if (projId) {
-      if (!force && alreadyAuditedProjectIds.has(projId)) {
-        continue; // Already audited
-      }
-      candidates.push({ ...m, projectId: projId });
-    }
-  }
-
   if (targetDomain) {
-    const exact = candidates.filter((c) => c.domain === targetDomain);
-    if (exact.length === 0) {
-      console.error(`[ERROR] Domain '${targetDomain}' is not found among enrolled unaudited candidate projects.`);
+    const projId = projectIdByDomain.get(targetDomain);
+    const repoMeta = repoMappings.get(targetDomain);
+    if (!projId || !repoMeta) {
+      console.error(`[ERROR] Domain '${targetDomain}' is not found among enrolled projects or repository mappings.`);
       process.exit(1);
     }
-    candidates = exact;
-  }
-
-  if (limit) {
-    candidates = candidates.slice(0, limit);
+    candidates = [{ ...repoMeta, projectId: projId }];
+  } else {
+    for (const [dom, m] of repoMappings.entries()) {
+      const projId = projectIdByDomain.get(dom);
+      if (projId) {
+        if (!force && alreadyAuditedProjectIds.has(projId)) {
+          continue; // Already audited
+        }
+        candidates.push({ ...m, projectId: projId });
+      }
+    }
+    if (limit) {
+      candidates = candidates.slice(0, limit);
+    }
   }
 
   console.log(`Eligible unaudited candidate sites ready for GitHub Direct Audit: ${candidates.length}`);

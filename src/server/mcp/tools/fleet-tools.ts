@@ -11,8 +11,8 @@ function routeIssueToSkill(issueType: string, url: string = ""): {
   skill: string;
   action: string;
 } {
-  const t = issueType.toLowerCase().replace(/-/g, "_");
-  const u = url.toLowerCase();
+  const t = (issueType || "").toLowerCase().replace(/-/g, "_");
+  const u = (url || "").toLowerCase();
 
   if (
     t.includes("broken_image") ||
@@ -136,7 +136,7 @@ export const getFleetIssuesTool = {
               issueType: z.string(),
               severity: z.string(),
               pageUrl: z.string(),
-              targetUrl: z.string().nullable().optional(),
+              targetUrl: z.string().nullable(),
               skillRoute: z.string(),
               recommendedAction: z.string(),
             })
@@ -151,17 +151,15 @@ export const getFleetIssuesTool = {
     },
   },
   handler: async (args: GetFleetIssuesArgs, context: ToolContext) => {
-    const orgId = context.auth.organizationId;
-    const limit = args.limit ?? 50;
-
+    const limit = Math.max(1, Math.min(200, args.limit || 50));
     const conditions = [
-      eq(projects.organizationId, orgId),
+      eq(projects.organizationId, context.auth.organizationId),
       isNull(projects.archivedAt),
       eq(audits.status, "completed"),
     ];
 
     if (args.domain) {
-      conditions.push(eq(projects.domain, args.domain.toLowerCase()));
+      conditions.push(eq(projects.domain, args.domain.toLowerCase().trim()));
     }
     if (args.severity) {
       conditions.push(eq(auditIssues.severity, args.severity));
@@ -170,19 +168,20 @@ export const getFleetIssuesTool = {
       conditions.push(eq(auditIssues.issueType, args.issueType));
     }
 
+    // Sol P1-7: Select authoritative auditIssues.pageUrl directly rather than auditPages.url,
+    // ensuring site-level issues with null pageId are fully preserved with valid URLs.
     const rows = await db
       .select({
         id: auditIssues.id,
         issueType: auditIssues.issueType,
         severity: auditIssues.severity,
         detailsJson: auditIssues.detailsJson,
-        pageUrl: auditPages.url,
+        pageUrl: auditIssues.pageUrl,
         domain: projects.domain,
       })
       .from(auditIssues)
       .innerJoin(audits, eq(audits.id, auditIssues.auditId))
       .innerJoin(projects, eq(projects.id, audits.projectId))
-      .leftJoin(auditPages, eq(auditPages.id, auditIssues.pageId))
       .where(and(...conditions))
       .orderBy(desc(auditIssues.id))
       .limit(limit);
@@ -244,10 +243,13 @@ export const getFleetIssuesTool = {
 
 // ─── run_fleet_audit ────────────────────────────────────────────────────────
 
+const CANONICAL_DOMAIN_REGEX = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
 const runFleetAuditInputSchema = {
   domain: z
     .string()
     .trim()
+    .regex(CANONICAL_DOMAIN_REGEX, "Must be a valid canonical hostname (e.g. 'toiletcubicle.co.id')")
     .optional()
     .describe("Optional target domain to audit (e.g. 'toiletcubicle.co.id'). If omitted, runs fleet runner across eligible domains."),
   mode: z
@@ -277,7 +279,7 @@ export const runFleetAuditTool = {
   config: {
     title: "Run fleet audit",
     description:
-      "Trigger or dispatch fleet-wide site audits across enrolled properties in OpenSEO. Supports 'repository_direct' mode (fast static Git analysis via GitHub CLI) and 'edge_workflow' mode (Cloudflare Workflows live HTTP crawler).",
+      "Plan and configure fleet-wide site audits across enrolled properties in OpenSEO. Supports 'repository_direct' mode (fast static Git analysis via GitHub CLI) and 'edge_workflow' mode (Cloudflare Workflows live HTTP crawler).",
     inputSchema: runFleetAuditInputSchema,
     outputSchema: z
       .object({
@@ -285,33 +287,50 @@ export const runFleetAuditTool = {
         mode: z.string(),
         targetDomain: z.string().nullable().optional(),
         message: z.string(),
+        executable: z.string(),
+        argv: z.array(z.string()),
         executionCommand: z.string(),
         ...optionalMetaOutputSchema,
       })
       .passthrough(),
     annotations: {
-      readOnlyHint: false,
-      openWorldHint: true,
+      readOnlyHint: true,
+      openWorldHint: false,
     },
   },
   handler: async (args: RunFleetAuditArgs, _context: ToolContext) => {
     const mode = args.mode ?? "repository_direct";
-    const domain = args.domain?.toLowerCase();
+    const domain = args.domain?.toLowerCase().trim();
+    const maxPages = args.maxPages || 2000;
+    const concurrency = args.concurrency || 2;
 
-    let cmd = "";
+    let argv: string[] = [];
     if (mode === "repository_direct") {
-      cmd = domain
-        ? `pnpm exec tsx scripts/run-github-fleet-audit.ts --domain ${domain} --max-pages ${args.maxPages || 2000}`
-        : `pnpm exec tsx scripts/run-github-fleet-audit.ts --all --max-pages ${args.maxPages || 2000}`;
+      argv = [
+        "exec",
+        "tsx",
+        "scripts/run-github-fleet-audit.ts",
+        ...(domain ? ["--domain", domain] : ["--all"]),
+        "--max-pages",
+        String(maxPages),
+      ];
     } else {
-      cmd = domain
-        ? `pnpm exec tsx scripts/run-fleet-audits.ts --domain ${domain} --max-pages ${args.maxPages || 2000}`
-        : `pnpm exec tsx scripts/run-fleet-audits.ts --concurrency ${args.concurrency || 2} --max-pages ${args.maxPages || 2000}`;
+      argv = [
+        "exec",
+        "tsx",
+        "scripts/run-fleet-audits.ts",
+        ...(domain ? ["--domain", domain] : []),
+        "--max-pages",
+        String(maxPages),
+        "--concurrency",
+        String(concurrency),
+      ];
     }
 
+    const executionCommand = `pnpm ${argv.join(" ")}`;
     const message = domain
-      ? `Fleet audit configured for ${domain} in ${mode} mode.`
-      : `Fleet-wide audit configured across enrolled properties in ${mode} mode.`;
+      ? `Fleet audit plan configured for ${domain} in ${mode} mode.`
+      : `Fleet-wide audit plan configured across enrolled properties in ${mode} mode.`;
 
     return mcpResponse({
       structuredContent: {
@@ -319,9 +338,11 @@ export const runFleetAuditTool = {
         mode,
         targetDomain: domain ?? null,
         message,
-        executionCommand: cmd,
+        executable: "pnpm",
+        argv,
+        executionCommand,
       },
-      text: `${message}\nExecution Command: \`${cmd}\``,
+      text: `${message}\nExecution Plan: \`${executionCommand}\``,
     });
   },
 };

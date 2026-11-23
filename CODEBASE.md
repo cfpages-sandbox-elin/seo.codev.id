@@ -533,6 +533,18 @@ Complete implementation of all pending PRD capabilities across linking, issue ag
    - `scripts/run-github-fleet-audit.ts`: Added Stage 5 Diagnostic Fleet Series Integration inserting `fleet_runs` (`trigger = 'manual'`, `requester_id = 'github-audit-runner'`, `status = 'completed'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`, `status = 'completed'`), and `fleet_snapshots` (`series_key = 'diagnostic'`).
    - Preserves weekly baseline integrity by recording repository direct audits in D1 under the `diagnostic` series key without polluting the official 80–100 score matrix or weekly dashboard.
 
+### Round 2 Review Remediation & P1 Hardening (2026-11-23)
+
+Remediated all 7 concrete P1 blockers and operational findings from Engineer Sol's Round 2 review ([REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-2-2026-11-23.md](C:/Users/THINKPAD/OneDrive/MD/REPORT/REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-2-2026-11-23.md)):
+- **P1-1 (Linker Schema & Roster Scoping)**: Removed non-existent `updated_at` column from `projects` INSERT; scoped member linking strictly to active `organization_id` and approved `version_id`; guarded updates with `WHERE project_id IS NULL` to prevent overwriting foreign-tenant or historical links; replaced `proj_*` ID generation with standard `crypto.randomUUID()`.
+- **P1-2 (Audit Scope & Explicit Selection)**: Enforced strict validation requiring explicit scope (`--domain <canonical-host>`, `--all`, or `--limit <n>`); eliminated unbounded silent fleet runs; added canonical domain regex validation to MCP `run_fleet_audit` and emitted structured `argv` array.
+- **P1-3 (URL Identity & False Runtime Findings)**: Rewrote `pathToUrl` to use canonical served identity rules (`/index.html` $\leftrightarrow$ `/`); resolved in-memory link graph via `new URL(href, servedUrl)` against known route set; filtered out unmeasured runtime-only issue types (`deep-page`, `slow-page`) from static source audits.
+- **P1-4 (Archive Parity Verification)**: Replaced partial intersection check with deterministic candidate set parity assertion (`!truncated && tree.length === lane1.size === lane2.size && every(file => lane1.get(file) === lane2.get(file))`); verified offline rejection on disjoint keys; added `--domain` parameter support with automatic repo resolution.
+- **P1-5 (Atomic Finalization Child Reconciliation)**: In `audits` compare-and-set UPDATE, verified exact child counts against persisted database state (`(SELECT COUNT(*) FROM audit_pages) = :pages AND (SELECT COUNT(*) FROM audit_issues) = :issues`); eliminated non-standard `'partial'` enum usage; preserved typed status `'completed'`.
+- **P1-6 (Diagnostic Scoped Publication)**: Strictly scoped Stage 5 diagnostic series queries to `organization_id = 'shared-workspace'` and `version_id`; recorded true observed coverage percentage; kept unmeasured rubric pillars (`score_mobile_and_perf`, `score_schema`, `score_ai_search`) as NULL.
+- **P1-7 (Authoritative Issue URL Selection)**: In `fleet-issues.ts` and `fleet-tools.ts`, selected authoritative `audit_issues.page_url` directly with COALESCE; prevented null dereference on site-level issues; added PapaParse RFC 4180 formula escaping (`escapeFormulae: true`) for CSV export.
+
+
 
 
 

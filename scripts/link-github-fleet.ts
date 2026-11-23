@@ -2,14 +2,14 @@
  * Turnkey Bulk Project Enrollment & GitHub Portfolio Linking CLI (PRD §4.1, FLEET-SYNC-01)
  *
  * Idempotently reconciles canonical fleet manifest members and accessible GitHub repositories
- * into OpenSEO D1 `projects` under `shared-workspace`, and updates `fleet_roster_members.project_id`
- * to achieve 100% mapped status across the entire fleet.
+ * into OpenSEO D1 `projects` under the target organization, and updates `fleet_roster_members.project_id`
+ * scoped strictly to the approved roster version and organization.
  *
  * Usage:
  *   pnpm exec tsx scripts/link-github-fleet.ts [--dry-run] [--remote | --local] [--org-id <id>]
  */
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import fs, { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import crypto from "node:crypto";
 import { parseArgs } from "node:util";
@@ -31,9 +31,7 @@ function loadEnv(): Record<string, string> {
         env[key] = val;
       }
     }
-  } catch {
-    // optional .env.selfhost
-  }
+  } catch {}
   return env;
 }
 
@@ -89,7 +87,6 @@ function executeD1Sql(sqlContent: string, isRemote: boolean) {
     });
   } finally {
     try {
-      const fs = require("node:fs");
       if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
     } catch {}
   }
@@ -139,7 +136,7 @@ export async function linkFleet(options: {
   try {
     const ghRaw = readFileSync(GITHUB_EVIDENCE_PATH, "utf8");
     ghLines = ghRaw.split("\n");
-  } catch (err) {
+  } catch {
     console.warn(`[WARN] Could not read ${GITHUB_EVIDENCE_PATH}, proceeding with manifest members only.`);
   }
 
@@ -196,38 +193,43 @@ export async function linkFleet(options: {
       `SELECT id, domain FROM projects WHERE organization_id = '${orgId}' AND archived_at IS NULL;`,
       isRemote,
     );
-    existingMembers = runD1Query(
-      `SELECT id, canonical_host, project_id, version_id FROM fleet_roster_members;`,
-      isRemote,
-    );
+
     const rosterVersions = runD1Query(
       `SELECT id, version_tag, manifest_hash FROM fleet_roster_versions WHERE organization_id = '${orgId}' ORDER BY approved_at DESC LIMIT 1;`,
       isRemote,
     );
     if (rosterVersions.length > 0) {
       approvedRoster = rosterVersions[0];
+    } else {
+      throw new Error(`No approved roster version found for organization '${orgId}'.`);
     }
+
+    // Scoped strictly to the approved roster version to prevent mutating historical or foreign versions (P1-1)
+    existingMembers = runD1Query(
+      `SELECT id, canonical_host, project_id, version_id FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}';`,
+      isRemote,
+    );
   } catch (err: any) {
     console.error(`[ERROR] Failed to query D1 database:`, err?.message || err);
-    if (!isDryRun) process.exit(1);
+    throw err; // Fail closed: unreadable state must not produce a clean dry run or blind apply
   }
 
   const existingProjectDomainMap = new Map<string, string>();
   for (const p of existingProjects) {
-    existingProjectDomainMap.set(p.domain.toLowerCase().trim(), p.id);
+    if (p.domain) {
+      existingProjectDomainMap.set(p.domain.toLowerCase().trim(), p.id);
+    }
   }
 
   console.log(`Found ${existingProjects.length} existing projects in D1.`);
-  console.log(`Found ${existingMembers.length} fleet roster members in D1.`);
-  if (approvedRoster) {
-    console.log(`Active Approved Roster Version: ${approvedRoster.version_tag} (${approvedRoster.id})`);
-  }
+  console.log(`Found ${existingMembers.length} fleet roster members in approved roster ${approvedRoster.id}.`);
+  console.log(`Active Approved Roster Version: ${approvedRoster.version_tag} (${approvedRoster.id})`);
 
   // 3. Determine missing projects and link updates
   const missingProjects: Array<{ id: string; domain: string; name: string }> = [];
   for (const [domain, meta] of targetMap.entries()) {
     if (!existingProjectDomainMap.has(domain)) {
-      const id = "proj_" + crypto.randomBytes(12).toString("hex");
+      const id = crypto.randomUUID(); // Standard UUID convention (P1-1)
       missingProjects.push({ id, domain, name: meta.name });
       existingProjectDomainMap.set(domain, id);
     }
@@ -238,7 +240,8 @@ export async function linkFleet(options: {
     const host = m.canonical_host.toLowerCase().trim();
     const currentProjectId = m.project_id;
     const targetProjectId = existingProjectDomainMap.get(host);
-    if (targetProjectId && (!currentProjectId || currentProjectId !== targetProjectId)) {
+    // Only link if unmapped (project_id IS NULL) to preserve existing manual overrides
+    if (targetProjectId && !currentProjectId) {
       membersToLink.push({ memberId: m.id, host, projectId: targetProjectId });
     }
   }
@@ -269,15 +272,22 @@ export async function linkFleet(options: {
   for (const p of missingProjects) {
     const escapedName = p.name.replace(/'/g, "''");
     const escapedDomain = p.domain.replace(/'/g, "''");
+    // Removed invalid updated_at column to adhere to shipped D1 and PG projects schema (P1-1)
     sqlStatements.push(
-      `INSERT INTO projects (id, organization_id, name, domain, location_code, language_code, created_at, updated_at) VALUES ('${p.id}', '${orgId}', '${escapedName}', '${escapedDomain}', 2360, 'id', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP);`
+      `INSERT INTO projects (id, organization_id, name, domain, location_code, language_code, created_at) VALUES ('${p.id}', '${orgId}', '${escapedName}', '${escapedDomain}', 2360, 'id', CURRENT_TIMESTAMP);`
     );
   }
 
+  // Scoped UPDATE with foreign-key and version existence guards (P1-1)
   for (const m of membersToLink) {
-    sqlStatements.push(
-      `UPDATE fleet_roster_members SET project_id = '${m.projectId}' WHERE id = '${m.memberId}';`
-    );
+    sqlStatements.push(`
+      UPDATE fleet_roster_members
+      SET project_id = '${m.projectId}'
+      WHERE id = '${m.memberId}'
+        AND version_id = '${approvedRoster.id}'
+        AND canonical_host = '${m.host.replace(/'/g, "''")}'
+        AND project_id IS NULL;
+    `);
   }
 
   if (sqlStatements.length <= 1) {
@@ -288,13 +298,13 @@ export async function linkFleet(options: {
   console.log(`Executing ${sqlStatements.length - 1} SQL statements against D1...`);
   executeD1Sql(sqlStatements.join("\n"), isRemote);
 
-  // 5. Verification check
+  // 5. Verification check strictly scoped to current roster
   const updatedMembers = runD1Query(
-    `SELECT count(*) as unmapped_count FROM fleet_roster_members WHERE project_id IS NULL;`,
+    `SELECT count(*) as unmapped_count FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}' AND project_id IS NULL;`,
     isRemote,
   );
   const unmapped = updatedMembers[0]?.unmapped_count ?? 0;
-  console.log(`Verification: Remaining unmapped roster members: ${unmapped}`);
+  console.log(`Verification: Remaining unmapped roster members in ${approvedRoster.id}: ${unmapped}`);
   if (unmapped === 0) {
     console.log(`SUCCESS: 100% of fleet roster members are linked to verified D1 projects!`);
   } else {
@@ -314,7 +324,7 @@ if (process.argv[1] && process.argv[1].includes("link-github-fleet")) {
     },
   });
 
-  const isRemote = values.remote ?? !values.local;
+  const isRemote = values.remote ? true : values.local ? false : false;
   linkFleet({
     dryRun: values["dry-run"],
     remote: isRemote,

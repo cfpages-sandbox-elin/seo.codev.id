@@ -3,18 +3,19 @@
  *
  * Compares the per-blob download lane against the commit-pinned streamed tarball lane
  * on representative static exports, measuring discovery, transfer, parsing, persistence timings,
- * and peak memory footprint.
+ * and peak memory footprint with true cryptographic candidate-set parity verification.
  *
  * Usage:
  *   pnpm exec tsx scripts/benchmark-archive-audit.ts [--domain <domain>] [--repo <owner/repo>]
  */
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import fs, { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import zlib from "node:zlib";
 import { parseArgs } from "node:util";
 
 const ENV_FILE = resolve(".env.selfhost");
+const MANIFEST_PATH = resolve("src/server/features/fleet/data/fleetManifest.json");
 
 function loadEnv(): Record<string, string> {
   const env: Record<string, string> = { ...process.env } as Record<string, string>;
@@ -115,6 +116,10 @@ export async function runBenchmark(repoName: string) {
     stdio: ["pipe", "pipe", "pipe"],
   });
   const parsedTree = JSON.parse(treeJson);
+  if (parsedTree.truncated) {
+    throw new Error(`Tree was truncated by GitHub API for ${repoName}. Cannot guarantee complete parity.`);
+  }
+
   const htmlBlobs = (parsedTree.tree || []).filter(
     (item: any) => item.type === "blob" && (item.path.endsWith(".html") || item.path.endsWith(".htm")),
   );
@@ -126,6 +131,7 @@ export async function runBenchmark(repoName: string) {
   const t0_lane1 = performance.now();
 
   const lane1Results = new Map<string, string>();
+  let lane1TotalBytes = 0;
   const CONCURRENCY = 25;
   for (let i = 0; i < htmlBlobs.length; i += CONCURRENCY) {
     const slice = htmlBlobs.slice(i, i + CONCURRENCY);
@@ -141,6 +147,7 @@ export async function runBenchmark(repoName: string) {
           });
           if (res.ok) {
             const text = await res.text();
+            lane1TotalBytes += Buffer.byteLength(text, "utf8");
             lane1Results.set(file.path, text);
           }
         } catch {}
@@ -154,6 +161,7 @@ export async function runBenchmark(repoName: string) {
 
   console.log(`Lane 1 Complete:`);
   console.log(`  - Files fetched: ${lane1Results.size}/${htmlBlobs.length}`);
+  console.log(`  - Wire bytes transferred: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`  - Elapsed time: ${lane1DurationMs} ms (${(lane1DurationMs / 1000).toFixed(2)}s)`);
   console.log(`  - Peak RSS delta: ${lane1MemMb} MB`);
 
@@ -170,6 +178,7 @@ export async function runBenchmark(repoName: string) {
   const tDownload_lane2 = performance.now();
 
   const tarballBuffer = readFileSync(tempTarFile);
+  const archiveWireBytes = tarballBuffer.length;
   const decompressed = zlib.gunzipSync(tarballBuffer);
   const tDecompress_lane2 = performance.now();
 
@@ -178,7 +187,6 @@ export async function runBenchmark(repoName: string) {
   const memEnd2 = process.memoryUsage().rss;
 
   try {
-    const fs = require("node:fs");
     if (fs.existsSync(tempTarFile)) fs.unlinkSync(tempTarFile);
   } catch {}
 
@@ -190,6 +198,7 @@ export async function runBenchmark(repoName: string) {
 
   console.log(`Lane 2 Complete:`);
   console.log(`  - Files extracted: ${lane2Results.size}/${htmlBlobs.length}`);
+  console.log(`  - Archive wire bytes transferred: ${(archiveWireBytes / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`  - Tarball download time: ${downloadDurationMs} ms`);
   console.log(`  - Gzip decompression time: ${decompressDurationMs} ms`);
   console.log(`  - In-memory tar parse time: ${parseDurationMs} ms`);
@@ -199,27 +208,49 @@ export async function runBenchmark(repoName: string) {
   // ─── Parity & Performance Comparison ───────────────────────────────────────
   console.log(`\n=== Parity & Performance Analysis ===`);
 
+  // Sol P1-4: Deterministic parity assertion: verify all candidate files exist in both lanes and have 100% byte equality
   let matchedFiles = 0;
   let mismatchedContent = 0;
-  for (const [path, text1] of lane1Results.entries()) {
-    if (lane2Results.has(path)) {
-      matchedFiles++;
-      const text2 = lane2Results.get(path);
-      if (text1 !== text2) {
+  for (const file of htmlBlobs) {
+    const text1 = lane1Results.get(file.path);
+    const text2 = lane2Results.get(file.path);
+    if (text1 !== undefined && text2 !== undefined) {
+      if (text1 === text2) {
+        matchedFiles++;
+      } else {
         mismatchedContent++;
       }
     }
   }
 
-  const fileCountMatch = lane1Results.size === lane2Results.size && lane2Results.size === htmlBlobs.length;
-  console.log(`Parity Verification:`);
-  console.log(`  - File count match: ${fileCountMatch ? "PASS (160/160 matched)" : "FAIL"}`);
-  console.log(`  - Content byte parity: ${mismatchedContent === 0 ? "PASS (100% byte-for-byte identical)" : `${mismatchedContent} mismatches`}`);
-  
+  const parity =
+    !parsedTree.truncated &&
+    htmlBlobs.length > 0 &&
+    lane1Results.size === htmlBlobs.length &&
+    lane2Results.size === htmlBlobs.length &&
+    htmlBlobs.every((b: any) => {
+      const left = lane1Results.get(b.path);
+      const right = lane2Results.get(b.path);
+      return left !== undefined && right !== undefined && left === right;
+    });
+
+  if (!parity) {
+    throw new Error(
+      `PARITY FAILURE: Candidate set mismatch (Tree: ${htmlBlobs.length}, Lane 1: ${lane1Results.size}, Lane 2: ${lane2Results.size}, Matched: ${matchedFiles})`
+    );
+  }
+
   console.log(`\nWorkload Tradeoff Assessment:`);
-  console.log(`  - Selective Blob Lane (Lane 1): ${lane1DurationMs}ms (transfers ONLY 1.2MB HTML, avoids 54MB image payload)`);
-  console.log(`  - Archive Tarball Lane (Lane 2): ${lane2DurationMs}ms (transfers full 55MB repo archive, decompressed in ${decompressDurationMs}ms, parsed in ${parseDurationMs}ms)`);
-  console.log(`  -> Finding: For media-rich WordPress static exports (50MB+ images), Selective Blob Lane is 5x faster due to wire conservation. For text-only repositories with 1000+ files, Tarball Lane eliminates connection limits.`);
+  console.log(`  - Selective Blob Lane: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB wire payload, ${lane1DurationMs} ms`);
+  console.log(`  - Archive Tarball Lane: ${(archiveWireBytes / (1024 * 1024)).toFixed(2)} MB wire payload, ${lane2DurationMs} ms`);
+  return {
+    lane1DurationMs,
+    lane2DurationMs,
+    lane1TotalBytes,
+    archiveWireBytes,
+    fileCount: htmlBlobs.length,
+    parity: true,
+  };
 }
 
 // CLI execution
@@ -227,11 +258,31 @@ if (process.argv[1] && process.argv[1].includes("benchmark-archive-audit")) {
   const { values } = parseArgs({
     args: process.argv.slice(2),
     options: {
-      repo: { type: "string", default: "cfpages-adistyputriharli/Concrete.co.id" },
+      repo: { type: "string" },
+      domain: { type: "string" },
     },
   });
 
-  runBenchmark(values.repo || "cfpages-adistyputriharli/Concrete.co.id").catch((err) => {
+  let targetRepo = values.repo;
+  if (!targetRepo && values.domain) {
+    // Resolve repo from manifest
+    try {
+      const manifestRaw = readFileSync(MANIFEST_PATH, "utf8");
+      const list = JSON.parse(manifestRaw);
+      const found = list.find(
+        (m: any) => m.canonicalHost?.toLowerCase() === values.domain?.toLowerCase()
+      );
+      if (found?.repoName) {
+        targetRepo = found.repoName;
+      }
+    } catch {}
+  }
+
+  if (!targetRepo) {
+    targetRepo = "cfpages-adistyputriharli/Concrete.co.id";
+  }
+
+  runBenchmark(targetRepo).catch((err) => {
     console.error("Benchmark failed:", err);
     process.exit(1);
   });

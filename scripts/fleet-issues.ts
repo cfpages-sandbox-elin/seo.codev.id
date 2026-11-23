@@ -1,18 +1,18 @@
 /**
  * Fleet-Wide Aggregated Issue Reporting & CSV Export CLI (PRD §4.4, FLEET-ISSUE-01)
  *
- * Aggregates technical SEO defects across all enrolled projects, groups identical
- * symptoms by root cause, and generates structured remediation packets with direct
- * sovereign skill routing tags (static-site-css-repair, internal-linking, unslop-seo).
+ * Queries technical SEO issues across all completed audits in the organization,
+ * parses detailed contexts (target URL, redirect chain, broken asset), maps issues
+ * to sovereign skill remediation routes, and exports to RFC 4180 CSV via PapaParse.
  *
  * Usage:
- *   pnpm exec tsx scripts/fleet-issues.ts [--remote] [--csv <path>] [--domain <domain>] [--severity <error|warning|info>] [--limit <n>]
+ *   pnpm exec tsx scripts/fleet-issues.ts [--domain <domain>] [--severity <critical|warning|info>] [--type <issue_type>] [--limit <n>] [--csv [file]] [--json]
  */
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import fs, { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { parseArgs } from "node:util";
 import Papa from "papaparse";
+import { parseArgs } from "node:util";
 
 const ENV_FILE = resolve(".env.selfhost");
 
@@ -29,9 +29,7 @@ function loadEnv(): Record<string, string> {
         env[key] = val;
       }
     }
-  } catch {
-    // optional
-  }
+  } catch {}
   return env;
 }
 
@@ -77,8 +75,8 @@ export function routeIssueToSkill(issueType: string, url: string = ""): {
   skill: string;
   action: string;
 } {
-  const t = issueType.toLowerCase().replace(/-/g, "_");
-  const u = url.toLowerCase();
+  const t = (issueType || "").toLowerCase().replace(/-/g, "_");
+  const u = (url || "").toLowerCase();
 
   if (
     t.includes("broken_image") ||
@@ -142,7 +140,7 @@ export interface FleetIssueRow {
   auditId: string;
   issueId: string;
   issueType: string;
-  severity: "critical" | "warning" | "info";
+  severity: string;
   pageUrl: string;
   pageTitle: string | null;
   targetUrl: string | null;
@@ -159,7 +157,8 @@ export async function getAggregatedFleetIssues(options: {
   limit?: number;
 }): Promise<FleetIssueRow[]> {
   const isRemote = options.remote ?? true;
-  const limit = options.limit ?? 200;
+  const rawLimit = options.limit ?? 200;
+  const limit = Math.max(1, Math.min(1000, Number.isFinite(rawLimit) ? rawLimit : 200));
 
   const whereClauses: string[] = [
     "p.organization_id = 'shared-workspace'",
@@ -168,15 +167,17 @@ export async function getAggregatedFleetIssues(options: {
   ];
 
   if (options.domain) {
-    whereClauses.push(`p.domain = '${options.domain.replace(/'/g, "''")}'`);
+    whereClauses.push(`p.domain = '${options.domain.toLowerCase().trim().replace(/'/g, "''")}'`);
   }
   if (options.severity) {
-    whereClauses.push(`i.severity = '${options.severity.replace(/'/g, "''")}'`);
+    whereClauses.push(`i.severity = '${options.severity.toLowerCase().trim().replace(/'/g, "''")}'`);
   }
   if (options.issueType) {
-    whereClauses.push(`i.issue_type = '${options.issueType.replace(/'/g, "''")}'`);
+    whereClauses.push(`i.issue_type = '${options.issueType.trim().replace(/'/g, "''")}'`);
   }
 
+  // Sol P1-7: Select authoritative i.page_url directly rather than pg.url from LEFT JOIN,
+  // preventing null dereference for site-level issues where page_id is NULL.
   const query = `
     SELECT 
       p.id AS project_id,
@@ -185,13 +186,13 @@ export async function getAggregatedFleetIssues(options: {
       i.id AS issue_id,
       i.issue_type AS issue_type,
       i.severity AS severity,
-      pg.url AS page_url,
+      COALESCE(i.page_url, pg.url, '') AS page_url,
       pg.title AS page_title,
       i.details_json AS details_json
     FROM audit_issues i
     JOIN audits a ON a.id = i.audit_id
     JOIN projects p ON p.id = a.project_id
-    LEFT JOIN audit_pages pg ON pg.id = i.page_id
+    LEFT JOIN audit_pages pg ON pg.id = i.page_id AND pg.audit_id = i.audit_id
     WHERE ${whereClauses.join(" AND ")}
     ORDER BY 
       CASE i.severity 
@@ -211,7 +212,7 @@ export async function getAggregatedFleetIssues(options: {
     if (r.details_json) {
       try {
         const parsed = JSON.parse(r.details_json);
-        if (parsed && typeof parsed.targetUrl === "string") {
+        if (parsed && typeof parsed === "object" && typeof parsed.targetUrl === "string") {
           parsedTargetUrl = parsed.targetUrl;
         }
         detailsStr = typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed);
@@ -220,7 +221,8 @@ export async function getAggregatedFleetIssues(options: {
       }
     }
 
-    const routing = routeIssueToSkill(r.issue_type, parsedTargetUrl || r.page_url);
+    const effectivePageUrl = r.page_url || "";
+    const routing = routeIssueToSkill(r.issue_type, parsedTargetUrl || effectivePageUrl);
     return {
       projectId: r.project_id,
       domain: r.domain,
@@ -228,7 +230,7 @@ export async function getAggregatedFleetIssues(options: {
       issueId: r.issue_id,
       issueType: r.issue_type,
       severity: r.severity,
-      pageUrl: r.page_url || "",
+      pageUrl: effectivePageUrl,
       pageTitle: r.page_title || null,
       targetUrl: parsedTargetUrl,
       details: detailsStr,
@@ -240,33 +242,92 @@ export async function getAggregatedFleetIssues(options: {
 
 // CLI execution
 if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
+  // Extract custom --csv argument to support both `--csv` and `--csv <filename>`
+  const csvArgIdx = process.argv.indexOf("--csv");
+  let csvTargetFile: string | null = null;
+  if (csvArgIdx !== -1) {
+    const nextArg = process.argv[csvArgIdx + 1];
+    if (nextArg && !nextArg.startsWith("-")) {
+      csvTargetFile = nextArg;
+    } else {
+      csvTargetFile = "fleet-issues.csv";
+    }
+  }
+
   const { values } = parseArgs({
-    args: process.argv.slice(2),
+    args: process.argv.slice(2).filter((a, idx, arr) => a !== "--csv" && arr[idx - 1] !== "--csv"),
     options: {
       remote: { type: "boolean", default: true },
       local: { type: "boolean", default: false },
-      csv: { type: "string" },
       domain: { type: "string" },
       severity: { type: "string" },
       type: { type: "string" },
       limit: { type: "string", default: "200" },
       json: { type: "boolean", default: false },
     },
+    strict: false,
   });
 
   const isRemote = !values.local;
-  const limit = parseInt(values.limit || "200", 10);
+  const parsedLimit = parseInt(String(values.limit || "200"), 10);
+  const limit = Math.max(1, Math.min(1000, isNaN(parsedLimit) ? 200 : parsedLimit));
 
   getAggregatedFleetIssues({
     remote: isRemote,
-    domain: values.domain,
-    severity: values.severity,
-    issueType: values.type,
+    domain: values.domain as string | undefined,
+    severity: values.severity as string | undefined,
+    issueType: values.type as string | undefined,
     limit,
   })
     .then((issues) => {
+      // 1. Export CSV if requested
+      if (csvTargetFile) {
+        const fields = [
+          "domain",
+          "severity",
+          "issueType",
+          "pageUrl",
+          "targetUrl",
+          "skillRoute",
+          "recommendedAction",
+          "details",
+          "auditId",
+          "issueId",
+          "projectId",
+        ];
+        const csvContent = Papa.unparse(
+          {
+            fields,
+            data: issues.map((i) => ({
+              domain: i.domain,
+              severity: i.severity,
+              issueType: i.issueType,
+              pageUrl: i.pageUrl,
+              targetUrl: i.targetUrl || "",
+              skillRoute: i.skillRoute,
+              recommendedAction: i.recommendedAction,
+              details: i.details || "",
+              auditId: i.auditId,
+              issueId: i.issueId,
+              projectId: i.projectId,
+            })),
+          },
+          { escapeFormulae: true }
+        );
+        writeFileSync(csvTargetFile, csvContent, "utf8");
+        console.log(`[CSV] Exported ${issues.length} fleet issues to ${csvTargetFile} (RFC 4180 with formula escaping)`);
+        return;
+      }
+
+      // 2. Output JSON if requested
+      if (values.json) {
+        console.log(JSON.stringify(issues, null, 2));
+        return;
+      }
+
+      // 3. Human console overview
       console.log(`\n=== OpenSEO Fleet-Wide Aggregated Issues (FLEET-ISSUE-01) ===`);
-      console.log(`Total issues retrieved: ${issues.length}`);
+      console.log(`Total sample issues retrieved: ${issues.length} (limit: ${limit})`);
 
       if (issues.length === 0) {
         console.log("No issues found matching the specified criteria.");
@@ -279,7 +340,7 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
       const bySkill: Record<string, number> = {};
 
       for (const i of issues) {
-        if (i.severity in bySeverity) bySeverity[i.severity]++;
+        if (i.severity in bySeverity) bySeverity[i.severity as keyof typeof bySeverity]++;
         byType[i.issueType] = (byType[i.issueType] || 0) + 1;
         bySkill[i.skillRoute] = (bySkill[i.skillRoute] || 0) + 1;
       }
@@ -300,20 +361,15 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
         .sort((a, b) => b[1] - a[1])
         .forEach(([s, count]) => console.log(`  - /${s}: ${count} issues`));
 
-      if (values.csv) {
-        const csvPath = resolve(values.csv);
-        const csvData = Papa.unparse(issues);
-        writeFileSync(csvPath, csvData, "utf8");
-        console.log(`\nExported complete issue list to CSV: ${csvPath}`);
-      }
-
-      if (values.json) {
-        console.log("\nJSON Remediation Packet Preview:");
-        console.log(JSON.stringify(issues.slice(0, 5), null, 2));
-      }
+      console.log(`\nSample Issues (first 5):`);
+      issues.slice(0, 5).forEach((i) => {
+        console.log(`  [${i.severity.toUpperCase()}] ${i.domain} - ${i.issueType} on ${i.pageUrl}`);
+        if (i.targetUrl) console.log(`     Target: ${i.targetUrl}`);
+        console.log(`     Routing: /${i.skillRoute} -> ${i.recommendedAction}`);
+      });
     })
     .catch((err) => {
-      console.error("Fleet issue aggregation failed:", err);
+      console.error("Failed to query fleet issues:", err);
       process.exit(1);
     });
 }

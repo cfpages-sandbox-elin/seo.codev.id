@@ -70,6 +70,16 @@ describe("Fleet MCP Tools", () => {
       const data = result.structuredContent as any;
       expect(data.status).toBe("configured");
       expect(data.mode).toBe("repository_direct");
+      expect(data.executable).toBe("pnpm");
+      expect(data.argv).toEqual([
+        "exec",
+        "tsx",
+        "scripts/run-github-fleet-audit.ts",
+        "--domain",
+        "kaca.co.id",
+        "--max-pages",
+        "500",
+      ]);
       expect(data.executionCommand).toContain("run-github-fleet-audit.ts --domain kaca.co.id --max-pages 500");
     });
 
@@ -82,7 +92,10 @@ describe("Fleet MCP Tools", () => {
       const data = result.structuredContent as any;
       expect(data.status).toBe("configured");
       expect(data.mode).toBe("edge_workflow");
-      expect(data.executionCommand).toContain("run-fleet-audits.ts --concurrency 3");
+      expect(data.executionCommand).toContain("run-fleet-audits.ts");
+      expect(data.executionCommand).toContain("--concurrency 3");
+      expect(data.argv).toContain("--concurrency");
+      expect(data.argv).toContain("3");
     });
   });
 });
