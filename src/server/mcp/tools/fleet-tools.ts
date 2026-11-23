@@ -203,7 +203,7 @@ export const getFleetIssuesTool = {
       }
 
       if (r.severity in severityBreakdown) {
-        severityBreakdown[r.severity as keyof typeof severityBreakdown]++;
+        severityBreakdown[r.severity]++;
       }
       const routing = routeIssueToSkill(r.issueType, parsedTargetUrl || r.pageUrl || "");
       skillRoutingBreakdown[routing.skill] = (skillRoutingBreakdown[routing.skill] || 0) + 1;
@@ -342,7 +342,7 @@ export const runFleetAuditTool = {
         "exec",
         "tsx",
         "scripts/run-fleet-audits.ts",
-        ...(domain ? ["--domain", domain] : []),
+        ...(domain ? ["--domain", domain] : ["--all"]),
         "--max-pages",
         String(maxPages),
         "--concurrency",

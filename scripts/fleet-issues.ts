@@ -56,7 +56,8 @@ function extractJson(raw: string): any {
 function runD1Query(query: string, isRemote: boolean): any[] {
   const sanitized = query.replace(/\r?\n/g, " ").trim();
   const flag = isRemote ? "--remote" : "--local";
-  const cmd = `npx wrangler d1 execute open-seo-db-selfhost ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
+  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
+  const cmd = `npx wrangler d1 execute ${dbName} ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
   const out = execSync(cmd, {
     cwd: resolve("."),
     env: { ...process.env, ...envVars },

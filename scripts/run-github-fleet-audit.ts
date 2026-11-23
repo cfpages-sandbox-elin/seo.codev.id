@@ -156,12 +156,18 @@ function loadRepoMappings(): Map<string, RepoMapping> {
 }
 
 const normalizeRoute = (urlOrPath: string): string => {
-  return urlOrPath
-    .split("#")[0]
-    .split("?")[0]
-    .toLowerCase()
-    .replace(/^https?:\/\//, "")
-    .replace(/\/+$/, "");
+  let s = urlOrPath.split("#")[0].split("?")[0].replace(/^https?:\/\//, "");
+  const slashIdx = s.indexOf("/");
+  if (slashIdx === -1) {
+    return s.toLowerCase();
+  }
+  const host = s.slice(0, slashIdx).toLowerCase();
+  let path = s.slice(slashIdx);
+  try {
+    path = decodeURI(path);
+  } catch {}
+  path = path.replace(/\/+$/, "");
+  return `${host}${path}`;
 };
 
 /**
@@ -266,7 +272,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   const htmlFiles: typeof treeItems = [];
 
   for (const item of treeItems) {
-    if (item.type !== "blob") continue;
+    if (item.type !== "blob" || (item.mode !== "100644" && item.mode !== "100755")) continue;
     const p = item.path;
     const isHtml = p.endsWith(".html") || p.endsWith(".htm");
 
@@ -465,10 +471,11 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
                 if (target.origin === servedUrl.origin) {
                   const normTarget = normalizeRoute(`https://${domain}${target.pathname}`);
                   const normPageUrl = normalizeRoute(pageUrl);
+                  const destCanonical = aliasToCanonicalUrl.get(normTarget) || normTarget;
+                  const sourceCanonical = aliasToCanonicalUrl.get(normPageUrl) || normPageUrl;
 
-                  if (normTarget && normTarget !== normPageUrl) {
+                  if (destCanonical && destCanonical !== sourceCanonical) {
                     if (validRouteSet.has(normTarget) || aliasToCanonicalUrl.has(normTarget)) {
-                      const destCanonical = aliasToCanonicalUrl.get(normTarget) || normTarget;
                       inboundLinkCounts.set(destCanonical, (inboundLinkCounts.get(destCanonical) || 0) + 1);
                     } else if (!isTreeTruncated && candidateFiles.length === htmlFiles.length) {
                       // Internal dead link confirmed only when tree is complete
@@ -642,7 +649,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
 
         const diagnosticSql = [
           `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-           VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, datetime('now'), datetime('now'));`,
+           VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', '${isComplete ? "completed" : "failed"}', 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, datetime('now'), datetime('now'));`,
           `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
            VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${isComplete ? "completed" : "partial"}', 1, datetime('now'), datetime('now'));`,
           `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
@@ -653,7 +660,6 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       }
     } catch (diagErr: any) {
       console.error(`[ERROR] Diagnostic fleet series linking failed:`, diagErr?.message || diagErr);
-      throw diagErr;
     }
 
     console.log(`[SUCCESS] ${domain} audit successfully finalized in D1 as '${finalStatus}'! (${processedCount} pages, ${detectedIssues.length} issues)`);
@@ -668,7 +674,8 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
              error_code = 'CHUNK_WRITE_FAILED',
              current_phase = 'failed',
              completed_at = datetime('now')
-         WHERE id = '${auditId}';`,
+         WHERE id = '${auditId}' AND status = 'running'
+         RETURNING id;`,
       ]);
     } catch {}
     return false;
@@ -712,9 +719,9 @@ async function main() {
     projectIdByDomain.set(p.domain.toLowerCase().trim(), p.id);
   }
 
-  // Load truly completed audits to avoid redundant work unless --force is given (Sol P1-01)
+  // Load truly completed audits from github source engine to avoid redundant work unless --force is given (Sol P1-01)
   const completedAudits = runD1Query(
-    "SELECT DISTINCT project_id FROM audits WHERE status = 'completed' AND pages_crawled >= pages_total;"
+    "SELECT DISTINCT project_id FROM audits WHERE status = 'completed' AND workflow_instance_id LIKE 'github-audit-%' AND pages_crawled >= pages_total;"
   );
   const alreadyAuditedProjectIds = new Set(completedAudits.map((a) => a.project_id));
 
@@ -728,6 +735,10 @@ async function main() {
     if (!projId || !repoMeta) {
       console.error(`[ERROR] Domain '${targetDomain}' is not found among enrolled projects or repository mappings.`);
       process.exit(1);
+    }
+    if (!force && alreadyAuditedProjectIds.has(projId)) {
+      console.log(`[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit. Use --force to re-audit.`);
+      return;
     }
     candidates = [{ ...repoMeta, projectId: projId }];
   } else {

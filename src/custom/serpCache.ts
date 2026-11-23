@@ -8,7 +8,8 @@
  */
 
 import type { DataforseoApiCallCost } from "@/server/lib/dataforseo/envelope";
-import type { SerpLiveItem } from "@/server/lib/dataforseo/serp";
+import { serpSnapshotItemSchema, type SerpLiveItem } from "@/server/lib/dataforseo/serp";
+import { z } from "zod";
 
 export interface SerpCacheParams {
   keyword: string;
@@ -61,9 +62,10 @@ export async function getCachedSerp(
     if (!cacheKey) return null;
 
     const { getCached } = await import("@/server/lib/r2-cache");
-    const cached = (await getCached(cacheKey)) as SerpLiveItem[] | null;
-    if (cached && Array.isArray(cached) && cached.length > 0) {
-      return cached;
+    const raw = await getCached(cacheKey);
+    const parsed = z.array(serpSnapshotItemSchema).safeParse(raw);
+    if (parsed.success && parsed.data.length > 0) {
+      return parsed.data;
     }
     return null;
   } catch {

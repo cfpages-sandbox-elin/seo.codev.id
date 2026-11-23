@@ -93,7 +93,9 @@ describe("Fleet MCP Tools", () => {
       expect(data.status).toBe("configured");
       expect(data.mode).toBe("edge_workflow");
       expect(data.executionCommand).toContain("run-fleet-audits.ts");
+      expect(data.executionCommand).toContain("--all");
       expect(data.executionCommand).toContain("--concurrency 3");
+      expect(data.argv).toContain("--all");
       expect(data.argv).toContain("--concurrency");
       expect(data.argv).toContain("3");
     });

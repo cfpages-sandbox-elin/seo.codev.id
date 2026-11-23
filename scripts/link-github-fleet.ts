@@ -58,7 +58,8 @@ function extractJson(raw: string): any {
 function runD1Query(query: string, isRemote: boolean): any[] {
   const sanitized = query.replace(/\r?\n/g, " ").trim();
   const flag = isRemote ? "--remote" : "--local";
-  const cmd = `npx wrangler d1 execute open-seo-db-selfhost ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
+  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
+  const cmd = `npx wrangler d1 execute ${dbName} ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
   const out = execSync(cmd, {
     cwd: resolve("."),
     env: { ...process.env, ...envVars },
@@ -75,10 +76,11 @@ function runD1Query(query: string, isRemote: boolean): any[] {
 
 function executeD1Sql(sqlContent: string, isRemote: boolean) {
   const flag = isRemote ? "--remote" : "--local";
+  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
   const tempFile = resolve(`scratch/temp_link_${Date.now()}.sql`);
   writeFileSync(tempFile, sqlContent, "utf8");
   try {
-    const cmd = `npx wrangler d1 execute open-seo-db-selfhost ${flag} --file "${tempFile}"`;
+    const cmd = `npx wrangler d1 execute ${dbName} ${flag} --file "${tempFile}"`;
     execSync(cmd, {
       cwd: resolve("."),
       env: { ...process.env, ...envVars },
@@ -292,9 +294,14 @@ export async function linkFleet(options: {
   for (const p of missingProjects) {
     const escapedName = p.name.replace(/'/g, "''");
     const escapedDomain = p.domain.replace(/'/g, "''");
-    // Removed invalid updated_at column to adhere to shipped D1 and PG projects schema (P1-1)
+    // Atomic insert with duplicate prevention to avoid race conditions (Sol P1-07)
     sqlStatements.push(
-      `INSERT INTO projects (id, organization_id, name, domain, location_code, language_code, created_at) VALUES ('${p.id}', '${orgId}', '${escapedName}', '${escapedDomain}', 2360, 'id', CURRENT_TIMESTAMP);`
+      `INSERT INTO projects (id, organization_id, name, domain, location_code, language_code, created_at)
+       SELECT '${p.id}', '${orgId}', '${escapedName}', '${escapedDomain}', 2360, 'id', CURRENT_TIMESTAMP
+       WHERE NOT EXISTS (
+         SELECT 1 FROM projects
+         WHERE organization_id = '${orgId}' AND lower(domain) = '${escapedDomain}' AND archived_at IS NULL
+       );`
     );
   }
 
@@ -311,6 +318,11 @@ export async function linkFleet(options: {
   }
 
   if (sqlStatements.length <= 1) {
+    if (unmappedCount > 0) {
+      console.error(`[ERROR] ${unmappedCount} fleet roster members remain unmapped.`);
+      process.exitCode = 1;
+      return;
+    }
     console.log(`All portfolio projects and fleet roster members are 100% mapped! Zero updates required.`);
     return;
   }
@@ -329,6 +341,7 @@ export async function linkFleet(options: {
     console.log(`SUCCESS: 100% of fleet roster members are linked to verified D1 projects!`);
   } else {
     console.warn(`WARNING: ${unmapped} members remain unmapped.`);
+    process.exitCode = 1;
   }
 }
 

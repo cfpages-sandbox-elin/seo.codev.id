@@ -45,8 +45,8 @@ const GITHUB_TOKEN = envVars.GITHUB_TOKEN || process.env.GITHUB_TOKEN;
 export function parseTarHtmlFiles(
   tarBuf: Buffer,
   maxEntrySize = 5 * 1024 * 1024,
-): Map<string, string> {
-  const htmlMap = new Map<string, string>();
+): Map<string, Buffer> {
+  const htmlMap = new Map<string, Buffer>();
   let offset = 0;
 
   while (offset + 512 <= tarBuf.length) {
@@ -84,8 +84,8 @@ export function parseTarHtmlFiles(
       (relPath.endsWith(".html") || relPath.endsWith(".htm"))
     ) {
       if (contentEnd <= tarBuf.length) {
-        const content = tarBuf.subarray(contentStart, contentEnd).toString("utf8");
-        htmlMap.set(relPath, content);
+        const contentBuf = Buffer.from(tarBuf.subarray(contentStart, contentEnd));
+        htmlMap.set(relPath, contentBuf);
       }
     }
 
@@ -136,7 +136,7 @@ export async function runBenchmark(repoName: string) {
   const memStart1 = process.memoryUsage().rss;
   const t0_lane1 = performance.now();
 
-  const lane1Results = new Map<string, string>();
+  const lane1Results = new Map<string, Buffer>();
   let lane1TotalBytes = 0;
   const CONCURRENCY = 25;
   for (let i = 0; i < htmlBlobs.length; i += CONCURRENCY) {
@@ -152,9 +152,10 @@ export async function runBenchmark(repoName: string) {
             },
           });
           if (res.ok) {
-            const text = await res.text();
-            lane1TotalBytes += Buffer.byteLength(text, "utf8");
-            lane1Results.set(file.path, text);
+            const arrayBuf = await res.arrayBuffer();
+            const buf = Buffer.from(arrayBuf);
+            lane1TotalBytes += buf.length;
+            lane1Results.set(file.path, buf);
           }
         } catch {}
       }),
@@ -176,17 +177,20 @@ export async function runBenchmark(repoName: string) {
   const memStart2 = process.memoryUsage().rss;
   const t0_lane2 = performance.now();
 
-  const scratchDir = resolve("scratch");
-  if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir, { recursive: true });
-  const tempTarFile = resolve(scratchDir, `bench_${Date.now()}.tar.gz`);
-  const authHeader = GITHUB_TOKEN ? `-H "Authorization: token ${GITHUB_TOKEN}"` : "";
-  execSync(
-    `curl.exe -sL ${authHeader} -H "User-Agent: OpenSEO-Benchmark" "https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}" -o "${tempTarFile}"`,
-    { stdio: ["pipe", "pipe", "pipe"] }
-  );
+  const archiveUrl = `https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}`;
+  const archiveRes = await fetch(archiveUrl, {
+    headers: {
+      ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
+      "User-Agent": "OpenSEO-Benchmark",
+    },
+  });
+  if (!archiveRes.ok) {
+    throw new Error(`Failed to download archive: ${archiveRes.status} ${archiveRes.statusText}`);
+  }
+  const archiveArrayBuf = await archiveRes.arrayBuffer();
   const tDownload_lane2 = performance.now();
 
-  const tarballBuffer = readFileSync(tempTarFile);
+  const tarballBuffer = Buffer.from(archiveArrayBuf);
   const archiveWireBytes = tarballBuffer.length;
   if (archiveWireBytes > 100 * 1024 * 1024) {
     throw new Error(`Archive wire payload exceeds safe 100MB bound (${archiveWireBytes} bytes)`);
@@ -197,10 +201,6 @@ export async function runBenchmark(repoName: string) {
   const lane2Results = parseTarHtmlFiles(decompressed);
   const t1_lane2 = performance.now();
   const memEnd2 = process.memoryUsage().rss;
-
-  try {
-    if (fs.existsSync(tempTarFile)) fs.unlinkSync(tempTarFile);
-  } catch {}
 
   const downloadDurationMs = Math.round(tDownload_lane2 - t0_lane2);
   const decompressDurationMs = Math.round(tDecompress_lane2 - tDownload_lane2);
@@ -220,16 +220,15 @@ export async function runBenchmark(repoName: string) {
   // ─── Parity & Performance Comparison ───────────────────────────────────────
   console.log(`\n=== Parity & Performance Analysis ===`);
 
-  // Sol P1-04: Deterministic cryptographic byte parity assertion:
-  // Compare SHA-256 digests of all candidate blobs to ensure genuine byte equality across both lanes
+  // Sol P1-02: Cryptographic byte parity assertion over raw binary buffers before text decoding:
   let matchedFiles = 0;
   let mismatchedContent = 0;
   for (const file of htmlBlobs) {
-    const text1 = lane1Results.get(file.path);
-    const text2 = lane2Results.get(file.path);
-    if (text1 !== undefined && text2 !== undefined) {
-      const d1 = crypto.createHash("sha256").update(text1).digest("hex");
-      const d2 = crypto.createHash("sha256").update(text2).digest("hex");
+    const buf1 = lane1Results.get(file.path);
+    const buf2 = lane2Results.get(file.path);
+    if (buf1 !== undefined && buf2 !== undefined) {
+      const d1 = crypto.createHash("sha256").update(buf1).digest("hex");
+      const d2 = crypto.createHash("sha256").update(buf2).digest("hex");
       if (d1 === d2) {
         matchedFiles++;
       } else {
@@ -294,6 +293,11 @@ if (process.argv[1] && process.argv[1].includes("benchmark-archive-audit")) {
         targetRepo = found.repoName;
       }
     } catch {}
+
+    if (!targetRepo) {
+      console.error(`[ERROR] Domain '${values.domain}' was not found in fleet manifest.`);
+      process.exit(1);
+    }
   }
 
   if (!targetRepo) {

@@ -57,9 +57,11 @@ function extractJson(raw: string): any {
   return JSON.parse(raw);
 }
 
-function runD1Query(query: string): any[] {
+function runD1Query(query: string, isRemote = true): any[] {
   const sanitized = query.replace(/\r?\n/g, " ").trim();
-  const cmd = `npx wrangler d1 execute open-seo-db-selfhost --remote --json --command "${sanitized.replace(/"/g, '\\"')}"`;
+  const flag = isRemote ? "--remote" : "--local";
+  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
+  const cmd = `npx wrangler d1 execute ${dbName} ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
   const out = execSync(cmd, {
     cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
     env: { ...process.env, ...envVars },
@@ -114,6 +116,8 @@ async function main() {
       "max-pages": { type: "string", short: "m", default: "500" },
       "skip-recent": { type: "boolean", default: true },
       all: { type: "boolean", default: false },
+      remote: { type: "boolean", default: true },
+      local: { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
@@ -123,6 +127,7 @@ async function main() {
   const limit = args.values.limit ? parseInt(args.values.limit, 10) : undefined;
   const targetDomainFilter = args.values.domain?.toLowerCase().trim();
   const isAll = !!args.values.all;
+  const isRemote = args.values.local ? false : true;
 
   // Sol P1-05: Require explicit execution scope (fail closed against unintended global audits)
   if (!targetDomainFilter && !isAll && !limit) {
@@ -147,7 +152,7 @@ async function main() {
     ORDER BY last_audited ASC, p.created_at ASC;
   `;
 
-  const rows = runD1Query(sql);
+  const rows = runD1Query(sql, isRemote);
   console.log(`Retrieved ${rows.length} total enrolled projects from D1.`);
 
   let candidates: TargetProject[] = rows.map((r) => ({
@@ -161,6 +166,15 @@ async function main() {
     candidates = candidates.filter((c) =>
       c.domain.toLowerCase() === targetDomainFilter,
     );
+    if (candidates.length === 0) {
+      console.error(`[ERROR] Target domain '${targetDomainFilter}' was not found among enrolled projects in shared-workspace.`);
+      process.exit(1);
+    }
+  }
+
+  if (args.values["skip-recent"] && !targetDomainFilter) {
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+    candidates = candidates.filter((c) => !c.lastAudited || c.lastAudited < tenDaysAgo);
   }
 
   if (limit) {
@@ -182,10 +196,24 @@ async function main() {
     for (const [auditId, info] of Array.from(activeAudits.entries())) {
       const statusRows = runD1Query(
         `SELECT status, pages_crawled, current_phase, error_code FROM audits WHERE id = '${auditId}';`,
+        isRemote,
       );
-      if (statusRows.length > 0) {
-        const audit = statusRows[0];
-        if (audit.status === "completed") {
+      if (statusRows.length === 0) {
+        console.warn(`[WARNING] Audit ${auditId} for ${info.project.domain} not found in database.`);
+        activeAudits.delete(auditId);
+        failedCount++;
+        continue;
+      }
+
+      if (Date.now() - info.startedAt > 15 * 60 * 1000) {
+        console.warn(`[TIMEOUT] Audit ${auditId} for ${info.project.domain} exceeded 15-minute polling deadline.`);
+        activeAudits.delete(auditId);
+        failedCount++;
+        continue;
+      }
+
+      const audit = statusRows[0];
+      if (audit.status === "completed") {
           console.log(
             `[COMPLETED] ${info.project.domain} (Pages crawled: ${audit.pages_crawled})`,
           );
@@ -205,7 +233,6 @@ async function main() {
         }
       }
     }
-  }
 
   while (queueIndex < candidates.length || activeAudits.size > 0) {
     // Fill concurrency window
