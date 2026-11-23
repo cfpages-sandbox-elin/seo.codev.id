@@ -2,14 +2,14 @@
  * Internal GitHub Repository Direct Audit Engine (`run-github-fleet-audit.ts`)
  *
  * Audits portfolio properties directly from their GitHub repositories using the
- * GitHub Git Database API and raw blob streaming with ZERO rate limits, ZERO
- * Cloudflare Worker isolate memory pressure, and 100% full-depth page discovery.
+ * GitHub Git Database API, commit-pinned raw blob streaming, in-memory link graph
+ * validation, and staged Cloudflare D1 persistence with atomic completion checks.
  *
  * Usage:
- *   pnpm exec tsx scripts/run-github-fleet-audit.ts [--domain <domain>] [--limit <n>] [--all]
+ *   pnpm exec tsx scripts/run-github-fleet-audit.ts [--domain <domain>] [--limit <n>] [--all] [--force]
  */
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import crypto from "node:crypto";
 import { parseArgs } from "node:util";
@@ -17,6 +17,7 @@ import { analyzeHtml } from "../src/server/lib/audit/page-analyzer";
 import { runPageReporters, type DetectedIssue } from "../src/server/lib/audit/issues/page-reporters";
 import type { CrawledPageResult } from "../src/server/lib/audit/types";
 import { deterministicAuditRowId } from "../src/server/lib/audit/ids";
+import { getIssueDescriptor } from "../src/shared/audit-issues";
 
 const ENV_FILE = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/.env.selfhost");
 const FLEET_MANIFEST_FILE = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/src/server/features/fleet/data/fleetManifest.json");
@@ -48,9 +49,7 @@ function getGitHubToken(): string {
   try {
     const token = execSync("gh auth token", { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
     if (token) return token;
-  } catch {
-    // Fallback to git credential manager
-  }
+  } catch {}
   return process.env.GITHUB_TOKEN || "";
 }
 
@@ -87,25 +86,27 @@ function runD1Query(query: string): any[] {
   return [];
 }
 
-function executeD1SqlFile(sqlContent: string): void {
-  const tempFile = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/scratch", `batch_${Date.now()}.sql`);
-  writeFileSync(tempFile, sqlContent, "utf8");
-  try {
-    const cmd = `npx wrangler d1 execute open-seo-db-selfhost --remote --file "${tempFile}"`;
-    execSync(cmd, {
-      cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
-      env: { ...process.env, ...envVars },
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } finally {
+function executeD1SqlStatements(sqlLines: string[]): void {
+  const CHUNK_SIZE = 500;
+  for (let i = 0; i < sqlLines.length; i += CHUNK_SIZE) {
+    const chunk = sqlLines.slice(i, i + CHUNK_SIZE).join("\n");
+    const tempFile = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/scratch", `batch_${Date.now()}_${i}.sql`);
+    writeFileSync(tempFile, chunk, "utf8");
     try {
-      // unlinkSync(tempFile);
-    } catch {}
+      const cmd = `npx wrangler d1 execute open-seo-db-selfhost --remote --file "${tempFile}"`;
+      execSync(cmd, {
+        cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
+        env: { ...process.env, ...envVars },
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } finally {
+      try {
+        unlinkSync(tempFile);
+      } catch {}
+    }
   }
 }
-
-import { getIssueDescriptor } from "../src/shared/audit-issues";
 
 interface RepoMapping {
   domain: string;
@@ -116,7 +117,7 @@ interface RepoMapping {
 function loadRepoMappings(): Map<string, RepoMapping> {
   const map = new Map<string, RepoMapping>();
 
-  // 1. Load from fleetManifest.json
+  // 1. Load from fleetManifest.json (canonical approved mappings take highest precedence)
   try {
     const raw = readFileSync(FLEET_MANIFEST_FILE, "utf8");
     const list = JSON.parse(raw);
@@ -132,29 +133,17 @@ function loadRepoMappings(): Map<string, RepoMapping> {
     console.warn("Could not load fleetManifest.json:", err);
   }
 
-  // 2. Enrich from PROJECTS_GITHUB.md
+  // 2. Enrich unmapped hosts from PROJECTS_GITHUB.md
   try {
     const raw = readFileSync(PROJECTS_GITHUB_FILE, "utf8");
-    const lines = raw.split(/\r?\n/);
-    for (const line of lines) {
-      if (!line.startsWith("|")) continue;
-      const parts = line.split("|").map((p) => p.trim());
-      if (parts.length >= 5) {
-        const owner = parts[1];
-        const repoCell = parts[2];
-        const siteCell = parts[3];
-
-        const repoMatch = repoCell.match(/\[([^\]]+)\]/);
-        const repo = repoMatch ? repoMatch[1] : repoCell;
-
-        const siteMatch = siteCell.match(/\[([^\]]+)\]/);
-        const site = (siteMatch ? siteMatch[1] : siteCell).toLowerCase().replace(/^https?:\/\//, "").replace(/\/$/, "");
-
-        if (owner && repo && site && site.endsWith(".id") && !site.includes(" ")) {
-          const fullRepo = `${owner}/${repo}`;
-          if (!map.has(site)) {
-            map.set(site, { domain: site, repoName: fullRepo });
-          }
+    for (const line of raw.split(/\r?\n/)) {
+      const match = line.match(/^\|\s*([^|]+)\s*\|\s*\[([^\]]+)\]\([^)]+\)\s*\|\s*\[([^\]]+)\]\([^)]+\)\s*\|\s*([^|]+)\|/);
+      if (match) {
+        const owner = match[1].trim();
+        const repo = match[2].trim();
+        const site = match[3].trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
+        if (owner && repo && site && !map.has(site)) {
+          map.set(site, { domain: site, repoName: `${owner}/${repo}` });
         }
       }
     }
@@ -165,38 +154,90 @@ function loadRepoMappings(): Map<string, RepoMapping> {
   return map;
 }
 
-async function auditRepository(mapping: RepoMapping, maxPages = 2000): Promise<boolean> {
+const normalizeRoute = (urlOrPath: string): string => {
+  return urlOrPath
+    .split("#")[0]
+    .split("?")[0]
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
+};
+
+async function auditRepository(mapping: RepoMapping, maxPages = 10000): Promise<boolean> {
   const { domain, repoName, projectId } = mapping;
   console.log(`\n======================================================`);
   console.log(`Auditing ${domain} directly from GitHub repo ${repoName}`);
   console.log(`======================================================`);
 
-  // 1. Get default branch & git tree
-  let treeItems: Array<{ path: string; mode: string; type: string; sha: string; size?: number }> = [];
+  // 1. Resolve default branch and immutable commit SHA
   let defaultBranch = "main";
+  let commitSha = "";
+  let treeItems: Array<{ path: string; mode: string; type: string; sha: string; size?: number }> = [];
+  let isTreeTruncated = false;
+
   try {
     const repoInfo = JSON.parse(
       execSync(`gh api /repos/${repoName}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] })
     );
     defaultBranch = repoInfo.default_branch || "main";
 
+    const commitInfo = JSON.parse(
+      execSync(`gh api /repos/${repoName}/commits/${defaultBranch}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] })
+    );
+    commitSha = commitInfo.sha;
+    console.log(`Pinned commit: ${commitSha.slice(0, 10)} (branch: ${defaultBranch})`);
+
     const treeJson = execSync(
-      `gh api /repos/${repoName}/git/trees/${defaultBranch}?recursive=1`,
+      `gh api /repos/${repoName}/git/trees/${commitSha}?recursive=1`,
       { encoding: "utf8", maxBuffer: 30 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] }
     );
     const parsedTree = JSON.parse(treeJson);
+    if (parsedTree.truncated) {
+      isTreeTruncated = true;
+      console.warn(`[WARNING] Git tree for ${repoName} is truncated by GitHub (exceeds limit).`);
+    }
     treeItems = parsedTree.tree || [];
   } catch (err: any) {
     console.error(`Failed to fetch git tree for ${repoName}:`, err?.message || err);
     return false;
   }
 
-  // 2. Discover all static HTML files
-  const htmlFiles = treeItems.filter(
-    (item) => item.type === "blob" && (item.path.endsWith(".html") || item.path.endsWith(".htm"))
-  );
+  // 2. Build comprehensive route set from ALL tree items (pages + static assets)
+  const validRouteSet = new Set<string>();
+  const htmlFiles: typeof treeItems = [];
 
-  console.log(`Discovered ${htmlFiles.length} static HTML pages in ${repoName}`);
+  for (const item of treeItems) {
+    if (item.type !== "blob") continue;
+    const p = item.path;
+    const isHtml = p.endsWith(".html") || p.endsWith(".htm");
+
+    if (isHtml) {
+      htmlFiles.push(item);
+    }
+
+    // Direct path
+    validRouteSet.add(normalizeRoute(`${domain}/${p}`));
+
+    if (isHtml) {
+      if (p === "index.html" || p === "index.htm") {
+        validRouteSet.add(normalizeRoute(domain));
+      } else if (p.endsWith("/index.html")) {
+        const slug = p.slice(0, -11);
+        validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
+      } else if (p.endsWith("/index.htm")) {
+        const slug = p.slice(0, -10);
+        validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
+      } else if (p.endsWith(".html")) {
+        const slug = p.slice(0, -5);
+        validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
+      } else if (p.endsWith(".htm")) {
+        const slug = p.slice(0, -4);
+        validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
+      }
+    }
+  }
+
+  console.log(`Discovered ${htmlFiles.length} static HTML pages and ${treeItems.length} total repository assets in ${repoName}`);
   if (htmlFiles.length === 0) {
     console.warn(`No HTML pages found in repository ${repoName}. Skipping.`);
     return false;
@@ -204,7 +245,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 2000): Promise<b
 
   const candidateFiles = htmlFiles.slice(0, maxPages);
 
-  // 3. Map file paths to normalized site URL paths
+  // Helper to map repo path to public page URL
   const pathToUrl = (path: string): string => {
     let sub = path;
     if (sub === "index.html" || sub === "index.htm") return `https://${domain}/`;
@@ -217,25 +258,20 @@ async function auditRepository(mapping: RepoMapping, maxPages = 2000): Promise<b
     return `https://${domain}/${sub}`;
   };
 
-  const validUrls = new Set<string>();
-  for (const f of htmlFiles) {
-    validUrls.add(pathToUrl(f.path));
-  }
-
-  // 4. Fetch and analyze HTML files with paced concurrency
+  // 3. Fetch and analyze HTML files with paced concurrency
   const auditId = crypto.randomUUID();
   const startTime = Date.now();
   const crawledPages: CrawledPageResult[] = [];
   const detectedIssues: DetectedIssue[] = [];
   const inboundLinkCounts = new Map<string, number>();
 
-  const CONCURRENCY = 10;
+  const CONCURRENCY = 25;
   for (let i = 0; i < candidateFiles.length; i += CONCURRENCY) {
     const slice = candidateFiles.slice(i, i + CONCURRENCY);
     await Promise.all(
       slice.map(async (file) => {
         const pageUrl = pathToUrl(file.path);
-        const rawUrl = `https://raw.githubusercontent.com/${repoName}/${defaultBranch}/${file.path}`;
+        const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${file.path}`;
 
         try {
           const res = await fetch(rawUrl, {
@@ -305,24 +341,26 @@ async function auditRepository(mapping: RepoMapping, maxPages = 2000): Promise<b
           // Check internal links against known repository routes
           for (const link of analysis.links) {
             if (link.isInternal) {
-              const targetNorm = link.targetUrl.split("#")[0].split("?")[0];
-              if (validUrls.has(targetNorm)) {
-                inboundLinkCounts.set(targetNorm, (inboundLinkCounts.get(targetNorm) || 0) + 1);
-              } else if (
-                targetNorm.startsWith(`https://${domain}`) &&
-                !targetNorm.endsWith(".css") &&
-                !targetNorm.endsWith(".js") &&
-                !targetNorm.endsWith(".png") &&
-                !targetNorm.endsWith(".jpg")
-              ) {
-                // Internal dead link!
-                detectedIssues.push({
-                  issueType: "broken-internal-link",
-                  pageId,
-                  pageUrl,
-                  dedupeKey: targetNorm,
-                  details: { targetUrl: targetNorm, targetStatus: 404 },
-                });
+              const targetNorm = normalizeRoute(link.targetUrl);
+              const normPageUrl = normalizeRoute(pageUrl);
+
+              if (targetNorm && targetNorm !== normPageUrl) {
+                if (validRouteSet.has(targetNorm)) {
+                  inboundLinkCounts.set(targetNorm, (inboundLinkCounts.get(targetNorm) || 0) + 1);
+                } else if (
+                  link.targetUrl.startsWith(`https://${domain}`) ||
+                  link.targetUrl.startsWith(`http://${domain}`) ||
+                  link.targetUrl.startsWith("/")
+                ) {
+                  // Internal dead link confirmed
+                  detectedIssues.push({
+                    issueType: "broken-internal-link",
+                    pageId,
+                    pageUrl,
+                    dedupeKey: link.targetUrl,
+                    details: { targetUrl: link.targetUrl, targetStatus: 404 },
+                  });
+                }
               }
             }
           }
@@ -335,10 +373,11 @@ async function auditRepository(mapping: RepoMapping, maxPages = 2000): Promise<b
   }
   console.log("\nPage analysis completed.");
 
-  // 5. Detect Orphan Pages
-  const homeUrl = `https://${domain}/`;
+  // 4. Detect Orphan Pages
+  const homeNorm = normalizeRoute(domain);
   for (const page of crawledPages) {
-    if (page.url !== homeUrl && (inboundLinkCounts.get(page.url) || 0) === 0) {
+    const pageNorm = normalizeRoute(page.url);
+    if (pageNorm !== homeNorm && (inboundLinkCounts.get(pageNorm) || 0) === 0) {
       detectedIssues.push({
         issueType: "orphan-page",
         pageId: page.id,
@@ -348,72 +387,112 @@ async function auditRepository(mapping: RepoMapping, maxPages = 2000): Promise<b
   }
 
   const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
-  console.log(`Analyzed ${crawledPages.length} pages, detected ${detectedIssues.length} issues in ${durationSec}s.`);
+  const attemptedCount = candidateFiles.length;
+  const processedCount = crawledPages.length;
+  const unreadCount = attemptedCount - processedCount;
+  const isComplete = !isTreeTruncated && candidateFiles.length === htmlFiles.length && unreadCount === 0 && processedCount > 0;
+  const finalStatus = isComplete ? "completed" : "partial";
 
-  // 6. Ingest into Cloudflare D1
-  console.log("Ingesting audit records into Cloudflare D1...");
+  console.log(`Analyzed ${processedCount}/${attemptedCount} pages (${unreadCount} unread, treeTruncated: ${isTreeTruncated}), detected ${detectedIssues.length} issues in ${durationSec}s.`);
+  console.log(`Final evaluation status: ${finalStatus}`);
 
-  // Build SQL statements
-  const sqlLines: string[] = [];
+  // 5. Staged Ingestion into Cloudflare D1
+  console.log("Staging audit records into Cloudflare D1...");
 
-  // Audit record
   const configJson = JSON.stringify({
     source: "github_repository_direct",
     repoName,
     branch: defaultBranch,
+    commitSha,
     totalFiles: htmlFiles.length,
+    treeTruncated: isTreeTruncated,
   }).replace(/'/g, "''");
 
-  sqlLines.push(`
-    INSERT INTO audits (
-      id, project_id, started_by_user_id, start_url,
-      workflow_instance_id, config, status, pages_crawled,
-      pages_total, lighthouse_total, current_phase, started_at, completed_at
-    ) VALUES (
-      '${auditId}', '${projectId}', 'system', 'https://${domain}',
-      'github-audit-${auditId}', '${configJson}', 'completed', ${crawledPages.length},
-      ${crawledPages.length}, 0, 'completed', datetime('now', '-${durationSec} seconds'), datetime('now')
-    ) ON CONFLICT(id) DO UPDATE SET status = 'completed';
-  `);
-
-  // Audit pages
-  for (const p of crawledPages) {
-    const esc = (s: string | null | undefined) => (s ? `'${s.replace(/'/g, "''")}'` : "NULL");
-    sqlLines.push(`
-      INSERT INTO audit_pages (
-        id, audit_id, url, status_code, fetch_class, title, meta_description,
-        canonical_url, robots_meta, h1_count, h2_count, h3_count, h4_count, h5_count, h6_count,
-        word_count, content_hash, images_total, images_missing_alt, internal_link_count,
-        external_link_count, has_structured_data, is_indexable, crawl_depth, in_sitemap, response_time_ms
+  try {
+    // Stage 1: Insert parent audit in 'running' phase
+    executeD1SqlStatements([
+      `INSERT INTO audits (
+        id, project_id, started_by_user_id, start_url,
+        workflow_instance_id, config, status, pages_crawled,
+        pages_total, lighthouse_total, current_phase, started_at
       ) VALUES (
-        '${p.id}', '${auditId}', '${p.url.replace(/'/g, "''")}', ${p.statusCode}, '${p.fetchClass}',
-        ${esc(p.title)}, ${esc(p.metaDescription)}, ${esc(p.canonicalUrl)}, ${esc(p.robotsMeta)},
-        ${p.h1Count}, ${p.h2Count}, ${p.h3Count}, ${p.h4Count}, ${p.h5Count}, ${p.h6Count},
-        ${p.wordCount}, ${esc(p.contentHash)}, ${p.imagesTotal}, ${p.imagesMissingAlt},
-        ${p.links.filter((l) => l.isInternal).length}, ${p.links.filter((l) => !l.isInternal).length},
-        ${p.hasStructuredData ? 1 : 0}, ${p.isIndexable ? 1 : 0}, ${p.crawlDepth ?? 1}, 1, ${p.responseTimeMs}
-      ) ON CONFLICT(id) DO NOTHING;
-    `);
-  }
+        '${auditId}', '${projectId}', 'system', 'https://${domain}',
+        'github-audit-${auditId}', '${configJson}', 'running', ${processedCount},
+        ${htmlFiles.length}, 0, 'analyzing', datetime('now', '-${durationSec} seconds')
+      ) ON CONFLICT(id) DO UPDATE SET status = 'running';`,
+    ]);
 
-  // Audit issues
-  for (const issue of detectedIssues) {
-    const issueId = crypto.randomUUID();
-    const severity = getIssueDescriptor(issue.issueType)?.severity || "info";
-    const detailsJson = issue.details ? JSON.stringify(issue.details).replace(/'/g, "''") : "NULL";
-    sqlLines.push(`
-      INSERT INTO audit_issues (
-        id, audit_id, issue_type, severity, page_id, page_url, details_json
-      ) VALUES (
-        '${issueId}', '${auditId}', '${issue.issueType}', '${severity}', ${issue.pageId ? `'${issue.pageId}'` : "NULL"},
-        '${issue.pageUrl.replace(/'/g, "''")}', ${detailsJson === "NULL" ? "NULL" : `'${detailsJson}'`}
-      );
-    `);
-  }
+    // Stage 2: Insert audit pages (preserving source provenance, NULL unmeasured runtime evidence)
+    const pageSqlLines: string[] = [];
+    for (const p of crawledPages) {
+      const esc = (s: string | null | undefined) => (s ? `'${s.replace(/'/g, "''")}'` : "NULL");
+      pageSqlLines.push(`
+        INSERT INTO audit_pages (
+          id, audit_id, url, status_code, fetch_class, title, meta_description,
+          canonical_url, robots_meta, h1_count, h2_count, h3_count, h4_count, h5_count, h6_count,
+          word_count, content_hash, images_total, images_missing_alt, internal_link_count,
+          external_link_count, has_structured_data, is_indexable, crawl_depth, in_sitemap, response_time_ms
+        ) VALUES (
+          '${p.id}', '${auditId}', '${p.url.replace(/'/g, "''")}', NULL, '${p.fetchClass}',
+          ${esc(p.title)}, ${esc(p.metaDescription)}, ${esc(p.canonicalUrl)}, ${esc(p.robotsMeta)},
+          ${p.h1Count}, ${p.h2Count}, ${p.h3Count}, ${p.h4Count}, ${p.h5Count}, ${p.h6Count},
+          ${p.wordCount}, ${esc(p.contentHash)}, ${p.imagesTotal}, ${p.imagesMissingAlt},
+          ${p.links.filter((l) => l.isInternal).length}, ${p.links.filter((l) => !l.isInternal).length},
+          ${p.hasStructuredData ? 1 : 0}, ${p.isIndexable ? 1 : 0}, NULL, 0, NULL
+        ) ON CONFLICT(id) DO NOTHING;
+      `);
+    }
+    if (pageSqlLines.length > 0) {
+      executeD1SqlStatements(pageSqlLines);
+    }
 
-  executeD1SqlFile(sqlLines.join("\n"));
-  console.log(`[SUCCESS] ${domain} audit successfully ingested to D1! (${crawledPages.length} pages, ${detectedIssues.length} issues)`);
-  return true;
+    // Stage 3: Insert audit issues
+    const issueSqlLines: string[] = [];
+    for (const issue of detectedIssues) {
+      const issueId = crypto.randomUUID();
+      const severity = getIssueDescriptor(issue.issueType)?.severity || "info";
+      const detailsJson = issue.details ? JSON.stringify(issue.details).replace(/'/g, "''") : "NULL";
+      issueSqlLines.push(`
+        INSERT INTO audit_issues (
+          id, audit_id, issue_type, severity, page_id, page_url, details_json
+        ) VALUES (
+          '${issueId}', '${auditId}', '${issue.issueType}', '${severity}', ${issue.pageId ? `'${issue.pageId}'` : "NULL"},
+          '${issue.pageUrl.replace(/'/g, "''")}', ${detailsJson === "NULL" ? "NULL" : `'${detailsJson}'`}
+        );
+      `);
+    }
+    if (issueSqlLines.length > 0) {
+      executeD1SqlStatements(issueSqlLines);
+    }
+
+    // Stage 4: Atomic compare-and-set flip to final status
+    executeD1SqlStatements([
+      `UPDATE audits
+       SET status = '${finalStatus}',
+           current_phase = 'completed',
+           pages_crawled = ${processedCount},
+           pages_total = ${htmlFiles.length},
+           completed_at = datetime('now')
+       WHERE id = '${auditId}' AND status = 'running';`,
+    ]);
+
+    console.log(`[SUCCESS] ${domain} audit successfully finalized in D1 as '${finalStatus}'! (${processedCount} pages, ${detectedIssues.length} issues)`);
+    return true;
+  } catch (d1Err: any) {
+    console.error(`[ERROR] D1 persistence failed for ${domain}:`, d1Err?.message || d1Err);
+    // Mark audit as failed on error
+    try {
+      executeD1SqlStatements([
+        `UPDATE audits
+         SET status = 'failed',
+             error_code = 'CHUNK_WRITE_FAILED',
+             current_phase = 'failed',
+             completed_at = datetime('now')
+         WHERE id = '${auditId}';`,
+      ]);
+    } catch {}
+    return false;
+  }
 }
 
 async function main() {
@@ -422,7 +501,8 @@ async function main() {
       domain: { type: "string", short: "d" },
       limit: { type: "string", short: "l" },
       all: { type: "boolean", short: "a" },
-      "max-pages": { type: "string", short: "m", default: "2000" },
+      force: { type: "boolean", short: "f" },
+      "max-pages": { type: "string", short: "m", default: "10000" },
     },
     allowPositionals: true,
   });
@@ -430,7 +510,8 @@ async function main() {
   console.log("=== OpenSEO Zero-Limit GitHub Repository Audit Runner ===");
   const targetDomain = args.values.domain?.toLowerCase().trim();
   const limit = args.values.limit ? parseInt(args.values.limit, 10) : undefined;
-  const maxPages = parseInt(args.values["max-pages"] || "2000", 10);
+  const force = !!args.values.force;
+  const maxPages = parseInt(args.values["max-pages"] || "10000", 10);
 
   // Load project mappings from D1
   const projectRows = runD1Query(
@@ -441,39 +522,62 @@ async function main() {
     projectIdByDomain.set(p.domain.toLowerCase().trim(), p.id);
   }
 
+  // Load completed audits to avoid redundant work unless --force is given
+  const completedAudits = runD1Query("SELECT DISTINCT project_id FROM audits WHERE status = 'completed';");
+  const alreadyAuditedProjectIds = new Set(completedAudits.map((a) => a.project_id));
+
   const repoMappings = loadRepoMappings();
-  console.log(`Loaded ${repoMappings.size} repository mappings.`);
+  console.log(`Loaded ${repoMappings.size} repository mappings from manifest & PROJECTS_GITHUB.md.`);
 
   let candidates: RepoMapping[] = [];
   for (const [dom, m] of repoMappings.entries()) {
     const projId = projectIdByDomain.get(dom);
     if (projId) {
+      if (!force && alreadyAuditedProjectIds.has(projId)) {
+        continue; // Already audited
+      }
       candidates.push({ ...m, projectId: projId });
     }
   }
 
   if (targetDomain) {
-    candidates = candidates.filter((c) => c.domain.includes(targetDomain));
+    const exact = candidates.filter((c) => c.domain === targetDomain);
+    if (exact.length === 0) {
+      console.error(`[ERROR] Domain '${targetDomain}' is not found among enrolled unaudited candidate projects.`);
+      process.exit(1);
+    }
+    candidates = exact;
   }
 
   if (limit) {
     candidates = candidates.slice(0, limit);
   }
 
-  console.log(`Enrolled candidates ready for GitHub Direct Audit: ${candidates.length}`);
+  console.log(`Eligible unaudited candidate sites ready for GitHub Direct Audit: ${candidates.length}`);
 
   let successCount = 0;
   let failCount = 0;
 
-  for (const c of candidates) {
-    const ok = await auditRepository(c, maxPages);
-    if (ok) successCount++;
-    else failCount++;
+  for (let i = 0; i < candidates.length; i++) {
+    const c = candidates[i];
+    console.log(`\n[${i + 1}/${candidates.length}] Starting audit for ${c.domain} (${c.repoName})...`);
+    try {
+      const ok = await auditRepository(c, maxPages);
+      if (ok) successCount++;
+      else failCount++;
+    } catch (err: any) {
+      console.error(`Audit failed for ${c.domain}:`, err?.message || err);
+      failCount++;
+    }
   }
 
   console.log(`\n======================================================`);
   console.log(`GitHub Fleet Audit Completed! Success: ${successCount}, Failed: ${failCount}`);
   console.log(`======================================================`);
+
+  if (failCount > 0) {
+    process.exit(1);
+  }
 }
 
 main().catch((err) => {

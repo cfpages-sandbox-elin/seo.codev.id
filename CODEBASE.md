@@ -497,5 +497,11 @@ The [Round 17 report](REPORT-SOL-OPENSEO-AGGREGATED-FLEET-VIEW-ROUND-17-2026-11-
   - **Zero Worker Heap Limits & Instant D1 Ingestion**: Runs in Node.js / CLI runner with standard memory headroom, completely bypassing Cloudflare Workers 128 MB isolate constraints. Direct batch inserts populate `audits`, `audit_pages`, and `audit_issues` in `open-seo-db-selfhost`.
   - **Dual-Lane Preservation**: Retains the auxiliary worker `open-seo-selfhost-audit` and `SiteAuditWorkflow` as a fallback lane for on-demand live HTTP status probes, external third-party sites, and optional Cloudflare Browser Run rendering.
 
+### Direct GitHub audit review (2026-11-23)
+
+- **Release decision: revision required.** The Node runner bypasses the live crawler's frontier and Worker heap. It currently reads a mutable branch, ignores recursive tree truncation, budgets HTML pages, and downloads selected files individually. Repository evidence cannot establish live HTTP health or Lighthouse results.
+- Local CLI fixtures with migrated SQLite reproduced completed rows after unread pages or a truncated tree, an incomplete audit remaining completed after a second write chunk failed, incorrect orphan detection for a valid route alias, and a `--domain` request selecting a different host. The existing fleet, roster, and MCP transport tests pass and do not exercise the direct runner.
+- The direct runner writes `audits`, `audit_pages`, and `audit_issues`. `/onsite` reads roster-scoped attempts and snapshots from the fleet tables. Direct audits cannot publish an official fleet score. The hardening and diagnostic integration contracts are in [PRD §4.3](PRD.md#43-internal-github-repository-direct-audit-engine-githubstaticauditengine) and [§4.6](PRD.md#46-streaming-and-incremental-source-audits).
+
 
 

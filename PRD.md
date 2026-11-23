@@ -69,9 +69,9 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **FLEET-FULL-VFY** | Full Fleet Verification: Audit CI run conclusions, commits, and Cloudflare Pages triggers | ✅ Completed | Assistant | 100% verified conservation partition: 254 in-scope compliant (11 prior + 243 newly completed; 0 pending, 2 excluded); resolved flat HTML globbing and directory edge cases |
 | **FLEET-FULL-LOG** | Durable Documentation & Private Git Backup Mirror Parity for 254-Repo Fleet | ✅ Completed | Assistant | Engineering design doc Section 6 updated, LOGS.md row 18 upserted, and private Git mirror synced |
 | **FLEET-SYNC-01** | Bulk Project Enrollment & GitHub Portfolio Linking | ✅ Completed | Assistant | 199 unique properties enrolled in D1 `projects`; 87/87 roster members 100% mapped (`linked_roster = 87`) |
-| **FLEET-GH-01**   | Internal GitHub Repository Direct Audit Engine (`githubStaticAuditEngine`) | ✅ Active | Assistant | Single-request Git Tree page discovery, zero HTTP crawl limits, in-memory graph validation, batch D1 ingestion |
+| **FLEET-GH-01**   | Internal GitHub Repository Direct Audit Engine (`githubStaticAuditEngine`) | 🔄 Hardening required | Assistant | Direct repository inspection exists. Commit-pinned coverage, consistent D1 publication, and fleet snapshot integration are open. |
 | **FLEET-QUEUE-01**| Fleet Audit Batch Queue & Rolling Concurrency Dispatcher | 🔄 In Progress | Assistant | Paced 2-3 concurrent workflow execution preventing `AUDIT_ALREADY_RUNNING` and workflow queue starvation |
-| **FLEET-FAST-01** | Fast-Path Static Site Crawl Profile (`fast_static`) | ✅ Merged into GH | Assistant | Replaced by zero-limit GitHub Repository Direct Audit Engine (`FLEET-GH-01`) |
+| **FLEET-FAST-01** | Fast-Path Static Site Crawl Profile (`fast_static`) | ✅ Merged into GH | Assistant | Source inspection is tracked in `FLEET-GH-01`. Live HTTP and rendered evidence remain available through the edge audit lane. |
 | **FLEET-ISSUE-01**| Fleet-Wide Aggregated Issue Reporting & CSV Export | ⏳ Pending | Assistant | Rollup of critical technical SEO defects across all enrolled properties with 1-click remediation packet export |
 | **FLEET-CLI-01**  | Headless Fleet Audit Runner & MCP Automation Integration | 🔄 In Progress | Assistant | `scripts/run-fleet-audits.ts` CLI runner and MCP tool wrapper for continuous agent fleet auditing |
 
@@ -101,7 +101,7 @@ All Cloudflare components operate with **$0.00/month** infrastructure cost on th
 
 ## 4. Fleet Auditing Acceleration & Scaling Capabilities
 
-To support autonomous, full-depth auditing across Syamsul Alam's entire GitHub repository portfolio (245+ commercial repositories, 87 canonical fleet properties, and 199 enrolled domains) without manual friction, rate limiting, or worker memory exhaustion, the following five architectural capabilities are defined for implementation:
+The portfolio inventory, active OpenSEO projects, and approved fleet roster define different scopes. Fleet jobs must identify the selected scope and report which targets were eligible, skipped, unavailable, or completed.
 
 ### 4.1 Bulk Project Enrollment & GitHub Portfolio Sync (`syncGithubFleetProjects`)
 - **Problem**: Enrolling projects one by one via the web UI is impossible for a portfolio of 200+ properties. Disconnected projects leave `fleet_roster_members.project_id` null (`unmapped`), blocking fleet runs.
@@ -111,14 +111,15 @@ To support autonomous, full-depth auditing across Syamsul Alam's entire GitHub r
 - **Problem**: Dispatching audits across 87 or 200 domains concurrently throws `AUDIT_ALREADY_RUNNING` or `AUDIT_CAPACITY_REACHED` in `AuditService.ts`, and exhausts Cloudflare Workflow step queues or D1 concurrent write locks.
 - **Contract**: A paced queue dispatcher that maintains a configurable concurrency window (default: 2–3 active running crawls). The queue periodically polls audit terminal states via D1, drains completed items, automatically dispatches the next queued domains with jittered backoff, and tracks overall fleet audit progress.
 
-### 4.3 Internal GitHub Repository Direct Audit Engine (`githubStaticAuditEngine`) — The Zero-Limit Paradigm
-- **Problem**: External HTTP crawling on Cloudflare Workers Free Tier enforces a hard 128 MB heap ceiling per isolate. Crawling massive properties (such as `phenolic.kaca.co.id` with 4,813 pages) crashes worker isolates mid-crawl (`exceeded CPU/Memory limits`), encounters HTTP 429 origin backoffs, risks subrequest rate limits, and can take 20+ minutes per site.
-- **Contract**: A direct, zero-limit audit engine leveraging the GitHub Git Database API and `gh` CLI:
-  - **Single-Request Complete Page Universe**: Uses GitHub Git Trees API (`GET /repos/:owner/:repo/git/trees/:branch?recursive=1`) to resolve 100% of the repository's static files in a single atomic response. Every `*.html` page is discovered upfront in milliseconds with zero page omissions, zero crawler traps, and zero HTTP fetch calls.
-  - **Zero Worker Heap Limits**: HTML parsing, AST inspection, and metadata extraction execute in Node.js / CLI runner with full host memory headroom, completely bypassing Cloudflare Workers' 128 MB isolate ceiling.
-  - **Deterministic In-Memory Link Graph Validation**: Internal link targets (`<a href="...">`) are matched in-memory against the complete Git tree file manifest (`Set.has(targetPath)`). Broken internal links, missing assets, and orphan pages are detected deterministically with zero network roundtrips.
-  - **Instant Cloudflare D1 Ingestion**: Extracted page rows and detected issues are ingested in batch transactions directly into D1 (`audits`, `audit_pages`, `audit_issues`), seamlessly updating `/onsite` Aggregated Fleet View and `/p/:projectId/audit`.
-  - **100x Speedup & Zero Limit**: An audit of a 2,000–5,000 page site completes in **under 10 seconds** (vs 20+ minutes over HTTP). Auditing the entire 245+ commercial site fleet finishes in under 30 minutes with zero API rate limits.
+### 4.3 Internal GitHub Repository Direct Audit Engine (`githubStaticAuditEngine`)
+
+`scripts/run-github-fleet-audit.ts` currently runs source analysis in Node.js, checks anchor targets against repository files, and writes project audit rows. This takes static analysis off the HTTP crawler's page frontier and Worker heap. GitHub requests, host memory, and D1 still bound the job. The current writer has no `/onsite` snapshot integration.
+
+- Resolve a repository, publish root, and immutable commit for each eligible host. Scope fleet mode to the approved roster. Keep any broader workspace mode explicit and reject ambiguous host mappings.
+- Enumerate the publish root from a complete tree or archive. Expand truncated Git trees or stop with a coverage reason. Record discovered, attempted, processed, unread, and deliberately excluded counts separately. Completed source coverage requires all eligible files at the pinned revision to be processed.
+- Resolve route aliases to one page identity using the site's declared static hosting rules. Report source findings with source provenance. Use the edge lane for live responses, timing, robots headers, rendering, and Lighthouse. Keep runtime evidence unknown in source-only audits.
+- Publish project audit rows idempotently and expose a successful result only after all expected writes reconcile. Link source evidence to a diagnostic fleet attempt when the fleet writer ships. Official weekly grading still requires the existing runtime, evidence, and comparability contract.
+- Benchmark cold and warm runs with representative small and large exports. Measure discovery, transfer, parsing, and persistence separately, together with peak resident memory, request count, and coverage. Publish a latency target after measuring these workloads.
 
 ### 4.4 Fleet-Wide Aggregated Issue Reporting & CSV Export
 - **Problem**: Currently, `/p/:projectId/audit` confines issue inspection to a single domain. Operators managing 87+ properties cannot see sitewide patterns (e.g. broken theme asset URLs, missing canonical tags across a template family, or robots.txt misconfigurations).
@@ -129,4 +130,11 @@ To support autonomous, full-depth auditing across Syamsul Alam's entire GitHub r
 - **Contract**:
   - Headless runner: `scripts/run-fleet-audits.ts` executing via Wrangler credentials against remote D1 and Workflows.
   - MCP Tool: `run_fleet_audit` on `https://seo.codev.id/mcp`, enabling conversational triggers (e.g. "audit all linked sites in the fleet") with progress reporting, error quarantine, and markdown summary emission.
+
+### 4.6 Streaming and Incremental Source Audits
+
+- **FLEET-GH-02 · Streaming archive reader.** Compare a commit-pinned streamed GitHub tarball against bounded blob downloads. Read entries without extraction, enforce compressed and expanded byte limits and entry size limits, and accept only regular files under the approved publish root. Limit in-flight writes and record download, parse, and persistence timings. Add worker threads only if profiling shows parsing dominates after transfer and D1 improvements. Accept the faster lane when it reproduces page and issue results with bounded memory on representative large exports.
+- **FLEET-GH-03 · Incremental audit evidence.** Cache reusable parse results by blob SHA, parser version, route context, and audit profile. Rebuild route and inbound-link evidence when routes or relevant inputs change, even if the affected page bytes stay unchanged. Accept when add, rename, delete, and link-change fixtures match a clean full scan at the same commit.
+- **FLEET-GH-04 · GitHub-triggered re-audits.** Verify GitHub App webhook signatures and installation/repository scope, deduplicate by delivery and commit, and enqueue the approved host for commit-pinned analysis. Coalesce obsolete queued commits and back off on transient provider failures. A source run records revision evidence. A deployment-triggered edge probe confirms what reached production. Accept when replayed deliveries and superseded commits cannot overwrite a newer result.
+- **FLEET-GH-05 · Source diagnostics in the fleet view.** Reuse roster, run item, and evidence identities to show coverage, source revision, and project audit link for diagnostic runs. Add organization-scoped preview/status for CLI operators before exposing fleet execution through MCP. Accept when a diagnostic run is visible on its own surface and leaves the official weekly score and trend unchanged.
 
