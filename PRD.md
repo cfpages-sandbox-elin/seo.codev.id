@@ -68,6 +68,11 @@ Deploy OpenSEO to `https://seo.codev.id` as a self-hosted, pay-as-you-go alterna
 | **FLEET-FULL-RUN** | Full Fleet Rollout: Zero-Disk Git Database API Upgrade & Dispatch across 243 Remaining Repos | ✅ Completed | Assistant | 243 remaining repositories upgraded and dispatched via Git Database API; 0 MB disk consumed |
 | **FLEET-FULL-VFY** | Full Fleet Verification: Audit CI run conclusions, commits, and Cloudflare Pages triggers | ✅ Completed | Assistant | 100% verified conservation partition: 254 in-scope compliant (11 prior + 243 newly completed; 0 pending, 2 excluded); resolved flat HTML globbing and directory edge cases |
 | **FLEET-FULL-LOG** | Durable Documentation & Private Git Backup Mirror Parity for 254-Repo Fleet | ✅ Completed | Assistant | Engineering design doc Section 6 updated, LOGS.md row 18 upserted, and private Git mirror synced |
+| **FLEET-SYNC-01** | Bulk Project Enrollment & GitHub Portfolio Linking | ✅ Completed | Assistant | 199 unique properties enrolled in D1 `projects`; 87/87 roster members 100% mapped (`linked_roster = 87`) |
+| **FLEET-QUEUE-01**| Fleet Audit Batch Queue & Rolling Concurrency Dispatcher | 🔄 In Progress | Assistant | Paced 2-3 concurrent workflow execution preventing `AUDIT_ALREADY_RUNNING` and workflow queue starvation |
+| **FLEET-FAST-01** | Fast-Path Static Site Crawl Profile (`fast_static`) | ⏳ Pending | Assistant | Lightweight HTTP streaming parser bypassing Browser Run for WordPress static exports / Cloudflare Pages |
+| **FLEET-ISSUE-01**| Fleet-Wide Aggregated Issue Reporting & CSV Export | ⏳ Pending | Assistant | Rollup of critical technical SEO defects across all enrolled properties with 1-click remediation packet export |
+| **FLEET-CLI-01**  | Headless Fleet Audit Runner & MCP Automation Integration | 🔄 In Progress | Assistant | `scripts/run-fleet-audits.ts` CLI runner and MCP tool wrapper for continuous agent fleet auditing |
 
 
 ---
@@ -90,3 +95,37 @@ flowchart LR
 ```
 
 All Cloudflare components operate with **$0.00/month** infrastructure cost on the Free Plan.
+
+---
+
+## 4. Fleet Auditing Acceleration & Scaling Capabilities
+
+To support autonomous, full-depth auditing across Syamsul Alam's entire GitHub repository portfolio (245+ commercial repositories, 87 canonical fleet properties, and 199 enrolled domains) without manual friction, rate limiting, or worker memory exhaustion, the following five architectural capabilities are defined for implementation:
+
+### 4.1 Bulk Project Enrollment & GitHub Portfolio Sync (`syncGithubFleetProjects`)
+- **Problem**: Enrolling projects one by one via the web UI is impossible for a portfolio of 200+ properties. Disconnected projects leave `fleet_roster_members.project_id` null (`unmapped`), blocking fleet runs.
+- **Contract**: An idempotent bulk enrollment service and CLI script (`scripts/link-github-fleet.ts`) that reads `fleetManifest.json` and `PROJECTS_GITHUB.md`, extracts unique normalized canonical hostnames, inserts missing records into `projects` (`organization_id = 'shared-workspace'`, `location_code = 2360`, `language_code = 'id'`), and updates `fleet_roster_members.project_id` to achieve 100% mapped status.
+
+### 4.2 Fleet Audit Batch Queue & Rolling Concurrency Dispatcher (`FleetAuditQueue`)
+- **Problem**: Dispatching audits across 87 or 200 domains concurrently throws `AUDIT_ALREADY_RUNNING` or `AUDIT_CAPACITY_REACHED` in `AuditService.ts`, and exhausts Cloudflare Workflow step queues or D1 concurrent write locks.
+- **Contract**: A paced queue dispatcher that maintains a configurable concurrency window (default: 2–3 active running crawls). The queue periodically polls audit terminal states via D1, drains completed items, automatically dispatches the next queued domains with jittered backoff, and tracks overall fleet audit progress.
+
+### 4.3 Fast-Path Static Site Crawl Profile (`fast_static`)
+- **Problem**: WordPress static exports, Astro brochure sites, and Cloudflare Pages portfolio sites do not execute dynamic client-side hydration or require paid browser rendering. Running full browser automation or heavyweight emulation on every internal page wastes execution time and limits throughput.
+- **Contract**: A lightweight crawl configuration (`fast_static`):
+  - `renderJavaScript: false`
+  - Direct HTTP streaming edge fetch with HTML regex/cheerio metadata parsing.
+  - Concurrency paced at ≤2 requests/sec per origin to protect edge Workers from subrequest limits.
+  - Dedicated full-depth traversal up to `maxPages: 2000` (zero page omission).
+  - Pinned Lighthouse sampling (`lighthouseStrategy: "auto"`) limited strictly to representative homepage and primary landing templates.
+
+### 4.4 Fleet-Wide Aggregated Issue Reporting & CSV Export
+- **Problem**: Currently, `/p/:projectId/audit` confines issue inspection to a single domain. Operators managing 87+ properties cannot see sitewide patterns (e.g. broken theme asset URLs, missing canonical tags across a template family, or robots.txt misconfigurations).
+- **Contract**: An aggregated issue triage layer on `/onsite` that rolls up issues across all enrolled projects, groups identical symptoms by root cause (e.g. shared static site CSS path or template bug), and generates structured remediation packets with direct skill routing (`static-site-css-repair`, `internal-linking`, `unslop-seo`).
+
+### 4.5 Headless CLI Fleet Audit Runner & MCP Automation Integration
+- **Problem**: Autonomous AI agents (Gemini, Sol, Codex, Claude) need to trigger and supervise full fleet audits programmatically without driving web UI browser sessions.
+- **Contract**:
+  - Headless runner: `scripts/run-fleet-audits.ts` executing via Wrangler credentials against remote D1 and Workflows.
+  - MCP Tool: `run_fleet_audit` on `https://seo.codev.id/mcp`, enabling conversational triggers (e.g. "audit all linked sites in the fleet") with progress reporting, error quarantine, and markdown summary emission.
+

@@ -474,4 +474,19 @@ The [Round 17 report](REPORT-SOL-OPENSEO-AGGREGATED-FLEET-VIEW-ROUND-17-2026-11-
 - **Live Worker Deployment**: Deployed production Worker `open-seo-selfhost` and aux worker `open-seo-selfhost-audit` to `https://seo.codev.id` via Alchemy (`deploy:selfhost`), binding `FEATURE_FLEET_VIEW="true"` and `FLEET_VIEW_ORGANIZATION_ID="shared-workspace"`.
 - **Live Edge Wire Verification**: Verified `https://seo.codev.id/onsite` returns HTTP 302 redirect to Cloudflare Access Zero Trust login (`broken-hill-4163.cloudflareaccess.com`) preserving `redirect_url=%2Fonsite`, eliminating the previous 404 route error.
 
+### Fleet Portfolio Linking & Full-Depth Audit Automation (2026-11-23)
+
+- **Bulk Project Enrollment & GitHub Portfolio Linking**:
+  - Script: `scripts/generate-fleet-linking-sql.ts` parses `fleetManifest.json` and `PORTFOLIO/EVIDENCE/PROJECTS_GITHUB.md`.
+  - Enrolled 186 new properties into Cloudflare D1 `projects` under `shared-workspace`, raising total projects from 13 to **199** with Indonesian locale (`location_code = 2360`, `language_code = 'id'`).
+  - Linked all 87 canonical commercial properties in `fleet_roster_members` to their enrolled project (`linked_roster = 87 / 87`, 0 unmapped).
+- **Headless Fleet Audit Runner & Workflow Concurrency Control**:
+  - Script: `scripts/run-fleet-audits.ts` dispatches full-depth site audits across enrolled projects via Cloudflare Workflows (`site-audit-workflow-selfhost`).
+  - Enforces rolling concurrency pacing (default: 2 active crawls) with automatic queue drain, jittered backoff, and live polling via D1.
+  - Successfully verified on `aquarium.kaca.co.id`: 144 pages crawled, analyzed, and marked completed with 0 errors.
+- **Worker Memory Ceiling & PRD Acceleration Roadmap**:
+  - Discovered Cloudflare Free Tier 128 MB Worker heap ceiling when crawling massive pSEO catalogs with >4,000 sitemap URLs (`phenolic.kaca.co.id` at 1,380 pages).
+  - Authored Section 4 of `PRD.md` and Section 10 of `OPENSEO-AGGREGATED-FLEET-VIEW-PRD.md` specifying 5 high-leverage acceleration capabilities: (1) Bulk Project Enrollment, (2) Fleet Audit Batch Queue, (3) Fast-Path Static Site Crawl Profile (`fast_static`), (4) Fleet-Wide Issue Rollup & CSV Export, and (5) Headless CLI & MCP Automation.
+
+
 
