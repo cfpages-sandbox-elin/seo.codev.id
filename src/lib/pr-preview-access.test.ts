@@ -1,10 +1,13 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { z } from "zod";
+
+const GIT_BASH = "C:\\Program Files\\Git\\bin\\bash.exe";
+const BASH_CMD = process.platform === "win32" && existsSync(GIT_BASH) ? GIT_BASH : "bash";
 
 const workflow = z
   .object({
@@ -41,7 +44,7 @@ describe("preview Access verification", () => {
       const responseFile = join(directory, "responses");
       writeFileSync(responseFile, responses.join("\n") + "\n");
       const result = spawnSync(
-        "bash",
+        BASH_CMD,
         [
           "-c",
           // A shared file descriptor advances even inside curl's command substitution.
@@ -57,7 +60,7 @@ ${script}`,
             ...process.env,
             PREVIEW_URL: "https://preview.example.invalid",
             STAGE: "test",
-            PREVIEW_RESPONSES: responseFile,
+            PREVIEW_RESPONSES: responseFile.replace(/\\/g, "/"),
           },
         },
       );

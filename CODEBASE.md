@@ -557,6 +557,21 @@ Remediated all findings from Engineer Sol's Round 5 and Round 6 reviews ([REPORT
 - **F9 (Fleet Run Enum Parity & Isolated Fallback CAS)**: Aligned `fleet_runs.status` with `fleetRunStatuses` (`completed` or `partial`), leaving unmeasured pillar scores in `fleet_snapshots` as `NULL`. Implemented observable fallback CAS with single-row assertion and lane-aware logging.
 - **F10 (Local Test Suite Green on Windows)**: Switched SQLite fixtures in `googleOAuth.test.ts` and `googleOAuthMigration.test.ts` to `:memory:`, and guarded cleanup in `GoogleAccountService.test.ts` with retryable lifecycle, eliminating Windows `EPERM` errors. Created `scripts/github-archive-audit.test.ts` verifying streaming byte caps, Git blob identity checks, and RFC 1123 hostname validation.
 
+### Round 7 Review Remediation & Full Fleet Hardening — Round 8 Pre-Flight (2026-11-24)
+
+Remediated all findings from Engineer Sol's Round 7 review ([REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-7-2026-11-24.md](file:///C:/Users/THINKPAD/OneDrive/MD/REPORT/REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-7-2026-11-24.md)):
+- **P1-01 (V3: Linker Cross-Workspace Postcheck Bypass)**: Implemented `verifyRosterIntegrity` in `scripts/link-github-fleet.ts` with unified single-query live postcheck scoped to `fleet_roster_versions.id` and `organization_id`, asserting `unmapped === 0`, `invalid_links === 0`, and `member_count === approvedRoster.domain_count`.
+- **P1-02 & P2-04 (V2: Skill Paid Quotes & Recurrence Syntax v1.6.0)**: Updated `openseo-ops` v1.6.0: rank tracking quotes read `costCredits` from `structuredContent.costCredits` and scheduled from `structuredContent.scheduledEstimate?.costCredits` without fallback; AI visibility quotes read `runNowCostUsd` from `estimate.structuredContent.data.runNowCostUsd`; AI schedule tool uses `scheduleInterval: "weekly"` with `scheduleTime: { weekday: 1, hour: 9, minute: 0, timeZone: "Asia/Jakarta" }`; corrected internal audit limit tier to `"self_hosted"`.
+- **P2-01 (V1: Raw Blob Streaming Cap)**: In `scripts/run-github-fleet-audit.ts` and `scripts/benchmark-archive-audit.ts`, piped raw blob response bodies through `capBytes(10MB, "raw blob")` and cancelled response bodies on HTTP errors.
+- **P2-02 (V1: Static Asset Route Encoding Consistency)**: Segment-encoded all tree item paths in `validRouteSet` to ensure assets containing URI characters (`#`, `?`, spaces) match links deterministically without false broken links.
+- **P2-03 (V1: Link Graph Completeness vs. Anchor Cap)**: Added `truncatedLinks: boolean` to `PageAnalysis` and `analyzeHtml` when anchor count reaches `MAX_EXTRACTED_LINKS` (1,000); suppressed false orphan page reporting when link graph is incomplete.
+- **P2-05 (V2: Fleet Status Initial Rollup Scope)**: Scoped initial audit status aggregation in `scripts/fleet-status.ts` with `JOIN projects p ON audits.project_id = p.id WHERE p.organization_id = 'shared-workspace' AND p.archived_at IS NULL`.
+- **P2-07 (V3: Edge CLI Scope Exclusivity & Concurrency Bounds)**: Validated `--concurrency` strictly between 1 and 5 in `scripts/run-fleet-audits.ts`; enforced mutual exclusivity among `--domain`, `--all`, and `--limit`.
+- **P2-08 (V3: Fleet Issue Domain Validation)**: Shared `CANONICAL_DOMAIN_REGEX` and `isValidCanonicalHostname` on `get_fleet_issues` domain parameter in `src/server/mcp/tools/fleet-tools.ts`.
+- **P2-09 & P2-10 (V4: Terminal CAS Row Assertion & Diagnostic Failure Propagation)**: In `scripts/run-github-fleet-audit.ts`, verified `casResult.length === 1 && casResult[0].id === auditId`; propagated diagnostic fleet series publication failures to non-zero exit code.
+- **P2-11 (V4: Windows PR Preview Access Test)**: Used Git Bash (`C:\Program Files\Git\bin\bash.exe`) on Windows in `src/lib/pr-preview-access.test.ts` and normalized paths to forward slashes.
+
+
 
 
 

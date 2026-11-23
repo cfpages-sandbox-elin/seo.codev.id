@@ -58,6 +58,26 @@ describe("Fleet MCP Tools", () => {
       expect(data.issues[0].skillRoute).toBe("static-site-css-repair");
       expect(data.issues[1].skillRoute).toBe("unslop-seo");
     });
+
+    it("validates canonical domain input in get_fleet_issues schema (Sol P2-08)", () => {
+      const schema = getFleetIssuesTool.config.inputSchema;
+      expect(schema.domain.safeParse("a.id").success).toBe(true);
+      expect(schema.domain.safeParse("kaca.co.id").success).toBe(true);
+      expect(schema.domain.safeParse("-invalid.com").success).toBe(false);
+      expect(schema.domain.safeParse("https://kaca.co.id").success).toBe(false);
+      expect(schema.domain.safeParse("kaca.co.id/path").success).toBe(false);
+    });
+
+    it("rejects invalid canonical domain in handler (Sol P2-08)", async () => {
+      const result = await getFleetIssuesTool.handler(
+        { limit: 10, domain: "-invalid.com" },
+        toolContext,
+      );
+      expect(result.structuredContent).toEqual({
+        error: "invalid_domain",
+        domain: "-invalid.com",
+      });
+    });
   });
 
   describe("run_fleet_audit", () => {

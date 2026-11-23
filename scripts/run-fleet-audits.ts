@@ -142,7 +142,13 @@ async function main() {
     maxPages = num;
   }
 
-  const concurrency = Math.max(1, parseInt(args.values.concurrency || "2", 10) || 2);
+  const rawConcurrency = args.values.concurrency ? String(args.values.concurrency) : "2";
+  const numConcurrency = Number(rawConcurrency);
+  if (!/^[1-9][0-9]*$/.test(rawConcurrency) || !Number.isSafeInteger(numConcurrency) || numConcurrency < 1 || numConcurrency > 5) {
+    console.error("[ERROR] Invalid --concurrency value. Must be a safe positive integer between 1 and 5.");
+    process.exit(1);
+  }
+  const concurrency = numConcurrency;
   let limit: number | undefined;
   if (args.values.limit !== undefined) {
     const raw = String(args.values.limit);
@@ -160,9 +166,14 @@ async function main() {
     ? { database: "open-seo-db-selfhost", dbFlag: "--remote", workflow: "site-audit-workflow-selfhost" }
     : { database: "DB", dbFlag: "--local", workflow: "site-audit-workflow" };
 
-  // Sol P1-05: Require explicit execution scope (fail closed against unintended global audits)
-  if (!targetDomainFilter && !isAll && !limit) {
-    console.error("[ERROR] Missing explicit execution scope. Please specify --domain <canonical-host>, --all, or --limit <n>.");
+  // Sol P2-07: Require mutually exclusive explicit execution scope
+  const scopeCount = (targetDomainFilter ? 1 : 0) + (isAll ? 1 : 0) + (limit !== undefined ? 1 : 0);
+  if (scopeCount === 0) {
+    console.error("[ERROR] Missing explicit execution scope. Please specify exactly one of --domain <canonical-host>, --all, or --limit <n>.");
+    process.exit(1);
+  }
+  if (scopeCount > 1) {
+    console.error("[ERROR] Conflicting execution scope flags: please specify exactly one of --domain, --all, or --limit.");
     process.exit(1);
   }
 

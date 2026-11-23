@@ -81,12 +81,23 @@ interface EnrichedFleetIssue {
   recommendedAction: string;
 }
 
+// ─── Canonical Domain Helpers (RFC 1123) ────────────────────────────────────
+
+export const CANONICAL_DOMAIN_REGEX = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+export function isValidCanonicalHostname(domain: string): boolean {
+  if (!domain || typeof domain !== "string" || domain.length > 253) return false;
+  return CANONICAL_DOMAIN_REGEX.test(domain);
+}
+
 // ─── get_fleet_issues ────────────────────────────────────────────────────────
 
 const getFleetIssuesInputSchema = {
   domain: z
     .string()
     .trim()
+    .max(253)
+    .regex(CANONICAL_DOMAIN_REGEX, "Must be a valid canonical hostname (e.g. 'kaca.co.id') without protocol, path, or port")
     .optional()
     .describe("Optional domain to filter issues by (e.g. 'kaca.co.id')."),
   severity: z
@@ -159,6 +170,12 @@ export const getFleetIssuesTool = {
     ];
 
     if (args.domain) {
+      if (!isValidCanonicalHostname(args.domain)) {
+        return mcpResponse({
+          text: `Error: Invalid canonical hostname: "${args.domain}". Must be lowercase RFC 1123 hostname without protocol, port, or path.`,
+          structuredContent: { error: "invalid_domain", domain: args.domain },
+        });
+      }
       conditions.push(eq(projects.domain, args.domain.toLowerCase().trim()));
     }
     if (args.severity) {
@@ -244,8 +261,6 @@ export const getFleetIssuesTool = {
 };
 
 // ─── run_fleet_audit ────────────────────────────────────────────────────────
-
-const CANONICAL_DOMAIN_REGEX = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 
 const runFleetAuditInputSchema = {
   domain: z

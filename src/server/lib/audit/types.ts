@@ -95,6 +95,9 @@ export interface PageAnalysis {
 
   // Hreflang
   hreflangTags: string[];
+
+  /** Whether links were truncated because link count exceeded MAX_EXTRACTED_LINKS */
+  truncatedLinks?: boolean;
 }
 
 /** Lighthouse result for a single URL+strategy. */

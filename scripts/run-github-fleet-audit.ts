@@ -235,23 +235,25 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       htmlFiles.push(item);
     }
 
-    // Direct path
+    // Segment-encode path to ensure static assets with special characters resolve consistently (Sol P2-02)
+    const encodedPath = p.split("/").map(encodeURIComponent).join("/");
+    validRouteSet.add(normalizeRoute(`${domain}/${encodedPath}`));
     validRouteSet.add(normalizeRoute(`${domain}/${p}`));
 
     if (isHtml) {
       if (p === "index.html" || p === "index.htm") {
         validRouteSet.add(normalizeRoute(domain));
       } else if (p.endsWith("/index.html")) {
-        const slug = p.slice(0, -11);
+        const slug = encodedPath.slice(0, -11);
         validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
       } else if (p.endsWith("/index.htm")) {
-        const slug = p.slice(0, -10);
+        const slug = encodedPath.slice(0, -10);
         validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
       } else if (p.endsWith(".html")) {
-        const slug = p.slice(0, -5);
+        const slug = encodedPath.slice(0, -5);
         validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
       } else if (p.endsWith(".htm")) {
-        const slug = p.slice(0, -4);
+        const slug = encodedPath.slice(0, -4);
         validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
       }
     }
@@ -308,6 +310,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   const crawledPages: CrawledPageResult[] = [];
   const detectedIssues: DetectedIssue[] = [];
   const inboundLinkCounts = new Map<string, number>();
+  let hasTruncatedLinks = false;
 
   let archiveHtmlMap: Map<string, Buffer> | null = null;
   if (useArchive) {
@@ -368,11 +371,16 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
 
             if (!res.ok) {
               console.warn(`Failed to fetch ${file.path}: HTTP ${res.status}`);
+              await res.body?.cancel().catch(() => {});
               return;
             }
-
-            const arrayBuf = await res.arrayBuffer();
-            bytes = Buffer.from(arrayBuf);
+            if (!res.body) {
+              console.warn(`Empty response body for ${file.path}`);
+              return;
+            }
+            bytes = await streamToBuffer(
+              res.body.pipeThrough(capBytes(10 * 1024 * 1024, "raw blob")),
+            );
           }
 
           if (!bytes) return;
@@ -382,6 +390,9 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
 
           const html = bytes.toString("utf8");
           const analysis = analyzeHtml(html, pageUrl, 200, 50);
+          if (analysis.truncatedLinks) {
+            hasTruncatedLinks = true;
+          }
 
           const pageId = await deterministicAuditRowId(auditId, pageUrl);
           const contentHash = analysis.bodyText
@@ -479,22 +490,26 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   const isComplete = !isTreeTruncated && candidateFiles.length === htmlFiles.length && unreadCount === 0 && processedCount > 0;
   const finalStatus = isComplete ? "completed" : "failed";
 
-  // 4. Detect Orphan Pages (only when tree is complete and all eligible pages read — Sol P1-03)
+  // 4. Detect Orphan Pages (only when tree is complete, all eligible pages read, and link graph untruncated — Sol P1-03, P2-03)
   const homeNorm = normalizeRoute(domain);
   if (isComplete && unreadCount === 0) {
-    for (const page of crawledPages) {
-      if (normalizeRoute(page.url) === homeNorm) continue;
-      const inlinks =
-        inboundLinkCounts.get(page.url) ||
-        inboundLinkCounts.get(normalizeRoute(page.url)) ||
-        0;
-      if (inlinks === 0) {
-        detectedIssues.push({
-          issueType: "orphan-page",
-          pageId: page.id,
-          pageUrl: page.url,
-          dedupeKey: `orphan:${page.url}`,
-        });
+    if (hasTruncatedLinks) {
+      console.warn(`[WARN] Links were truncated on one or more pages (>1,000 links); orphan page detection suppressed to prevent false orphan reports.`);
+    } else {
+      for (const page of crawledPages) {
+        if (normalizeRoute(page.url) === homeNorm) continue;
+        const inlinks =
+          inboundLinkCounts.get(page.url) ||
+          inboundLinkCounts.get(normalizeRoute(page.url)) ||
+          0;
+        if (inlinks === 0) {
+          detectedIssues.push({
+            issueType: "orphan-page",
+            pageId: page.id,
+            pageUrl: page.url,
+            dedupeKey: `orphan:${page.url}`,
+          });
+        }
       }
     }
   }
@@ -588,11 +603,12 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
          AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') = ${detectedIssues.length}
        RETURNING id;`;
     const casResult = runD1Query(casSql, isRemote);
-    if (!casResult || casResult.length !== 1) {
-      throw new Error(`Audit CAS finalization failed for ${auditId} (updated ${casResult?.length ?? 0} rows, expected 1). State conflict or child count mismatch.`);
+    if (!casResult || casResult.length !== 1 || casResult[0].id !== auditId) {
+      throw new Error(`Audit CAS finalization failed for ${auditId} (updated ${casResult?.length ?? 0} rows, expected 1 matching id). State conflict or child count mismatch.`);
     }
 
     // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration strictly scoped to organization and approved roster (Sol P1-02, P1-06)
+    let diagnosticFailed = false;
     try {
       const rosterRows = runD1Query(
         `SELECT m.id AS member_id, m.version_id, v.organization_id
@@ -636,6 +652,13 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       }
     } catch (diagErr: any) {
       console.error(`[ERROR] Diagnostic fleet series linking failed:`, diagErr?.message || diagErr);
+      diagnosticFailed = true;
+    }
+
+    if (diagnosticFailed) {
+      console.error(`[ERROR] Audit finalized in D1 for ${domain} but diagnostic fleet series recording failed.`);
+      process.exitCode = 1;
+      return false;
     }
 
     console.log(`[SUCCESS] ${domain} audit successfully finalized in D1 as '${finalStatus}'! (${processedCount} pages, ${detectedIssues.length} issues)`);

@@ -7,6 +7,7 @@ import {
   isValidCanonicalHostname,
   parseTarHtmlFiles,
 } from "./github-archive-utils";
+import { analyzeHtml } from "../src/server/lib/audit/page-analyzer";
 import zlib from "node:zlib";
 
 describe("GitHub Archive & Git Ingestion Utils", () => {
@@ -109,6 +110,23 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
       expect(result.size).toBe(1);
       expect(result.has("index.html")).toBe(true);
       expect(result.get("index.html")?.toString("utf8")).toBe("<h1>Hello OpenSEO</h1>");
+    });
+  });
+
+  describe("analyzeHtml link truncation detection (Sol P2-03)", () => {
+    it("reports truncatedLinks=false on ordinary pages with <1,000 links", () => {
+      const html = "<html><body><a href='/about'>About</a><a href='/contact'>Contact</a></body></html>";
+      const result = analyzeHtml(html, "https://example.com/", 200, 50);
+      expect(result.truncatedLinks).toBe(false);
+      expect(result.links.length).toBe(2);
+    });
+
+    it("reports truncatedLinks=true when unique links exceed MAX_EXTRACTED_LINKS (1,000)", () => {
+      const links = Array.from({ length: 1005 }, (_, i) => `<a href="/page-${i}">Link ${i}</a>`).join("\n");
+      const html = `<html><body>${links}</body></html>`;
+      const result = analyzeHtml(html, "https://example.com/", 200, 50);
+      expect(result.truncatedLinks).toBe(true);
+      expect(result.links.length).toBe(1000);
     });
   });
 });

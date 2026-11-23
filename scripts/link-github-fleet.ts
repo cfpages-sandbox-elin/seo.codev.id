@@ -205,7 +205,7 @@ export async function linkFleet(options: {
     );
 
     const rosterVersions = runD1Query(
-      `SELECT id, version_tag, manifest_hash FROM fleet_roster_versions WHERE organization_id = '${orgId}' ORDER BY approved_at DESC LIMIT 1;`,
+      `SELECT id, version_tag, domain_count, manifest_hash FROM fleet_roster_versions WHERE organization_id = '${orgId}' ORDER BY approved_at DESC LIMIT 1;`,
       isRemote,
     );
     if (rosterVersions.length > 0) {
@@ -333,20 +333,49 @@ export async function linkFleet(options: {
     `);
   }
 
+// Helper to perform strict live roster verification scoped to version and organization (Sol P1-01)
+function verifyRosterIntegrity(
+  rosterId: string,
+  orgId: string,
+  expectedCount: number,
+  isRemote: boolean,
+) {
+  const query = `
+    SELECT
+      COUNT(m.id) AS member_count,
+      COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.project_id IS NULL THEN 1 ELSE 0 END), 0) AS unmapped,
+      COALESCE(SUM(CASE WHEN m.project_id IS NOT NULL AND (p.id IS NULL OR p.organization_id <> v.organization_id OR p.archived_at IS NOT NULL) THEN 1 ELSE 0 END), 0) AS invalid_links
+    FROM fleet_roster_versions v
+    LEFT JOIN fleet_roster_members m ON m.version_id = v.id
+    LEFT JOIN projects p ON p.id = m.project_id
+    WHERE v.id = '${rosterId}' AND v.organization_id = '${orgId}'
+    GROUP BY v.id;
+  `;
+  const res = runD1Query(query, isRemote);
+  if (!res || res.length === 0) {
+    throw new Error(`Roster integrity query returned no records for roster ${rosterId} in organization ${orgId}.`);
+  }
+  const row = res[0];
+  const memberCount = Number(row.member_count ?? 0);
+  const unmapped = Number(row.unmapped ?? 0);
+  const invalidLinks = Number(row.invalid_links ?? 0);
+
+  if (memberCount !== expectedCount) {
+    throw new Error(`Roster member count mismatch: expected ${expectedCount}, found ${memberCount} for roster ${rosterId}.`);
+  }
+  if (unmapped > 0) {
+    throw new Error(`${unmapped} fleet roster members remain unmapped in roster ${rosterId}.`);
+  }
+  if (invalidLinks > 0) {
+    throw new Error(`${invalidLinks} fleet roster members point to foreign, missing, or archived projects in roster ${rosterId}.`);
+  }
+  console.log(`Live verification: 100% of fleet roster members (${memberCount}/${expectedCount}) are strictly mapped to active projects in organization ${orgId}!`);
+}
+
   if (sqlStatements.length <= 1) {
     if (!isDryRun) {
-      const updatedMembers = runD1Query(
-        `SELECT count(*) as unmapped_count FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}' AND project_id IS NULL;`,
-        isRemote,
-      );
-      if (!updatedMembers || updatedMembers.length === 0 || typeof updatedMembers[0]?.unmapped_count !== "number") {
-        throw new Error(`Verification query failed to return a valid count for roster ${approvedRoster.id}.`);
-      }
-      const unmapped = updatedMembers[0].unmapped_count;
-      if (unmapped > 0) {
-        throw new Error(`${unmapped} fleet roster members remain unmapped in approved roster ${approvedRoster.id}.`);
-      }
-      console.log(`Live verification: 100% of fleet roster members in ${approvedRoster.id} are mapped to verified D1 projects! Zero updates required.`);
+      verifyRosterIntegrity(approvedRoster.id, orgId, approvedRoster.domain_count ?? existingMembers.length, isRemote);
+      console.log(`Live verification: All portfolio projects and fleet roster members in ${approvedRoster.id} are 100% mapped! Zero updates required.`);
     } else {
       if (unmappedCount > 0) {
         console.error(`[ERROR] ${unmappedCount} fleet roster members remain unmapped.`);
@@ -361,21 +390,8 @@ export async function linkFleet(options: {
   console.log(`Executing ${sqlStatements.length - 1} SQL statements against D1...`);
   executeD1Sql(sqlStatements.join("\n"), isRemote);
 
-  // 5. Verification check strictly scoped to current roster (Sol F5)
-  const updatedMembers = runD1Query(
-    `SELECT count(*) as unmapped_count FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}' AND project_id IS NULL;`,
-    isRemote,
-  );
-  if (!updatedMembers || updatedMembers.length === 0 || typeof updatedMembers[0]?.unmapped_count !== "number") {
-    throw new Error(`Verification query failed to return a valid count for roster ${approvedRoster.id}.`);
-  }
-  const unmapped = updatedMembers[0].unmapped_count;
-  console.log(`Verification: Remaining unmapped roster members in ${approvedRoster.id}: ${unmapped}`);
-  if (unmapped === 0) {
-    console.log(`SUCCESS: 100% of fleet roster members are linked to verified D1 projects!`);
-  } else {
-    throw new Error(`WARNING: ${unmapped} members remain unmapped after linking run.`);
-  }
+  // 5. Verification check strictly scoped to current roster and organization (Sol P1-01, F5)
+  verifyRosterIntegrity(approvedRoster.id, orgId, approvedRoster.domain_count ?? existingMembers.length, isRemote);
 }
 
 // CLI execution

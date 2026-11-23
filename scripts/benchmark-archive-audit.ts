@@ -105,13 +105,15 @@ export async function runBenchmark(repoName: string) {
             },
             signal: AbortSignal.timeout(60000),
           });
-          if (res.ok) {
-            const arrayBuf = await res.arrayBuffer();
-            const buf = Buffer.from(arrayBuf);
+          if (res.ok && res.body) {
+            const buf = await streamToBuffer(
+              res.body.pipeThrough(capBytes(10 * 1024 * 1024, "raw blob")),
+            );
             verifyGitBlob(buf, file.sha);
             lane1TotalBytes += buf.length;
             lane1Results.set(file.path, buf);
           } else {
+            await res.body?.cancel().catch(() => {});
             throw new Error(`HTTP ${res.status} fetching ${file.path}`);
           }
         } catch (err: any) {

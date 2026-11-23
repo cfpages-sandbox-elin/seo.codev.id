@@ -104,6 +104,7 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
     links: Array.from(linksByTarget.values()),
     hasStructuredData,
     hreflangTags,
+    truncatedLinks: false,
   };
 }
 

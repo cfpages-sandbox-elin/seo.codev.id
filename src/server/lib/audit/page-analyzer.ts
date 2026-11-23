@@ -77,6 +77,7 @@ export function analyzeHtml(
 
   const images: Array<{ src: string | null; alt: string | null }> = [];
   const linksByTarget = new Map<string, PageLink>();
+  let truncatedLinks = false;
   let openAnchor: OpenAnchor | null = null;
 
   // Visible text: prefer text inside an explicit <body>; when the document
@@ -118,7 +119,10 @@ export function analyzeHtml(
     if (!openAnchor) return;
     const { href, rel, text } = openAnchor;
     openAnchor = null;
-    if (linksByTarget.size >= MAX_EXTRACTED_LINKS) return;
+    if (linksByTarget.size >= MAX_EXTRACTED_LINKS) {
+      truncatedLinks = true;
+      return;
+    }
     const resolved = normalizeUrl(href, pageUrl);
     if (!resolved || linksByTarget.has(resolved)) return;
     const anchor = text
@@ -279,5 +283,6 @@ export function analyzeHtml(
     links: Array.from(linksByTarget.values()),
     hasStructuredData,
     hreflangTags,
+    truncatedLinks,
   };
 }

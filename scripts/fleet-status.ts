@@ -60,10 +60,14 @@ function runD1Query(query: string): any[] {
 async function main() {
   console.log("=== OpenSEO Fleet Status Summary ===");
 
-  // 1. Audit status breakdown
-  const auditStatus = runD1Query(
-    "SELECT status, count(*) as count FROM audits GROUP BY status;"
-  );
+  // 1. Audit status breakdown (scoped to shared-workspace and active projects)
+  const auditStatus = runD1Query(`
+    SELECT a.status, count(*) as count
+    FROM audits a
+    JOIN projects p ON a.project_id = p.id
+    WHERE p.organization_id = 'shared-workspace' AND p.archived_at IS NULL
+    GROUP BY a.status;
+  `);
   console.log("Audits by status:", auditStatus);
 
   // 2. Total enrolled projects in shared-workspace
