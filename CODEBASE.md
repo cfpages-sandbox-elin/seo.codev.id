@@ -488,5 +488,14 @@ The [Round 17 report](REPORT-SOL-OPENSEO-AGGREGATED-FLEET-VIEW-ROUND-17-2026-11-
   - Discovered Cloudflare Free Tier 128 MB Worker heap ceiling when crawling massive pSEO catalogs with >4,000 sitemap URLs (`phenolic.kaca.co.id` at 1,380 pages).
   - Authored Section 4 of `PRD.md` and Section 10 of `OPENSEO-AGGREGATED-FLEET-VIEW-PRD.md` specifying 5 high-leverage acceleration capabilities: (1) Bulk Project Enrollment, (2) Fleet Audit Batch Queue, (3) Fast-Path Static Site Crawl Profile (`fast_static`), (4) Fleet-Wide Issue Rollup & CSV Export, and (5) Headless CLI & MCP Automation.
 
+### Transition to Internal GitHub Repository Direct Audit Engine (`githubStaticAuditEngine`) (2026-11-23)
+
+- **Zero-Limit GitHub Audit Paradigm Shift**:
+  - Rather than relying on external edge HTTP crawls (which are constrained by Cloudflare Free Tier 128 MB Worker isolate heap limits, origin 429 rate limits, and subrequest quotas), the fleet site audit architecture transitions to **internal repository audits directly from GitHub** (`githubStaticAuditEngine`).
+  - **Git Trees Single-Request Discovery**: Leverages the GitHub Git Database API (`GET /repos/:owner/:repo/git/trees/:branch?recursive=1`) and `gh` CLI to retrieve the complete static file tree in a single atomic response. Discovers 100% of all static HTML pages in milliseconds with 0 crawler traps and 0 page omissions.
+  - **In-Memory Link Graph & Dead Link Verification**: Validates all internal link targets `<a href="...">` against the complete Git tree file manifest (`Set.has(targetPath)`). Broken internal links, missing assets, and orphan pages are detected deterministically with zero network calls.
+  - **Zero Worker Heap Limits & Instant D1 Ingestion**: Runs in Node.js / CLI runner with standard memory headroom, completely bypassing Cloudflare Workers 128 MB isolate constraints. Direct batch inserts populate `audits`, `audit_pages`, and `audit_issues` in `open-seo-db-selfhost`.
+  - **Dual-Lane Preservation**: Retains the auxiliary worker `open-seo-selfhost-audit` and `SiteAuditWorkflow` as a fallback lane for on-demand live HTTP status probes, external third-party sites, and optional Cloudflare Browser Run rendering.
+
 
 
