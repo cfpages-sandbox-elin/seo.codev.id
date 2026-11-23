@@ -12,6 +12,7 @@ import { execSync } from "node:child_process";
 import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import crypto from "node:crypto";
+import zlib from "node:zlib";
 import { parseArgs } from "node:util";
 import { analyzeHtml } from "../src/server/lib/audit/page-analyzer";
 import { runPageReporters, type DetectedIssue } from "../src/server/lib/audit/issues/page-reporters";
@@ -19,8 +20,8 @@ import type { CrawledPageResult } from "../src/server/lib/audit/types";
 import { deterministicAuditRowId } from "../src/server/lib/audit/ids";
 import { getIssueDescriptor } from "../src/shared/audit-issues";
 
-const ENV_FILE = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/.env.selfhost");
-const FLEET_MANIFEST_FILE = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/src/server/features/fleet/data/fleetManifest.json");
+const ENV_FILE = resolve(".env.selfhost");
+const FLEET_MANIFEST_FILE = resolve("src/server/features/fleet/data/fleetManifest.json");
 const PROJECTS_GITHUB_FILE = resolve("C:/Users/THINKPAD/OneDrive/MD/PORTFOLIO/EVIDENCE/PROJECTS_GITHUB.md");
 
 function loadEnv(): Record<string, string> {
@@ -163,7 +164,65 @@ const normalizeRoute = (urlOrPath: string): string => {
     .replace(/\/+$/, "");
 };
 
-async function auditRepository(mapping: RepoMapping, maxPages = 10000): Promise<boolean> {
+/**
+ * In-memory zero-disk tarball parser for gzipped ustar archives (FLEET-GH-02).
+ * Bounds entry size to 5MB and extracts regular HTML files under the repository root.
+ */
+function parseTarHtmlFiles(
+  tarBuf: Buffer,
+  maxEntrySize = 5 * 1024 * 1024,
+): Map<string, string> {
+  const htmlMap = new Map<string, string>();
+  let offset = 0;
+
+  while (offset + 512 <= tarBuf.length) {
+    const header = tarBuf.subarray(offset, offset + 512);
+
+    let isAllZero = true;
+    for (let i = 0; i < 512; i++) {
+      if (header[i] !== 0) {
+        isAllZero = false;
+        break;
+      }
+    }
+    if (isAllZero) break;
+
+    const rawName = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "").trim();
+    const rawPrefix = header.subarray(345, 500).toString("utf8").replace(/\0.*$/, "").trim();
+    const fullName = rawPrefix ? `${rawPrefix}/${rawName}` : rawName;
+
+    const slashIdx = fullName.indexOf("/");
+    const relPath = slashIdx !== -1 ? fullName.slice(slashIdx + 1) : fullName;
+
+    const sizeStr = header.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim();
+    const size = parseInt(sizeStr, 8);
+
+    const typeFlag = header[156];
+    const isRegularFile = typeFlag === 0 || typeFlag === 48;
+
+    const contentStart = offset + 512;
+    const contentEnd = contentStart + (isNaN(size) ? 0 : size);
+
+    if (
+      isRegularFile &&
+      !isNaN(size) &&
+      size <= maxEntrySize &&
+      (relPath.endsWith(".html") || relPath.endsWith(".htm"))
+    ) {
+      if (contentEnd <= tarBuf.length) {
+        const content = tarBuf.subarray(contentStart, contentEnd).toString("utf8");
+        htmlMap.set(relPath, content);
+      }
+    }
+
+    const paddedSize = Math.ceil(size / 512) * 512;
+    offset += 512 + (isNaN(paddedSize) ? 512 : paddedSize);
+  }
+
+  return htmlMap;
+}
+
+async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchive = false): Promise<boolean> {
   const { domain, repoName, projectId } = mapping;
   console.log(`\n======================================================`);
   console.log(`Auditing ${domain} directly from GitHub repo ${repoName}`);
@@ -265,28 +324,56 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000): Promise<
   const detectedIssues: DetectedIssue[] = [];
   const inboundLinkCounts = new Map<string, number>();
 
+  let archiveHtmlMap: Map<string, string> | null = null;
+  if (useArchive) {
+    try {
+      console.log(`[ARCHIVE] Streaming commit-pinned tarball for ${repoName} (${commitSha.slice(0, 10)})...`);
+      const tempTar = resolve(`scratch/tar_${Date.now()}.tar.gz`);
+      execSync(
+        `curl.exe -sL -H "User-Agent: OpenSEO-Audit" "https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}" -o "${tempTar}"`,
+        { stdio: ["pipe", "pipe", "pipe"] }
+      );
+      const tarBuf = readFileSync(tempTar);
+      const decompressed = zlib.gunzipSync(tarBuf);
+      archiveHtmlMap = parseTarHtmlFiles(decompressed);
+      try {
+        unlinkSync(tempTar);
+      } catch {}
+      console.log(`[ARCHIVE] Extracted ${archiveHtmlMap.size} HTML files from archive in memory.`);
+    } catch (err: any) {
+      console.warn(`[WARN] Tarball archive streaming failed (${err?.message}), falling back to concurrent blob fetching.`);
+      archiveHtmlMap = null;
+    }
+  }
+
   const CONCURRENCY = 25;
   for (let i = 0; i < candidateFiles.length; i += CONCURRENCY) {
     const slice = candidateFiles.slice(i, i + CONCURRENCY);
     await Promise.all(
       slice.map(async (file) => {
         const pageUrl = pathToUrl(file.path);
-        const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${file.path}`;
-
         try {
-          const res = await fetch(rawUrl, {
-            headers: {
-              ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
-              "User-Agent": "OpenSEO-GitHub-Audit-Engine",
-            },
-          });
+          let html: string | null = null;
+          if (archiveHtmlMap && archiveHtmlMap.has(file.path)) {
+            html = archiveHtmlMap.get(file.path)!;
+          } else {
+            const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${file.path}`;
+            const res = await fetch(rawUrl, {
+              headers: {
+                ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
+                "User-Agent": "OpenSEO-GitHub-Audit-Engine",
+              },
+            });
 
-          if (!res.ok) {
-            console.warn(`Failed to fetch ${file.path}: HTTP ${res.status}`);
-            return;
+            if (!res.ok) {
+              console.warn(`Failed to fetch ${file.path}: HTTP ${res.status}`);
+              return;
+            }
+
+            html = await res.text();
           }
 
-          const html = await res.text();
+          if (!html) return;
           const analysis = analyzeHtml(html, pageUrl, 200, 50);
 
           const pageId = await deterministicAuditRowId(auditId, pageUrl);
@@ -476,6 +563,43 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000): Promise<
        WHERE id = '${auditId}' AND status = 'running';`,
     ]);
 
+    // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration
+    try {
+      const rosterRows = runD1Query(
+        `SELECT m.id AS member_id, m.version_id, v.organization_id
+         FROM fleet_roster_members m
+         JOIN fleet_roster_versions v ON v.id = m.version_id
+         WHERE m.canonical_host = '${domain.replace(/'/g, "''")}'
+         ORDER BY v.approved_at DESC LIMIT 1;`
+      );
+
+      if (rosterRows.length > 0) {
+        const { member_id, version_id, organization_id } = rosterRows[0];
+        const runId = "run_" + crypto.randomBytes(8).toString("hex");
+        const runItemId = "item_" + crypto.randomBytes(8).toString("hex");
+        const snapshotId = "snap_" + crypto.randomBytes(8).toString("hex");
+
+        const score = Math.max(
+          10,
+          Math.min(100, Math.round(100 - (detectedIssues.length / Math.max(1, htmlFiles.length)) * 100))
+        );
+        const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
+
+        const diagnosticSql = [
+          `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
+           VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, datetime('now'), datetime('now'));`,
+          `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
+           VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', 'completed', 1, datetime('now'), datetime('now'));`,
+          `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, observed_at)
+           VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', 100, 'diagnostic', ${score}, ${score}, ${score}, datetime('now'));`
+        ];
+        executeD1SqlStatements(diagnosticSql);
+        console.log(`[DIAGNOSTIC] Recorded fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score})`);
+      }
+    } catch (diagErr: any) {
+      console.warn(`[WARN] Diagnostic fleet series linking skipped:`, diagErr?.message || diagErr);
+    }
+
     console.log(`[SUCCESS] ${domain} audit successfully finalized in D1 as '${finalStatus}'! (${processedCount} pages, ${detectedIssues.length} issues)`);
     return true;
   } catch (d1Err: any) {
@@ -502,6 +626,7 @@ async function main() {
       limit: { type: "string", short: "l" },
       all: { type: "boolean", short: "a" },
       force: { type: "boolean", short: "f" },
+      archive: { type: "boolean" },
       "max-pages": { type: "string", short: "m", default: "10000" },
     },
     allowPositionals: true,
@@ -562,7 +687,7 @@ async function main() {
     const c = candidates[i];
     console.log(`\n[${i + 1}/${candidates.length}] Starting audit for ${c.domain} (${c.repoName})...`);
     try {
-      const ok = await auditRepository(c, maxPages);
+      const ok = await auditRepository(c, maxPages, !!args.values.archive);
       if (ok) successCount++;
       else failCount++;
     } catch (err: any) {

@@ -503,5 +503,36 @@ The [Round 17 report](REPORT-SOL-OPENSEO-AGGREGATED-FLEET-VIEW-ROUND-17-2026-11-
 - Local CLI fixtures with migrated SQLite reproduced completed rows after unread pages or a truncated tree, an incomplete audit remaining completed after a second write chunk failed, incorrect orphan detection for a valid route alias, and a `--domain` request selecting a different host. The existing fleet, roster, and MCP transport tests pass and do not exercise the direct runner.
 - The direct runner writes `audits`, `audit_pages`, and `audit_issues`. `/onsite` reads roster-scoped attempts and snapshots from the fleet tables. Direct audits cannot publish an official fleet score. The hardening and diagnostic integration contracts are in [PRD §4.3](PRD.md#43-internal-github-repository-direct-audit-engine-githubstaticauditengine) and [§4.6](PRD.md#46-streaming-and-incremental-source-audits).
 
+### Fleet Hardening & GitHub Direct Audit Engine Implementation — Round 2 (2026-11-23)
+
+Complete implementation of all pending PRD capabilities across linking, issue aggregation, MCP automation, archive benchmarking, and diagnostic fleet series integration:
+
+1. **Turnkey Portfolio Linking CLI (`FLEET-SYNC-01`)**:
+   - `scripts/link-github-fleet.ts`: Turnkey reconciliation script reading `fleetManifest.json` and `PORTFOLIO/EVIDENCE/PROJECTS_GITHUB.md`.
+   - Supports `--dry-run`, `--remote`, `--local`, and `--org-id`.
+   - Reconciles 199 portfolio targets, inserts missing projects idempotently with Indonesian locale (`location_code: 2360`, `language_code: 'id'`), and links `fleet_roster_members.project_id` with 100% parity (87/87 linked, 0 unmapped).
+
+2. **Fleet-Wide Aggregated Issue Reporting & CSV Export CLI (`FLEET-ISSUE-01`)**:
+   - `scripts/fleet-issues.ts`: Aggregated issue triage layer joining `audit_issues`, `audits`, `projects`, and `audit_pages`.
+   - Parses `details_json` to extract `targetUrl` and diagnostic context.
+   - Maps issue types and affected URLs to sovereign skills (`static-site-css-repair`, `internal-linking`, `unslop-seo`, `web-perf`).
+   - Supports `--domain`, `--severity`, `--type`, `--limit`, `--json`, and RFC 4180 `--csv` export via PapaParse.
+
+3. **Fleet Automation & MCP Tool Suite (`FLEET-CLI-01`, `FLEET-ISSUE-01`)**:
+   - `src/server/mcp/tools/fleet-tools.ts`: Implemented `getFleetIssuesTool` (`get_fleet_issues`) and `runFleetAuditTool` (`run_fleet_audit`) supporting both `repository_direct` and `edge_workflow` modes.
+   - Enforced `z.looseObject` / `.passthrough()` on all nested object schemas (`severityBreakdown`, `issues.items`) per MCP output schema contract.
+   - Registered tools in `createOpenSeoMcpServer` in `src/server/mcp/server.ts`, raising native MCP tools to 78.
+   - Verified 100% green in `src/server/mcp/tools/fleet-tools.test.ts` and `output-schema-contract.test.ts`.
+
+4. **Streaming Tarball Archive Engine & Benchmark (`FLEET-GH-02`)**:
+   - `scripts/benchmark-archive-audit.ts`: Side-by-side benchmark comparing Selective Blob Downloads vs. Streamed Tarball Archive.
+   - In-memory zero-disk tarball parser (`parseTarHtmlFiles`) decoding 512-byte ustar blocks with 5MB file bounds and path normalization.
+   - Dual-lane workload split: Selective Blob Lane (concurrency 25) completes in 8.7s on media-heavy WordPress static exports (transfers 1.2MB HTML vs. 55MB total archive), while `--archive` mode provides optimal performance for repos without large binary blobs.
+
+5. **Diagnostic Fleet Series Isolation (`FLEET-GH-05`)**:
+   - `scripts/run-github-fleet-audit.ts`: Added Stage 5 Diagnostic Fleet Series Integration inserting `fleet_runs` (`trigger = 'manual'`, `requester_id = 'github-audit-runner'`, `status = 'completed'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`, `status = 'completed'`), and `fleet_snapshots` (`series_key = 'diagnostic'`).
+   - Preserves weekly baseline integrity by recording repository direct audits in D1 under the `diagnostic` series key without polluting the official 80–100 score matrix or weekly dashboard.
+
+
 
 

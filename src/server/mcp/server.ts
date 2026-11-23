@@ -107,6 +107,10 @@ import {
   deleteSiteAuditTool,
   listSiteAuditsTool,
 } from "@/server/mcp/tools/site-audit-cleanup-tools";
+import {
+  getFleetIssuesTool,
+  runFleetAuditTool,
+} from "@/server/mcp/tools/fleet-tools";
 import { whoamiTool } from "@/server/mcp/tools/whoami";
 import { explorePromptTool } from "@/server/mcp/tools/explore-prompt";
 
@@ -268,6 +272,8 @@ export function createOpenSeoMcpServer(authProps: McpProps) {
   register(getAuditStatusTool);
   register(getAuditIssuesTool);
   register(getAuditPagesTool);
+  register(getFleetIssuesTool);
+  register(runFleetAuditTool);
   register(saveReportTool);
   register(listReportsTool);
   register(getReportTool);
