@@ -557,21 +557,30 @@ Remediated all findings from Engineer Sol's Round 5 and Round 6 reviews ([REPORT
 - **F9 (Fleet Run Enum Parity & Isolated Fallback CAS)**: Aligned `fleet_runs.status` with `fleetRunStatuses` (`completed` or `partial`), leaving unmeasured pillar scores in `fleet_snapshots` as `NULL`. Implemented observable fallback CAS with single-row assertion and lane-aware logging.
 - **F10 (Local Test Suite Green on Windows)**: Switched SQLite fixtures in `googleOAuth.test.ts` and `googleOAuthMigration.test.ts` to `:memory:`, and guarded cleanup in `GoogleAccountService.test.ts` with retryable lifecycle, eliminating Windows `EPERM` errors. Created `scripts/github-archive-audit.test.ts` verifying streaming byte caps, Git blob identity checks, and RFC 1123 hostname validation.
 
-### Round 9 Review Remediation & Full Fleet Hardening — Round 10 Pre-Flight (2026-11-24)
+### Round 10 & Round 11 Fleet Hardening & Convergence Progression (2026-11-24)
 
-Remediated all findings from Engineer Sol's Round 9 review ([REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-9-2026-11-24.md](file:///C:/Users/THINKPAD/OneDrive/MD/REPORT/REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-9-2026-11-24.md)) across all 4 evaluation vectors:
-- **F1 (V1: Route Identity Collision & Index Disambiguation)**: Unified route index before downloads (`RouteOwner` page/asset/ambiguous). Dedupes HTML candidates by served URL (`pathToUrl`); if both `.html` and `.htm` exist for the same route, prefers `.html`, flags collision, and admits exactly one candidate row per unique served identity to prevent count CAS failure. Preserves www/apex links as internal using `isSameOrigin`. Suppresses orphan reports for ambiguous routes.
-- **F2 (V3: Scope Parsing & Bulk Repair Bleed Prevention)**: Strict upfront tagged selector validation in `run-github-fleet-audit.ts` (`isValidCanonicalHostname` on `--domain`, rejecting blank strings, and mutual exclusivity of `--local` and `--remote`). Formulates planned actions (`repair` vs `audit`) into a deterministic list and applies `--limit` to the combined set before executing any writes, preventing repair bleed across projects.
-- **F3 (V4: Windows SQL Transport Command-Line Budget & Supervision)**: In `scripts/github-archive-utils.ts`, reduced default batch envelope in `executeD1SqlBatches` to $\le 10$ statements and $\le 15,000$ bytes total per batch (enforcing a hard 15,000-byte cap on single statements and checking serialized command-line length against Windows `CreateProcessW` 32,767 character ceiling with a 60s timeout). Enforces strict statement success validation on every result element.
-- **F4 (V4: Deterministic Diagnostic Observation & Full Triple Verification)**: Replaced un-ordered completed audits query with deterministic CTE ordered by `unixepoch(a.completed_at) DESC, a.id DESC`. In `repairDiagnosticObservation`, verified the full exact triple (`fleet_runs`, `fleet_run_items`, `fleet_snapshots`) matching `auditId`, `member_id`, `projectId`, and `primary_series_key = 'diagnostic'`. On repair failure, aborts with an error rather than falling back into an unnecessary Git crawl.
-- **F5 (V4: Durable Link Graph Completeness & Transactional Scratchpad)**: In `AuditScratchpad.ts` and `scratchpad-sql.ts`, added persistent `meta` table in SQLite schema. Wrapped `recordBatch` in `this.ctx.storage.transactionSync` for atomic commits. Persists `link_graph_incomplete = '1'` when `input.hasTruncatedLinks` or storage budget trips, restoring it on constructor re-instantiation to eliminate false orphan findings across Durable Object restarts/evictions.
-- **F6 (V3: Edge Runner Timeout & Concurrency Admission Control)**: In `scripts/run-fleet-audits.ts`, when an audit hits the 15-minute polling deadline and is still running in D1, sets `admissionPaused = true`, logs deadline exceeded, and retains the active slot without freeing capacity to prevent isolate exhaustion.
-- **F7 (V2: Operator Skill Excluded from Customer-Facing SAM Catalog)**: Added `internal: true` under `metadata` in `openseo-ops/SKILL.md` (canonical and all mirrors) and added focused negative assertion in `src/server/features/sam/samSkills.test.ts` verifying SAM catalog rejects `openseo-ops`.
-- **F8 (V1: Shared Verified Acquisition in Archive Benchmark)**: Exported `acquireVerifiedBlob` in `github-archive-utils.ts` and integrated it across both `run-github-fleet-audit.ts` and `benchmark-archive-audit.ts`, ensuring identical byte caps, cryptographic Git blob hash checks, and per-file raw fallback logic.
-- **F9 (V3: Harmonized Fleet Issue Triage Across CLI & MCP)**: Updated `get_fleet_issues` in `src/server/mcp/tools/fleet-tools.ts` to join the latest completed audit per active project and sort by severity priority (`critical` $\rightarrow$ `warning` $\rightarrow$ `info`) then canonical domain and issue ID, perfectly matching CLI semantics.
-- **F10 (V3: Post-Apply Effective Roster Verification in Linker)**: In `scripts/link-github-fleet.ts`, re-reads approved roster versions post-apply to verify `selectEffectiveRosterVersion` still matches `approvedRoster.id`, throwing an explicit supersession error if changed mid-run.
-- **F11 (V4: Mutually Exclusive Fleet Status Coverage Buckets)**: In `scripts/fleet-status.ts`, restructured coverage aggregation with a project-level CTE over non-null domain enrolled projects to emit mutually exclusive counts (`completed_projects`, `running_projects`, `failed_projects`, `never_audited_projects`).
-- **F12 (V2: Comprehensive Skill Fidelity Across All Playbooks v1.7.1)**: Updated `openseo-ops` across Playbooks 1, 2A–2E, 6B (`data.run`), 6F (operator authorization for public sharing), 6G (`project.id`, `website`, `save_project_website_setup`), 6H (`seeds` array), 6I (`search_local_businesses`, `get_local_rank_grid`), and 6J (`get_audit_issues`, `get_audit_pages`, `structuredContent.status`).
+- **Round 10 Baseline Scores** ([REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-10-2026-11-24.md](file:///C:/Users/THINKPAD/OneDrive/MD/REPORT/REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-10-2026-11-24.md)):
+  - Vector 1 (Architecture & Ingestion Integrity): 5.9 / 10.0
+  - Vector 2 (Operational Accuracy & Skill Fidelity): 6.7 / 10.0
+  - Vector 3 (Shipped Fleet Tooling): 5.9 / 10.0
+  - Vector 4 (Resilience, CAS, and D1 Parity): 6.1 / 10.0
+  - Total: 0 P0 blockers, 7 P1 blockers, 7 P2 findings.
+- **Round 10 Remediations Landed** (`911909f2`):
+  - Fixed SQLite ordering to use `julianday(completed_at) DESC NULLS LAST, id DESC` across all CTEs.
+  - Removed in-memory `hasTruncatedLinks` desync in `AuditScratchpad.ts`, relying strictly on durable `meta` table and storage budget.
+  - Added write-time effective version predicate in `scripts/link-github-fleet.ts` with `RETURNING id, project_id`.
+  - Added UTF-16 character estimator and strict statement-level success validation in `scripts/github-archive-utils.ts`.
+  - Synchronized full exact diagnostic 8-tuple verification in `scripts/run-github-fleet-audit.ts`.
+  - Synchronized complete schemas, valid UUIDs, and accurate routes in `openseo-ops/SKILL.md` (Playbooks 6A–6J).
+  - Deployed live to production at `https://seo.codev.id` via `pnpm run deploy:selfhost`.
+- **Round 11 Review Valuation** ([REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-11-2026-11-24.md](file:///C:/Users/THINKPAD/OneDrive/MD/REPORT/REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-11-2026-11-24.md)):
+  - Vector 1 (Architecture & Ingestion Integrity): **6.6 / 10.0** (▲ +0.7)
+  - Vector 2 (Operational Accuracy & Skill Fidelity): **7.2 / 10.0** (▲ +0.5)
+  - Vector 3 (Shipped Fleet Tooling): **6.8 / 10.0** (▲ +0.9)
+  - Vector 4 (Resilience, CAS, and D1 Parity): **6.4 / 10.0** (▲ +0.3)
+  - Findings: 0 P0 blockers, 8 P1 findings (F01–F08), 5 P2 findings (F09–F13).
+  - Clear architectural roadmap established to break through the $\ge 8.0$ threshold on all vectors in Round 12.
+
 
 
 
