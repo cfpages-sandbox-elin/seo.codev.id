@@ -304,6 +304,10 @@ export const runFleetAuditTool = {
   },
   handler: async (args: RunFleetAuditArgs, context: ToolContext) => {
     const orgId = context.auth?.organizationId || "shared-workspace";
+    if (orgId !== "shared-workspace") {
+      throw new Error(`Fleet runners are currently constrained to the 'shared-workspace' organization; caller organization '${orgId}' is not supported.`);
+    }
+
     const mode = args.mode ?? "repository_direct";
     const domain = args.domain?.toLowerCase().trim();
     const maxPages = args.maxPages || 2000;

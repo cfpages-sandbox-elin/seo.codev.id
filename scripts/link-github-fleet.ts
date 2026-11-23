@@ -305,15 +305,28 @@ export async function linkFleet(options: {
     );
   }
 
-  // Scoped UPDATE with foreign-key and version existence guards (P1-1)
+  // Scoped UPDATE with live write-time project ID resolution and foreign-key guards (Sol F7)
   for (const m of membersToLink) {
     sqlStatements.push(`
-      UPDATE fleet_roster_members
-      SET project_id = '${m.projectId}'
-      WHERE id = '${m.memberId}'
-        AND version_id = '${approvedRoster.id}'
-        AND canonical_host = '${m.host.replace(/'/g, "''")}'
-        AND project_id IS NULL;
+      UPDATE fleet_roster_members AS m
+      SET project_id = (
+        SELECT p.id FROM projects AS p
+        WHERE p.organization_id = '${orgId}'
+          AND p.archived_at IS NULL AND lower(trim(p.domain)) = m.canonical_host
+      )
+      WHERE m.id = '${m.memberId}'
+        AND m.version_id = '${approvedRoster.id}'
+        AND m.canonical_host = '${m.host.replace(/'/g, "''")}'
+        AND m.project_id IS NULL
+        AND EXISTS (
+          SELECT 1 FROM fleet_roster_versions v
+          WHERE v.id = m.version_id AND v.organization_id = '${orgId}'
+        )
+        AND 1 = (
+          SELECT count(*) FROM projects AS p
+          WHERE p.organization_id = '${orgId}'
+            AND p.archived_at IS NULL AND lower(trim(p.domain)) = m.canonical_host
+        );
     `);
   }
 
@@ -335,7 +348,12 @@ export async function linkFleet(options: {
     `SELECT count(*) as unmapped_count FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}' AND project_id IS NULL;`,
     isRemote,
   );
-  const unmapped = updatedMembers[0]?.unmapped_count ?? 0;
+  if (!updatedMembers || updatedMembers.length === 0 || typeof updatedMembers[0]?.unmapped_count !== "number") {
+    console.error(`[ERROR] Verification query failed to return a valid count.`);
+    process.exitCode = 1;
+    return;
+  }
+  const unmapped = updatedMembers[0].unmapped_count;
   console.log(`Verification: Remaining unmapped roster members in ${approvedRoster.id}: ${unmapped}`);
   if (unmapped === 0) {
     console.log(`SUCCESS: 100% of fleet roster members are linked to verified D1 projects!`);

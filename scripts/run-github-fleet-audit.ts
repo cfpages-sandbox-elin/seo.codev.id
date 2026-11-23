@@ -70,9 +70,11 @@ function extractJson(raw: string): any {
   return JSON.parse(raw);
 }
 
-function runD1Query(query: string): any[] {
+function runD1Query(query: string, isRemote = true): any[] {
   const sanitized = query.replace(/\r?\n/g, " ").trim();
-  const cmd = `npx wrangler d1 execute open-seo-db-selfhost --remote --json --command "${sanitized.replace(/"/g, '\\"')}"`;
+  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
+  const flag = isRemote ? "--remote" : "--local";
+  const cmd = `npx wrangler d1 execute ${dbName} ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
   const out = execSync(cmd, {
     cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
     env: { ...process.env, ...envVars },
@@ -87,14 +89,18 @@ function runD1Query(query: string): any[] {
   return [];
 }
 
-function executeD1SqlStatements(sqlLines: string[]): void {
+function executeD1SqlStatements(sqlLines: string[], isRemote = true): void {
+  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
+  const flag = isRemote ? "--remote" : "--local";
   const CHUNK_SIZE = 500;
   for (let i = 0; i < sqlLines.length; i += CHUNK_SIZE) {
     const chunk = sqlLines.slice(i, i + CHUNK_SIZE).join("\n");
-    const tempFile = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/scratch", `batch_${Date.now()}_${i}.sql`);
+    const scratchDir = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/scratch");
+    if (!existsSync(scratchDir)) mkdirSync(scratchDir, { recursive: true });
+    const tempFile = resolve(scratchDir, `batch_${Date.now()}_${i}.sql`);
     writeFileSync(tempFile, chunk, "utf8");
     try {
-      const cmd = `npx wrangler d1 execute open-seo-db-selfhost --remote --file "${tempFile}"`;
+      const cmd = `npx wrangler d1 execute ${dbName} ${flag} --file "${tempFile}"`;
       execSync(cmd, {
         cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
         env: { ...process.env, ...envVars },
@@ -172,13 +178,13 @@ const normalizeRoute = (urlOrPath: string): string => {
 
 /**
  * In-memory zero-disk tarball parser for gzipped ustar archives (FLEET-GH-02).
- * Bounds entry size to 5MB and extracts regular HTML files under the repository root.
+ * Bounds entry size to 5MB and extracts regular HTML files under the repository root into raw Buffers.
  */
 function parseTarHtmlFiles(
   tarBuf: Buffer,
   maxEntrySize = 5 * 1024 * 1024,
-): Map<string, string> {
-  const htmlMap = new Map<string, string>();
+): Map<string, Buffer> {
+  const htmlMap = new Map<string, Buffer>();
   let offset = 0;
 
   while (offset + 512 <= tarBuf.length) {
@@ -216,7 +222,7 @@ function parseTarHtmlFiles(
       (relPath.endsWith(".html") || relPath.endsWith(".htm"))
     ) {
       if (contentEnd <= tarBuf.length) {
-        const content = tarBuf.subarray(contentStart, contentEnd).toString("utf8");
+        const content = Buffer.from(tarBuf.subarray(contentStart, contentEnd));
         htmlMap.set(relPath, content);
       }
     }
@@ -228,7 +234,7 @@ function parseTarHtmlFiles(
   return htmlMap;
 }
 
-async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchive = false): Promise<boolean> {
+async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchive = false, isRemote = true): Promise<boolean> {
   const { domain, repoName, projectId } = mapping;
   console.log(`\n======================================================`);
   console.log(`Auditing ${domain} directly from GitHub repo ${repoName}`);
@@ -259,7 +265,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     const parsedTree = JSON.parse(treeJson);
     if (parsedTree.truncated) {
       isTreeTruncated = true;
-      console.warn(`[WARNING] Git tree for ${repoName} is truncated by GitHub (exceeds limit).`);
+      throw new Error(`Git tree for ${repoName} is truncated by GitHub (exceeds limit); recursive subtree enumeration required`);
     }
     treeItems = parsedTree.tree || [];
   } catch (err: any) {
@@ -353,30 +359,31 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   const detectedIssues: DetectedIssue[] = [];
   const inboundLinkCounts = new Map<string, number>();
 
-  let archiveHtmlMap: Map<string, string> | null = null;
+  let archiveHtmlMap: Map<string, Buffer> | null = null;
   if (useArchive) {
     try {
-      console.log(`[ARCHIVE] Streaming commit-pinned tarball for ${repoName} (${commitSha.slice(0, 10)})...`);
-      const scratchDir = resolve("scratch");
-      if (!existsSync(scratchDir)) mkdirSync(scratchDir, { recursive: true });
-      const tempTar = resolve(scratchDir, `tar_${Date.now()}.tar.gz`);
-      const authHeader = GITHUB_TOKEN ? `-H "Authorization: token ${GITHUB_TOKEN}"` : "";
-      execSync(
-        `curl.exe -sL ${authHeader} -H "User-Agent: OpenSEO-Audit" "https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}" -o "${tempTar}"`,
-        { stdio: ["pipe", "pipe", "pipe"] }
-      );
-      const tarBuf = readFileSync(tempTar);
+      console.log(`[ARCHIVE] In-process streaming commit-pinned tarball for ${repoName} (${commitSha.slice(0, 10)})...`);
+      const tarUrl = `https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}`;
+      const res = await fetch(tarUrl, {
+        headers: {
+          ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
+          "User-Agent": "OpenSEO-Audit",
+        },
+        signal: AbortSignal.timeout(60000),
+      });
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status} fetching archive from codeload`);
+      }
+      const arrayBuf = await res.arrayBuffer();
+      const tarBuf = Buffer.from(arrayBuf);
       if (tarBuf.length > 100 * 1024 * 1024) {
         throw new Error(`Archive exceeds 100MB bound (${tarBuf.length} bytes)`);
       }
       const decompressed = zlib.gunzipSync(tarBuf, { maxOutputLength: 250 * 1024 * 1024 });
       archiveHtmlMap = parseTarHtmlFiles(decompressed);
-      try {
-        unlinkSync(tempTar);
-      } catch {}
       console.log(`[ARCHIVE] Extracted ${archiveHtmlMap.size} HTML files from archive in memory.`);
     } catch (err: any) {
-      console.warn(`[WARN] Tarball archive streaming failed (${err?.message}), falling back to concurrent blob fetching.`);
+      console.warn(`[WARN] Tarball archive streaming failed (${err?.message || err}), falling back to concurrent blob fetching.`);
       archiveHtmlMap = null;
     }
   }
@@ -388,11 +395,12 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       slice.map(async (file) => {
         const pageUrl = pathToUrl(file.path);
         try {
-          let html: string | null = null;
+          let bytes: Buffer | null = null;
           if (archiveHtmlMap && archiveHtmlMap.has(file.path)) {
-            html = archiveHtmlMap.get(file.path)!;
+            bytes = archiveHtmlMap.get(file.path)!;
           } else {
-            const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${file.path}`;
+            const encodedPath = file.path.split("/").map(encodeURIComponent).join("/");
+            const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${encodedPath}`;
             const res = await fetch(rawUrl, {
               headers: {
                 ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
@@ -405,10 +413,23 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
               return;
             }
 
-            html = await res.text();
+            const arrayBuf = await res.arrayBuffer();
+            bytes = Buffer.from(arrayBuf);
           }
 
-          if (!html) return;
+          if (!bytes) return;
+
+          // Cryptographic Git Blob Identity Verification (Sol P1 - F1)
+          const algorithm = file.sha.length === 64 ? "sha256" : "sha1";
+          const blobId = crypto.createHash(algorithm)
+            .update("blob " + bytes.length + "\0")
+            .update(bytes)
+            .digest("hex");
+          if (blobId !== file.sha) {
+            throw new Error(`Git blob identity mismatch for ${file.path}: expected ${file.sha}, got ${blobId}`);
+          }
+
+          const html = bytes.toString("utf8");
           const analysis = analyzeHtml(html, pageUrl, 200, 50);
 
           const pageId = await deterministicAuditRowId(auditId, pageUrl);
@@ -545,7 +566,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   }).replace(/'/g, "''");
 
   try {
-    // Stage 1: Insert parent audit in 'running' phase
+    // Stage 1: Insert parent audit in 'running' phase (plain insert to surface duplicates as conflict, Sol F10)
     executeD1SqlStatements([
       `INSERT INTO audits (
         id, project_id, started_by_user_id, start_url,
@@ -555,8 +576,8 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
         '${auditId}', '${projectId}', 'system', 'https://${domain}',
         'github-audit-${auditId}', '${configJson}', 'running', ${processedCount},
         ${htmlFiles.length}, 0, 'analyzing', datetime('now', '-${durationSec} seconds')
-      ) ON CONFLICT(id) DO UPDATE SET status = 'running';`,
-    ]);
+      );`,
+    ], isRemote);
 
     // Stage 2: Insert audit pages (preserving source provenance, NULL unmeasured runtime evidence, including OpenGraph — Sol P1-03)
     const pageSqlLines: string[] = [];
@@ -581,7 +602,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       `);
     }
     if (pageSqlLines.length > 0) {
-      executeD1SqlStatements(pageSqlLines);
+      executeD1SqlStatements(pageSqlLines, isRemote);
     }
 
     // Stage 3: Insert audit issues
@@ -600,7 +621,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       `);
     }
     if (issueSqlLines.length > 0) {
-      executeD1SqlStatements(issueSqlLines);
+      executeD1SqlStatements(issueSqlLines, isRemote);
     }
 
     // Stage 4: Atomic compare-and-set flip to final status with child row count reconciliation and RETURNING assertion (Sol P1-01, P1-05)
@@ -615,7 +636,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
          AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = '${auditId}') = ${crawledPages.length}
          AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') = ${detectedIssues.length}
        RETURNING id;`;
-    const casResult = runD1Query(casSql);
+    const casResult = runD1Query(casSql, isRemote);
     if (!casResult || casResult.length !== 1) {
       throw new Error(`Audit CAS finalization failed for ${auditId} (updated ${casResult?.length ?? 0} rows, expected 1). State conflict or child count mismatch.`);
     }
@@ -631,7 +652,8 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
            AND m.project_id = '${projectId}'
            AND p.organization_id = 'shared-workspace'
            AND v.organization_id = 'shared-workspace'
-         ORDER BY v.approved_at DESC LIMIT 1;`
+         ORDER BY v.approved_at DESC LIMIT 1;`,
+        isRemote
       );
 
       if (rosterRows.length > 0) {
@@ -655,7 +677,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
           `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
            VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', ${score}, NULL, ${score}, NULL, NULL, NULL, datetime('now'));`
         ];
-        executeD1SqlStatements(diagnosticSql);
+        executeD1SqlStatements(diagnosticSql, isRemote);
         console.log(`[DIAGNOSTIC] Recorded fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%)`);
       }
     } catch (diagErr: any) {
@@ -668,7 +690,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     console.error(`[ERROR] D1 persistence failed for ${domain}:`, d1Err?.message || d1Err);
     // Mark audit as failed on error
     try {
-      executeD1SqlStatements([
+      const fallbackRows = runD1Query(
         `UPDATE audits
          SET status = 'failed',
              error_code = 'CHUNK_WRITE_FAILED',
@@ -676,7 +698,11 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
              completed_at = datetime('now')
          WHERE id = '${auditId}' AND status = 'running'
          RETURNING id;`,
-      ]);
+        isRemote,
+      );
+      if (!fallbackRows || fallbackRows.length === 0) {
+        console.warn(`[WARN] Fallback failure CAS updated 0 rows for ${auditId} (already finalized or missing).`);
+      }
     } catch {}
     return false;
   }
@@ -691,14 +717,23 @@ async function main() {
       force: { type: "boolean", short: "f" },
       archive: { type: "boolean" },
       "max-pages": { type: "string", short: "m", default: "10000" },
+      remote: { type: "boolean", default: true },
+      local: { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   console.log("=== OpenSEO Zero-Limit GitHub Repository Audit Runner ===");
   const targetDomain = args.values.domain?.toLowerCase().trim();
-  const rawLimit = args.values.limit ? parseInt(args.values.limit, 10) : undefined;
-  const limit = rawLimit && Number.isFinite(rawLimit) && rawLimit > 0 ? rawLimit : undefined;
+  const isRemote = !args.values.local;
+  let limit: number | undefined;
+  if (args.values.limit) {
+    if (!/^[1-9][0-9]*$/.test(args.values.limit)) {
+      console.error("[ERROR] Invalid --limit value. Must be a positive integer.");
+      process.exit(1);
+    }
+    limit = parseInt(args.values.limit, 10);
+  }
   const force = !!args.values.force;
   const isAll = !!args.values.all;
   const rawMaxPages = parseInt(args.values["max-pages"] || "10000", 10);
@@ -712,7 +747,8 @@ async function main() {
 
   // Load project mappings from D1
   const projectRows = runD1Query(
-    "SELECT id, domain FROM projects WHERE organization_id = 'shared-workspace' AND domain IS NOT NULL AND archived_at IS NULL;"
+    "SELECT id, domain FROM projects WHERE organization_id = 'shared-workspace' AND domain IS NOT NULL AND archived_at IS NULL;",
+    isRemote
   );
   const projectIdByDomain = new Map<string, string>();
   for (const p of projectRows) {
@@ -721,7 +757,8 @@ async function main() {
 
   // Load truly completed audits from github source engine to avoid redundant work unless --force is given (Sol P1-01)
   const completedAudits = runD1Query(
-    "SELECT DISTINCT project_id FROM audits WHERE status = 'completed' AND workflow_instance_id LIKE 'github-audit-%' AND pages_crawled >= pages_total;"
+    "SELECT DISTINCT project_id FROM audits WHERE status = 'completed' AND workflow_instance_id LIKE 'github-audit-%' AND pages_crawled >= pages_total;",
+    isRemote
   );
   const alreadyAuditedProjectIds = new Set(completedAudits.map((a) => a.project_id));
 
@@ -765,7 +802,7 @@ async function main() {
     const c = candidates[i];
     console.log(`\n[${i + 1}/${candidates.length}] Starting audit for ${c.domain} (${c.repoName})...`);
     try {
-      const ok = await auditRepository(c, maxPages, !!args.values.archive);
+      const ok = await auditRepository(c, maxPages, !!args.values.archive, isRemote);
       if (ok) successCount++;
       else failCount++;
     } catch (err: any) {

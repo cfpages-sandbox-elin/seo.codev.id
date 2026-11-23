@@ -4,7 +4,7 @@ import { makeToolContext } from "./tool-test-support";
 
 vi.mock("cloudflare:workers", () => ({ env: {} }));
 
-const toolContext = makeToolContext();
+const toolContext = makeToolContext({ organizationId: "shared-workspace" });
 
 vi.mock("@/db", () => {
   const dummyChain = {

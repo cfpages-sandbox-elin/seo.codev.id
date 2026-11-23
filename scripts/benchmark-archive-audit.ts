@@ -127,7 +127,10 @@ export async function runBenchmark(repoName: string) {
   }
 
   const htmlBlobs = (parsedTree.tree || []).filter(
-    (item: any) => item.type === "blob" && (item.path.endsWith(".html") || item.path.endsWith(".htm")),
+    (item: any) =>
+      item.type === "blob" &&
+      (item.mode === "100644" || item.mode === "100755") &&
+      (item.path.endsWith(".html") || item.path.endsWith(".htm")),
   );
   console.log(`Discovered ${htmlBlobs.length} HTML files in repository tree.`);
 
@@ -170,7 +173,7 @@ export async function runBenchmark(repoName: string) {
   console.log(`  - Files fetched: ${lane1Results.size}/${htmlBlobs.length}`);
   console.log(`  - Wire bytes transferred: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`  - Elapsed time: ${lane1DurationMs} ms (${(lane1DurationMs / 1000).toFixed(2)}s)`);
-  console.log(`  - Peak RSS delta: ${lane1MemMb} MB`);
+  console.log(`  - RSS end-minus-start: ${lane1MemMb} MB`);
 
   // ─── Lane 2: Streamed Commit-Pinned Archive (FLEET-GH-02) ───────────────────
   console.log(`\nBenchmarking Lane 2: Streamed Commit-Pinned Tarball Archive...`);
@@ -215,7 +218,7 @@ export async function runBenchmark(repoName: string) {
   console.log(`  - Gzip decompression time: ${decompressDurationMs} ms`);
   console.log(`  - In-memory tar parse time: ${parseDurationMs} ms`);
   console.log(`  - Total elapsed time: ${lane2DurationMs} ms (${(lane2DurationMs / 1000).toFixed(2)}s)`);
-  console.log(`  - Peak RSS delta: ${lane2MemMb} MB`);
+  console.log(`  - RSS end-minus-start: ${lane2MemMb} MB`);
 
   // ─── Parity & Performance Comparison ───────────────────────────────────────
   console.log(`\n=== Parity & Performance Analysis ===`);

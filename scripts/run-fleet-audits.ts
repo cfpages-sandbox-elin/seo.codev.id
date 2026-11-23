@@ -80,9 +80,11 @@ function triggerWorkflow(
   workflowName: string,
   id: string,
   params: object,
+  isRemote = true,
 ): boolean {
   const paramsStr = JSON.stringify(params);
-  const cmd = `npx wrangler workflows trigger ${workflowName} "${paramsStr.replace(/"/g, '\\"')}" --id ${id}`;
+  const flag = isRemote ? "" : "--local";
+  const cmd = `npx wrangler workflows trigger ${workflowName} "${paramsStr.replace(/"/g, '\\"')}" --id ${id} ${flag}`.trim();
   try {
     execSync(cmd, {
       cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
@@ -115,6 +117,7 @@ async function main() {
       domain: { type: "string", short: "d" },
       "max-pages": { type: "string", short: "m", default: "500" },
       "skip-recent": { type: "boolean", default: true },
+      "no-skip-recent": { type: "boolean", default: false },
       all: { type: "boolean", default: false },
       remote: { type: "boolean", default: true },
       local: { type: "boolean", default: false },
@@ -124,10 +127,20 @@ async function main() {
 
   const maxPages = parseInt(args.values["max-pages"] || "500", 10);
   const concurrency = Math.max(1, parseInt(args.values.concurrency || "2", 10) || 2);
-  const limit = args.values.limit ? parseInt(args.values.limit, 10) : undefined;
+  let limit: number | undefined;
+  if (args.values.limit) {
+    if (!/^[1-9][0-9]*$/.test(args.values.limit)) {
+      console.error("[ERROR] Invalid --limit value. Must be a positive integer.");
+      process.exit(1);
+    }
+    limit = parseInt(args.values.limit, 10);
+  }
   const targetDomainFilter = args.values.domain?.toLowerCase().trim();
   const isAll = !!args.values.all;
   const isRemote = args.values.local ? false : true;
+  const target = isRemote
+    ? { database: "open-seo-db-selfhost", dbFlag: "--remote", workflow: "site-audit-workflow-selfhost" }
+    : { database: "DB", dbFlag: "--local", workflow: "site-audit-workflow" };
 
   // Sol P1-05: Require explicit execution scope (fail closed against unintended global audits)
   if (!targetDomainFilter && !isAll && !limit) {
@@ -136,6 +149,8 @@ async function main() {
   }
 
   console.log("=== OpenSEO Fleet Audit Runner ===");
+  console.log(`Execution Mode: ${isRemote ? "Remote Production" : "Local Development"}`);
+  console.log(`Target Workflow: ${target.workflow}`);
   console.log(`Pacing Concurrency: ${concurrency}`);
   console.log(`Max Pages Per Site: ${maxPages} (Full Depth Crawl)`);
   if (targetDomainFilter) console.log(`Target Domain Filter: ${targetDomainFilter}`);
@@ -172,9 +187,10 @@ async function main() {
     }
   }
 
-  if (args.values["skip-recent"] && !targetDomainFilter) {
-    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
-    candidates = candidates.filter((c) => !c.lastAudited || c.lastAudited < tenDaysAgo);
+  const shouldSkipRecent = args.values["no-skip-recent"] ? false : !!args.values["skip-recent"];
+  if (shouldSkipRecent && !targetDomainFilter) {
+    const tenDaysAgoMs = Date.now() - 10 * 24 * 60 * 60 * 1000;
+    candidates = candidates.filter((c) => !c.lastAudited || new Date(c.lastAudited).getTime() < tenDaysAgoMs);
   }
 
   if (limit) {
@@ -261,7 +277,7 @@ async function main() {
           ${maxPages}, 20, 'discovery', datetime('now')
         );
       `;
-      runD1Query(insertSql);
+      runD1Query(insertSql, isRemote);
 
       // 2. Trigger workflow instance
       const params = {
@@ -279,7 +295,7 @@ async function main() {
         renderLocks: [],
       };
 
-      const ok = triggerWorkflow("site-audit-workflow-selfhost", auditId, params);
+      const ok = triggerWorkflow(target.workflow, auditId, params, isRemote);
       if (ok) {
         activeAudits.set(auditId, {
           auditId,
@@ -290,6 +306,7 @@ async function main() {
         console.error(`[ERROR] Failed to start workflow for ${project.domain}`);
         runD1Query(
           `UPDATE audits SET status = 'failed', error_code = 'DISPATCH_ERROR' WHERE id = '${auditId}';`,
+          isRemote,
         );
         failedCount++;
       }

@@ -265,12 +265,35 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
       limit: { type: "string", default: "200" },
       json: { type: "boolean", default: false },
     },
-    strict: false,
+    strict: true,
   });
 
   const isRemote = !values.local;
-  const parsedLimit = parseInt(String(values.limit || "200"), 10);
-  const limit = Math.max(1, Math.min(1000, isNaN(parsedLimit) ? 200 : parsedLimit));
+
+  if (values.domain && typeof values.domain === "string") {
+    const trimmedDomain = values.domain.toLowerCase().trim();
+    if (!/^[a-z0-9][a-z0-9-]{0,61}[a-z0-9](?:\.[a-z0-9-]{2,})+$/i.test(trimmedDomain)) {
+      console.error(`[ERROR] Invalid domain format: '${values.domain}'. Must be a canonical hostname.`);
+      process.exit(1);
+    }
+  }
+
+  if (values.severity && typeof values.severity === "string") {
+    const validSeverities = new Set(["critical", "warning", "info"]);
+    if (!validSeverities.has(values.severity.toLowerCase().trim())) {
+      console.error(`[ERROR] Invalid severity: '${values.severity}'. Must be one of: critical, warning, info.`);
+      process.exit(1);
+    }
+  }
+
+  let limit = 200;
+  if (values.limit) {
+    if (!/^[1-9][0-9]*$/.test(String(values.limit))) {
+      console.error("[ERROR] Invalid --limit value. Must be a positive integer.");
+      process.exit(1);
+    }
+    limit = Math.min(1000, parseInt(String(values.limit), 10));
+  }
 
   getAggregatedFleetIssues({
     remote: isRemote,
