@@ -7,12 +7,13 @@
  * Usage:
  *   pnpm exec tsx scripts/run-fleet-audits.ts [--limit <n>] [--concurrency <n>] [--domain <domain>] [--max-pages <n>]
  */
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { parseArgs } from "node:util";
-import { isValidCanonicalHostname } from "./github-archive-utils";
+import { executeD1SqlBatches, isValidCanonicalHostname } from "./github-archive-utils";
 
 // Sourced environment from .env.selfhost
 const ENV_FILE = resolve(
@@ -44,37 +45,8 @@ function loadEnv(): Record<string, string> {
 
 const envVars = loadEnv();
 
-function extractJson(raw: string): any {
-  const firstBracket = raw.indexOf("[");
-  const lastBracket = raw.lastIndexOf("]");
-  if (firstBracket !== -1 && lastBracket !== -1) {
-    return JSON.parse(raw.slice(firstBracket, lastBracket + 1));
-  }
-  const firstBrace = raw.indexOf("{");
-  const lastBrace = raw.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1) {
-    return JSON.parse(raw.slice(firstBrace, lastBrace + 1));
-  }
-  return JSON.parse(raw);
-}
-
 function runD1Query(query: string, isRemote = true): any[] {
-  const sanitized = query.replace(/\r?\n/g, " ").trim();
-  const flag = isRemote ? "--remote" : "--local";
-  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
-  const cmd = `npx wrangler d1 execute ${dbName} ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
-  const out = execSync(cmd, {
-    cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
-    env: { ...process.env, ...envVars },
-    encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  const parsed = extractJson(out);
-  if (Array.isArray(parsed) && parsed[0]?.results) {
-    return parsed[0].results;
-  }
-  return [];
+  return executeD1SqlBatches([query], isRemote);
 }
 
 function triggerWorkflow(
@@ -83,24 +55,25 @@ function triggerWorkflow(
   params: object,
   isRemote = true,
 ): boolean {
+  const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const wranglerJs = resolve(repoRoot, "node_modules/wrangler/bin/wrangler.js");
   const paramsStr = JSON.stringify(params);
-  const flag = isRemote ? "" : "--local";
-  const cmd = `npx wrangler workflows trigger ${workflowName} "${paramsStr.replace(/"/g, '\\"')}" --id ${id} ${flag}`.trim();
-  try {
-    execSync(cmd, {
-      cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
-      env: { ...process.env, ...envVars },
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    return true;
-  } catch (err: any) {
-    console.error(
-      `Failed to trigger workflow instance ${id}:`,
-      err?.message || err,
-    );
-    return false;
-  }
+  const argv = [wranglerJs, "workflows", "trigger", workflowName, paramsStr, "--id", id];
+  if (!isRemote) argv.push("--local");
+
+  const res = spawnSync(process.execPath, argv, {
+    cwd: repoRoot,
+    env: { ...process.env, ...envVars },
+    encoding: "utf8",
+    shell: false,
+    timeout: 60_000,
+  });
+
+  if (res.status === 0) return true;
+  console.error(
+    `Failed to trigger workflow instance ${id}: ${res.stderr || res.stdout}`,
+  );
+  return false;
 }
 
 interface TargetProject {
@@ -295,78 +268,109 @@ async function main() {
     }
   }
 
-  while ((!admissionPaused && queueIndex < candidates.length) || activeAudits.size > 0) {
-    // Fill concurrency window only when admission is active
-    while (!admissionPaused && activeAudits.size < concurrency && queueIndex < candidates.length) {
-      const project = candidates[queueIndex++];
-      const auditId = crypto.randomUUID();
-      const startUrl = `https://${project.domain}`;
+  const DRAIN_MS = 5 * 60 * 1000;
 
-      const config = {
-        maxPages,
-        lighthouseStrategy: "auto",
-        renderJavaScript: false,
-      };
+  while (queueIndex < candidates.length || activeAudits.size > 0) {
+    await pollActiveAudits();
+    const now = Date.now();
+    const overdue = Array.from(activeAudits.values()).filter(
+      (item) => now - item.startedAt > 15 * 60 * 1000,
+    );
 
-      console.log(`[DISPATCH] Launching audit on ${project.domain} (${startUrl}) [ID: ${auditId}]`);
-
-      // 1. Insert audit row in D1
-      const insertSql = `
-        INSERT INTO audits (
-          id, project_id, started_by_user_id, start_url,
-          workflow_instance_id, config, status, pages_crawled,
-          pages_total, lighthouse_total, current_phase, started_at
-        ) VALUES (
-          '${auditId}', '${project.id}', 'system', '${startUrl}',
-          '${auditId}', '${JSON.stringify(config).replace(/'/g, "''")}', 'running', 0,
-          ${maxPages}, 20, 'discovery', datetime('now')
-        );
-      `;
-      runD1Query(insertSql, isRemote);
-
-      // 2. Trigger workflow instance
-      const params = {
-        auditId,
-        billingCustomer: {
-          userId: "system",
-          userEmail: "admin@alampintar.org",
-          organizationId: "shared-workspace",
-          projectId: project.id,
-        },
-        projectId: project.id,
-        startUrl,
-        config,
-        access: null,
-        renderLocks: [],
-      };
-
-      const ok = triggerWorkflow(target.workflow, auditId, params, isRemote);
-      if (ok) {
-        activeAudits.set(auditId, {
-          auditId,
-          project,
-          startedAt: Date.now(),
-        });
-      } else {
-        console.error(`[ERROR] Failed to start workflow for ${project.domain}`);
-        const failSql = `UPDATE audits SET status = 'failed', error_code = 'DISPATCH_ERROR', completed_at = datetime('now') WHERE id = '${auditId}' AND status = 'running' RETURNING id;`;
-        const failedRows = runD1Query(failSql, isRemote);
-        if (!failedRows || failedRows.length === 0) {
-          console.warn(`[WARN] Dispatch error update for ${auditId} updated 0 rows (audit already terminal).`);
-        }
-        failedCount++;
-      }
+    // If an overdue item exceeds 15m + DRAIN_MS (20m total), break loop to prevent indefinite polling
+    if (overdue.some((item) => now - item.startedAt > 15 * 60 * 1000 + DRAIN_MS)) {
+      console.error(
+        `[DRAIN TIMEOUT] Active audit exceeded 20m deadline. Terminating queue drain.`,
+      );
+      break;
     }
 
-    // Wait 10 seconds between polls
-    await new Promise((resolve) => setTimeout(resolve, 10000));
-    await pollActiveAudits();
+    // Only dispatch new work if no overdue audits are in flight (Sol F05)
+    if (overdue.length === 0) {
+      while (activeAudits.size < concurrency && queueIndex < candidates.length) {
+        const project = candidates[queueIndex++];
+        const auditId = crypto.randomUUID();
+        const startUrl = `https://${project.domain}`;
+
+        const config = {
+          maxPages,
+          lighthouseStrategy: "auto",
+          renderJavaScript: false,
+        };
+
+        console.log(
+          `[DISPATCH] Launching audit on ${project.domain} (${startUrl}) [ID: ${auditId}]`,
+        );
+
+        // 1. Insert audit row in D1
+        const insertSql = `
+          INSERT INTO audits (
+            id, project_id, started_by_user_id, start_url,
+            workflow_instance_id, config, status, pages_crawled,
+            pages_total, lighthouse_total, current_phase, started_at
+          ) VALUES (
+            '${auditId}', '${project.id}', 'system', '${startUrl}',
+            '${auditId}', '${JSON.stringify(config).replace(/'/g, "''")}', 'running', 0,
+            ${maxPages}, 20, 'discovery', datetime('now')
+          );
+        `;
+        runD1Query(insertSql, isRemote);
+
+        // 2. Trigger workflow instance
+        const params = {
+          auditId,
+          billingCustomer: {
+            userId: "system",
+            userEmail: "admin@alampintar.org",
+            organizationId: "shared-workspace",
+            projectId: project.id,
+          },
+          projectId: project.id,
+          startUrl,
+          config,
+          access: null,
+          renderLocks: [],
+        };
+
+        const ok = triggerWorkflow(target.workflow, auditId, params, isRemote);
+        if (ok) {
+          activeAudits.set(auditId, {
+            auditId,
+            project,
+            startedAt: Date.now(),
+          });
+        } else {
+          console.error(`[ERROR] Failed to start workflow for ${project.domain}`);
+          const failSql = `UPDATE audits SET status = 'failed', error_code = 'DISPATCH_ERROR', completed_at = datetime('now') WHERE id = '${auditId}' AND status = 'running' RETURNING id;`;
+          const failedRows = runD1Query(failSql, isRemote);
+          if (!failedRows || failedRows.length === 0) {
+            console.warn(
+              `[WARN] Dispatch error update for ${auditId} updated 0 rows (audit already terminal).`,
+            );
+          }
+          failedCount++;
+        }
+      }
+    } else {
+      console.warn(
+        `[ADMISSION PAUSED] ${overdue.length} audit(s) running past 15m. Waiting for slot drain before admitting new candidates.`,
+      );
+    }
+
+    if (activeAudits.size > 0) {
+      // Wait 10 seconds between polls
+      await new Promise((resolve) => setTimeout(resolve, 10000));
+    }
   }
 
+  const undispatched = candidates.slice(queueIndex);
   console.log("\n=== Fleet Audit Run Finished ===");
+  console.log(`Total Candidates: ${candidates.length}`);
   console.log(`Total Completed: ${completedCount}`);
   console.log(`Total Failed: ${failedCount}`);
-  if (failedCount > 0) {
+  console.log(`Active Remaining: ${activeAudits.size}`);
+  console.log(`Undispatched Remaining: ${undispatched.length}`);
+  if (failedCount > 0 || activeAudits.size > 0 || undispatched.length > 0) {
     process.exitCode = 1;
   }
 }

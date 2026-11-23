@@ -1,7 +1,8 @@
 import crypto from "node:crypto";
 import { execFileSync, spawnSync } from "node:child_process";
 import fs, { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { parseUtcTimestampMs } from "../src/server/features/fleet/services/fleetConstants";
 
 /**
@@ -257,11 +258,17 @@ export function loadLocalEnv(repoRoot = "C:/Users/THINKPAD/Documents/GitHub/seo.
   return env;
 }
 
+function windowsCommandUpperBound(argv: string[]) {
+  // Quoting can at most double each character, plus surrounding quotes.
+  const words = [process.execPath, ...argv];
+  return words.reduce((size, word) => size + 2 * word.length + 2, words.length);
+}
+
 /**
- * Bounded D1 Multi-Statement Batch Execution via Direct Command (Sol P1-01, F3).
+ * Bounded D1 Multi-Statement Batch Execution via Direct Command (Sol P1-01, F3, F08).
  * Completely eliminates Wrangler D1 import path (--file) and import database locks.
- * Bounded by <= 10 statements and <= 15,000 bytes per batch envelope to safely respect
- * Windows CreateProcessW 32,767 character command-line limits with timeout supervision.
+ * Bounded by <= 10 statements, <= 15,000 bytes per batch envelope, and conservative Windows
+ * CreateProcessW UTF-16 character limit (<= 30,000 chars) with timeout supervision.
  */
 export function executeD1SqlBatches(
   statements: string[],
@@ -275,53 +282,54 @@ export function executeD1SqlBatches(
   if (!statements || statements.length === 0) return [];
   const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
   const flag = isRemote ? "--remote" : "--local";
-  const maxStatements = options?.maxStatementsPerBatch ?? 10;
-  const maxBytes = options?.maxBytesPerBatch ?? 15_000;
-  const repoRoot = options?.repoRoot ?? "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id";
+  const maxStatements = Math.min(10, Math.max(1, options?.maxStatementsPerBatch ?? 10));
+  const maxBytes = Math.min(15_000, Math.max(100, options?.maxBytesPerBatch ?? 15_000));
+  const defaultRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const repoRoot = options?.repoRoot ?? defaultRepoRoot;
+
+  const wranglerJs = resolve(repoRoot, "node_modules/wrangler/bin/wrangler.js");
+  const wranglerArgs = [wranglerJs, "d1", "execute", dbName, flag, "--json", "--command"];
+
+  function fits(stmts: string[]) {
+    const command = stmts.join("\n");
+    return (
+      stmts.length <= maxStatements &&
+      Buffer.byteLength(command, "utf8") <= maxBytes &&
+      (process.platform !== "win32" || windowsCommandUpperBound([...wranglerArgs, command]) <= 30_000)
+    );
+  }
 
   const batches: string[][] = [];
   let currentBatch: string[] = [];
-  let currentBytes = 0;
 
   for (const rawStmt of statements) {
     const trimmed = rawStmt.trim();
-    if (!trimmed) continue;
+    if (!trimmed || trimmed.startsWith("--")) continue;
     const stmt = trimmed.endsWith(";") ? trimmed : trimmed + ";";
-    const stmtBytes = Buffer.byteLength(stmt, "utf8");
-    if (stmtBytes > 15_000) {
-      throw new Error(`D1 statement exceeds maximum limit of 15,000 bytes (${stmtBytes} bytes)`);
+
+    if (!fits([stmt])) {
+      const stmtBytes = Buffer.byteLength(stmt, "utf8");
+      throw new Error(`D1 statement exceeds maximum batch budget constraints (${stmtBytes} bytes)`);
     }
 
-    if (
-      currentBatch.length >= maxStatements ||
-      (currentBatch.length > 0 && currentBytes + stmtBytes > maxBytes)
-    ) {
+    if (currentBatch.length > 0 && !fits([...currentBatch, stmt])) {
       batches.push(currentBatch);
-      currentBatch = [];
-      currentBytes = 0;
+      currentBatch = [stmt];
+    } else {
+      currentBatch.push(stmt);
     }
-    currentBatch.push(stmt);
-    currentBytes += stmtBytes;
   }
   if (currentBatch.length > 0) {
     batches.push(currentBatch);
   }
 
   const allResults: any[] = [];
-  const wranglerJs = resolve(repoRoot, "node_modules/wrangler/bin/wrangler.js");
   const localEnv = loadLocalEnv(repoRoot);
 
   for (let b = 0; b < batches.length; b++) {
     const batch = batches[b];
     const combinedSql = batch.join("\n");
-
-    const argv = [wranglerJs, "d1", "execute", dbName, flag, "--json", "--command", combinedSql];
-    const estimatedArgvLen = argv.reduce((sum, a) => sum + a.length + 3, 0);
-    if (estimatedArgvLen > 30_000) {
-      throw new Error(
-        `Serialized command line length (${estimatedArgvLen}) exceeds Windows CreateProcessW 32,767 character budget for batch ${b + 1}/${batches.length}`,
-      );
-    }
+    const argv = [...wranglerArgs, combinedSql];
 
     const result = spawnSync(
       process.execPath,
@@ -346,19 +354,20 @@ export function executeD1SqlBatches(
     }
 
     const parsed = extractJsonFromOutput(result.stdout);
-    if (!Array.isArray(parsed)) {
+    if (!Array.isArray(parsed) || parsed.length < batch.length) {
       throw new Error(
-        `D1 execution did not return a valid result array for batch ${b + 1}/${batches.length}: ${result.stdout.slice(0, 500)}`,
+        `D1 execution did not return a valid result array matching batch length (${parsed?.length ?? 0} vs expected ${batch.length}) for batch ${b + 1}/${batches.length}: ${result.stdout.slice(0, 500)}`,
       );
     }
 
-    for (const stmtResult of parsed) {
-      if (!stmtResult || stmtResult.success === false) {
+    for (let i = 0; i < batch.length; i++) {
+      const stmtResult = parsed[i];
+      if (!stmtResult || stmtResult.success !== true) {
         throw new Error(
-          `D1 statement failed in batch ${b + 1}: ${JSON.stringify(stmtResult?.errors || stmtResult)}`,
+          `D1 statement ${i + 1} failed in batch ${b + 1}: ${JSON.stringify(stmtResult?.errors || stmtResult)}`,
         );
       }
-      if (stmtResult?.results) {
+      if (Array.isArray(stmtResult.results)) {
         allResults.push(...stmtResult.results);
       }
     }

@@ -1,6 +1,7 @@
 import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
+import { getDatabaseProvider } from "@/db/provider";
 import { auditIssues, audits, projects } from "@/db/schema";
 import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
@@ -168,14 +169,19 @@ export const getFleetIssuesTool = {
     }
 
     const limit = Math.max(1, Math.min(200, args.limit || 50));
+    const completedTime =
+      getDatabaseProvider() === "postgres"
+        ? sql`a2.completed_at::timestamp AT TIME ZONE 'UTC'`
+        : sql`julianday(a2.completed_at)`;
+
     const conditions = [
       eq(projects.organizationId, orgId),
       isNull(projects.archivedAt),
       eq(audits.status, "completed"),
-      // Sol F9: Restrict issue triage to latest completed audit per active project
+      // Sol F04: Provider-aware timestamp expression with sub-second precision
       eq(
         audits.id,
-        sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' ORDER BY unixepoch(a2.completed_at) DESC, a2.id DESC LIMIT 1)`,
+        sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' ORDER BY ${completedTime} DESC NULLS LAST, a2.id DESC LIMIT 1)`,
       ),
     ];
 

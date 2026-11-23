@@ -45,16 +45,24 @@ function loadEnv(): Record<string, string> {
 }
 
 const envVars = loadEnv();
-const GITHUB_TOKEN = envVars.GITHUB_TOKEN || process.env.GITHUB_TOKEN;
+function getGitHubToken(): string {
+  try {
+    const token = execSync("gh auth token", { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    if (token) return token;
+  } catch {}
+  return envVars.GITHUB_TOKEN || process.env.GITHUB_TOKEN || "";
+}
 
-export async function runBenchmark(repoName: string) {
+const GITHUB_TOKEN = getGitHubToken();
+
+export async function runBenchmark(repoName: string, publishRoot = ".") {
   const ownerRepoRegex = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
   if (!ownerRepoRegex.test(repoName)) {
     throw new Error(`Invalid repository name '${repoName}'. Must match 'owner/repo'.`);
   }
 
   console.log(`\n=== Streaming Archive Reader Benchmark (FLEET-GH-02) ===`);
-  console.log(`Repository: ${repoName}`);
+  console.log(`Repository: ${repoName} (Publish root: ${publishRoot})`);
 
   // 1. Resolve commit SHA and tree via shell-free discovery helper (Sol P1-04)
   const discovered = discoverGitHubTree(repoName);
@@ -63,13 +71,15 @@ export async function runBenchmark(repoName: string) {
   const treeItems = discovered.tree;
   console.log(`Pinned commit: ${commitSha.slice(0, 10)} (${defaultBranch})`);
 
+  const prefix = publishRoot === "." ? "" : (publishRoot.replace(/^\/+|\/+$/g, "") + "/");
   const htmlBlobs = treeItems.filter(
     (item: any) =>
       item.type === "blob" &&
       (item.mode === "100644" || item.mode === "100755") &&
-      (item.path.endsWith(".html") || item.path.endsWith(".htm")),
+      (item.path.endsWith(".html") || item.path.endsWith(".htm")) &&
+      item.path.startsWith(prefix),
   );
-  console.log(`Discovered ${htmlBlobs.length} HTML files in repository tree.`);
+  console.log(`Discovered ${htmlBlobs.length} eligible HTML files in repository tree under '${publishRoot}'.`);
 
   // ─── Lane 1: Individual Blob Downloads (Current Baseline) ─────────────────
   console.log(`\nBenchmarking Lane 1: Individual Blob Downloads (concurrency: 25)...`);
@@ -164,32 +174,48 @@ export async function runBenchmark(repoName: string) {
   const tDecompress_lane2 = performance.now();
 
   const lane2Results = parseTarHtmlFiles(decompressed);
-  const t1_lane2 = performance.now();
-  const memEnd2 = process.memoryUsage().rss;
 
-  // Cryptographically verify every file in Lane 2 using shared acquireVerifiedBlob with raw fallback (Sol P2 - F8)
+  // Cryptographically verify every file in Lane 2 using shared acquireVerifiedBlob with raw fallback (Sol F09)
+  let archiveHits = 0;
+  let fallbackFiles = 0;
+  let fallbackBytes = 0;
+
   for (const file of htmlBlobs) {
-    const { buffer: buf } = await acquireVerifiedBlob(
+    const { buffer: buf, fromArchive } = await acquireVerifiedBlob(
       file,
       repoName,
       commitSha,
       lane2Results,
       GITHUB_TOKEN,
     );
+    if (fromArchive) {
+      archiveHits++;
+    } else {
+      fallbackFiles++;
+      fallbackBytes += buf.length;
+    }
     lane2Results.set(file.path, buf);
   }
+
+  const t1_lane2 = performance.now();
+  const memEnd2 = process.memoryUsage().rss;
 
   const decompressDurationMs = Math.round(tDecompress_lane2 - t0_lane2);
   const parseDurationMs = Math.round(t1_lane2 - tDecompress_lane2);
   const lane2DurationMs = Math.round(t1_lane2 - t0_lane2);
   const lane2MemMb = Math.round((memEnd2 - memStart2) / (1024 * 1024));
+  const totalTransferredWireBytes = compressedWireBytes + fallbackBytes;
 
   console.log(`Lane 2 Complete:`);
-  console.log(`  - Files extracted: ${lane2Results.size}/${htmlBlobs.length}`);
+  console.log(`  - Files extracted: ${lane2Results.size}/${htmlBlobs.length} (Archive hits: ${archiveHits}, Fallback: ${fallbackFiles})`);
   console.log(`  - Compressed wire bytes: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB`);
+  if (fallbackBytes > 0) {
+    console.log(`  - Fallback wire bytes: ${(fallbackBytes / (1024 * 1024)).toFixed(2)} MB`);
+  }
+  console.log(`  - Total transferred response bytes: ${(totalTransferredWireBytes / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`  - Expanded tarball payload: ${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`  - Download & gzip decompression time: ${decompressDurationMs} ms`);
-  console.log(`  - In-memory tar parse time: ${parseDurationMs} ms`);
+  console.log(`  - Tar parse, verification & fallback time: ${parseDurationMs} ms`);
   console.log(`  - Total elapsed time: ${lane2DurationMs} ms (${(lane2DurationMs / 1000).toFixed(2)}s)`);
   console.log(`  - RSS end-minus-start: ${lane2MemMb} MB`);
 
@@ -239,10 +265,13 @@ if (process.argv[1] && process.argv[1].includes("benchmark-archive-audit")) {
     options: {
       repo: { type: "string" },
       domain: { type: "string" },
+      root: { type: "string" },
     },
   });
 
   let targetRepo = values.repo;
+  let publishRoot = values.root ?? ".";
+
   if (!targetRepo && values.domain) {
     // Resolve repo from manifest
     try {
@@ -253,6 +282,9 @@ if (process.argv[1] && process.argv[1].includes("benchmark-archive-audit")) {
       );
       if (found?.repoName) {
         targetRepo = found.repoName;
+        if (!values.root && found.publishRoot) {
+          publishRoot = found.publishRoot;
+        }
       }
     } catch {}
 
@@ -266,7 +298,7 @@ if (process.argv[1] && process.argv[1].includes("benchmark-archive-audit")) {
     targetRepo = "cfpages-adistyputriharli/Concrete.co.id";
   }
 
-  runBenchmark(targetRepo).catch((err) => {
+  runBenchmark(targetRepo, publishRoot).catch((err) => {
     console.error("Benchmark failed:", err);
     process.exit(1);
   });

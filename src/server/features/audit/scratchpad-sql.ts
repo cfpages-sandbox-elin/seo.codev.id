@@ -88,6 +88,9 @@ export const BROKEN_LINKS_SQL = `
     SELECT l.source_page_id, l.source_url, l.target_url, m.status_code AS target_status
     FROM links l JOIN page_mirror m ON m.url = l.target_url
     WHERE m.status_code >= 400 AND m.fetch_class = 'ok'
+      AND NOT EXISTS (
+        SELECT 1 FROM page_links current WHERE current.page_id = l.source_page_id
+      )
   )
   ORDER BY source_page_id, target_url
   LIMIT ?
@@ -111,6 +114,9 @@ export const ORPHAN_PAGES_SQL = `
     SELECT DISTINCT l.target_url
     FROM links l
     WHERE l.target_url != l.source_url
+      AND NOT EXISTS (
+        SELECT 1 FROM page_links current WHERE current.page_id = l.source_page_id
+      )
   ) inbound ON inbound.target_url = m.url
   WHERE m.url != ?
     AND m.fetch_class = 'ok'

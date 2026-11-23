@@ -134,7 +134,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 ### Playbook 1: Roster Enrollment & Turnkey Linking
 **Prerequisites**:
 - The parent organization row (`id = 'shared-workspace'`) must exist in D1 before importing rosters to satisfy foreign key constraints.
-- Approval JSON requires canonical schema fields (`version`, `plan_hash` generated via `hashCanonicalRosterPlan`).
+- Approval JSON requires canonical schema fields: `organizationId`, `versionTag`, `rosterPlanSha256`, and `approvedBy`.
 - Roster importing (`import-fleet-roster.ts`) targets local D1 via `--approval`. Remote fleet linking (`link-github-fleet.ts`) requires an existing effective approved roster. Always run `--dry-run` to preview plans before live execution.
 
 For fresh **local development** (`localhost:3000` / `wrangler dev`):
@@ -143,7 +143,8 @@ For fresh **local development** (`localhost:3000` / `wrangler dev`):
 pnpm exec wrangler d1 migrations apply DB --local
 
 # 2. Import approved roster into local D1
-pnpm exec tsx scripts/import-fleet-roster.ts shared-workspace --approval <approval-json-file>
+$approvalFile = "path/to/approval.json"
+pnpm exec tsx scripts/import-fleet-roster.ts shared-workspace --approval "$approvalFile"
 
 # 3. Preview turnkey linking plan (validates unmapped projects and calculates required links)
 pnpm exec tsx scripts/link-github-fleet.ts --dry-run
@@ -165,25 +166,28 @@ pnpm exec tsx scripts/link-github-fleet.ts --remote
 > The linker's `--dry-run` flag operates as an execution plan preview that computes missing projects and link updates without mutating D1. Full database integrity assertions (zero unmapped, zero invalid links) and post-apply roster supersession checks run on live execution passes to confirm state convergence.
 
 ### Playbook 2A: Executing Commit-Pinned GitHub Repository Audit (Primary Source Lane)
-Direct audit accepts exactly one execution scope (`--domain <canonical-host>`, `--limit <n>`, or `--all`). D1 target defaults to `--remote` (`open-seo-db-selfhost`); pass `--local` for local D1 (`DB`).
+Direct audit accepts exactly one execution scope (`--domain <canonical-host>`, `--limit <n>`, or `--all`). By default, bulk audit admits properties from the approved fleet roster; pass `--workspace` to audit wider inventory projects. Use `--force` to run a fresh source audit at the repository's current pinned revision; without it, completed source audits with verified diagnostic observations are reused or scheduled for diagnostic repair. D1 target defaults to `--remote` (`open-seo-db-selfhost`); pass `--local` for local D1 (`DB`).
 ```powershell
 # Audit a single property by exact domain directly from its GitHub repository (Selective Blob Lane)
 pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --force
 
 # Streamed tarball archive mode for repositories without heavy binary assets
+# (Enforces 100 MiB compressed, 250 MiB expanded, and 10 MiB per-entry caps with verified raw fallback)
 pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --archive --force
 
 # Local D1 execution pass
 pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --local --force
 
 # Benchmark Selective Blob vs. Tarball Archive lane performance with verified blob acquisition
+# (Covers archive acquisition, entry extraction, and raw fallback recovery with verified wire bytes)
 pnpm exec tsx scripts/benchmark-archive-audit.ts --domain concrete.co.id
+pnpm exec tsx scripts/benchmark-archive-audit.ts --repo cfpages-adistyputriharli/Concrete.co.id
 
 # Audit a bounded slice of candidate portfolio properties (limits both repairs and fresh audits)
 pnpm exec tsx scripts/run-github-fleet-audit.ts --limit 20
 
-# Full fleet pass across all enrolled properties with custom page ceiling (max 10,000)
-pnpm exec tsx scripts/run-github-fleet-audit.ts --all --max-pages 5000
+# Audit wider workspace inventory outside approved fleet roster
+pnpm exec tsx scripts/run-github-fleet-audit.ts --all --workspace
 ```
 
 ### Playbook 2B: Triggering Edge Site Audits & Batch Fleet Crawls (Live Runtime Lane)
@@ -240,44 +244,48 @@ await AuditService.startAudit({
 Queries the latest completed audit per active project, ordering by severity priority (critical $\rightarrow$ warning $\rightarrow$ info) then domain and issue ID:
 ```powershell
 # List top aggregated issues across all fleet audits with sovereign skill routing (default limit 200, max 1000)
+# Supports --local (local SQLite D1 fixture) or default remote D1 execution
 pnpm exec tsx scripts/fleet-issues.ts --limit 50
+pnpm exec tsx scripts/fleet-issues.ts --local --limit 50
 
 # Filter issues by exact domain, severity, and issue type
 pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --severity critical --type broken-internal-link
 
-# Output structured JSON payload
+# Output formats: JSON payload or RFC 4180 CSV with formula escaping (when both --csv and --json are passed, --csv takes precedence)
 pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --json
-
-# Export fleet issues to RFC 4180 CSV with formula escaping
 pnpm exec tsx scripts/fleet-issues.ts --csv fleet-issues.csv
 ```
 
 ### Playbook 2D: Programmatic Fleet Operations via MCP
 ```typescript
 // Query fleet aggregated issues with skill routing (evaluates latest completed audit per active project)
+// Limit parameter: default 50, permitted 1–200. Total issues and breakdowns count the returned, filtered sample.
 const issuesResult = await client.callTool({
   name: "get_fleet_issues",
-  arguments: { domain: "concrete.co.id", severity: "critical", limit: 20 },
+  arguments: { domain: "concrete.co.id", severity: "critical", issueType: "broken-internal-link", limit: 20 },
 });
 
-// Generate execution plan for fleet audit (emits configured argv; does not dispatch directly)
+// Generate execution plan for fleet audit (emits structured argv; does not dispatch directly)
+// Repository direct mode defaults to maxPages: 2000; Edge workflow mode forwards maxPages (default 500) and concurrency (1–5, default 2)
 const auditPlan = await client.callTool({
   name: "run_fleet_audit",
-  arguments: { domain: "concrete.co.id", mode: "repository_direct", maxPages: 2000 },
+  arguments: { domain: "concrete.co.id", mode: "edge_workflow", maxPages: 500, concurrency: 2 },
 });
-console.log("Execution argv:", auditPlan.structuredContent.argv);
+console.log("Execution argv:", auditPlan.structuredContent?.argv);
 ```
 
 ### Playbook 2E: Fleet Telemetry & Inventory Inspection
 ```powershell
 # View fleet status summary with mutually exclusive coverage stats (completed, running, failed, never_audited)
+# Supports --local or default remote D1 execution
 pnpm exec tsx scripts/fleet-status.ts
+pnpm exec tsx scripts/fleet-status.ts --local
 
 # Check repository presence and default branch across all portfolio entries
 pnpm exec tsx scripts/check-fleet-repos.ts
 ```
 > [!NOTE]
-> In `fleet-status.ts`, queries are strictly scoped with `p.organization_id = 'shared-workspace' AND p.archived_at IS NULL AND p.domain IS NOT NULL` to report accurate, mutually exclusive coverage buckets across the enrolled domain fleet.
+> The coverage panel considers the latest attempt per active workspace project with a domain. The overall audit totals and recent audit samples include active workspace projects. A fresh partial status can result from a partial attempt or insufficient evidence for an official grade; an interval is rendered only when reconciled evidence satisfies 80% <= coverage < 100% and bounds agree with earned mass.
 
 ### Playbook 3: Monitoring Workspace Audit Execution in Remote D1
 To inspect real-time crawler progress and audit state using workspace-scoped predicates:
@@ -288,7 +296,7 @@ npx wrangler d1 execute open-seo-db-selfhost --remote --command "
   FROM audits AS a
   JOIN projects AS p ON p.id = a.project_id
   WHERE p.organization_id = 'shared-workspace' AND p.archived_at IS NULL
-  ORDER BY a.started_at DESC, a.id DESC 
+  ORDER BY julianday(a.started_at) DESC NULLS LAST, a.id DESC 
   LIMIT 10;
 "
 ```
@@ -347,12 +355,29 @@ try {
 - **UI Route**: `/p/:projectId/rank-tracking`
 - **MCP Tools**: `create_rank_tracker`, `add_rank_tracking_keywords`, `estimate_rank_tracker_cost`, `run_rank_tracker`, `get_rank_tracker`
 - **Workflow**:
-  1. Create tracker: `await client.callTool({ name: "create_rank_tracker", arguments: { projectId: "proj_123", domain: "kaca.co.id", locationCode: 2360, languageCode: "id" } });`
+  1. Create tracker (project ID must be a valid UUID; capture returned `trackerId`):
+     ```ts
+     const createRes = await client.callTool({
+       name: "create_rank_tracker",
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         domain: "kaca.co.id",
+         locationCode: 2360,
+         languageCode: "id"
+       }
+     });
+     const trackerId = createRes.structuredContent?.trackerId;
+     if (!trackerId) throw new Error("Tracker creation did not return a trackerId");
+     ```
   2. Estimate cost:
      ```ts
      const estResult = await client.callTool({
        name: "estimate_rank_tracker_cost",
-       arguments: { projectId: "proj_123", trackerId: "trk_123", additionalKeywords: ["kaca tempered surabaya", "partisi kaca"] }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         trackerId,
+         additionalKeywords: ["kaca tempered surabaya", "partisi kaca"]
+       }
      });
      // Quote fields reside strictly in structuredContent envelope (not SDK root)
      const costCredits = estResult.structuredContent?.costCredits;
@@ -363,8 +388,8 @@ try {
      await client.callTool({
        name: "add_rank_tracking_keywords",
        arguments: {
-         projectId: "proj_123",
-         trackerId: "trk_123",
+         projectId: "00000000-0000-0000-0000-000000000001",
+         trackerId,
          keywords: ["kaca tempered surabaya", "partisi kaca"],
          maxEstimatedScheduledCheckCredits: scheduledCredits
        }
@@ -374,10 +399,23 @@ try {
      ```ts
      await client.callTool({
        name: "run_rank_tracker",
-       arguments: { projectId: "proj_123", trackerId: "trk_123", maxCostCredits: costCredits }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         trackerId,
+         maxCostCredits: costCredits
+       }
      });
      ```
-  5. Read results: `await client.callTool({ name: "get_rank_tracker", arguments: { projectId: "proj_123", trackerId: "trk_123" } });`
+  5. Read results:
+     ```ts
+     await client.callTool({
+       name: "get_rank_tracker",
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         trackerId
+       }
+     });
+     ```
 
 ### Playbook 6B: AI Search Visibility & Prompt Exploration (`/ai-visibility`)
 - **UI Route**: `/p/:projectId/ai-visibility` and `/p/:projectId/prompt-explorer`
@@ -387,7 +425,13 @@ try {
      ```ts
      const estimate = await client.callTool({
        name: "estimate_ai_visibility_cost",
-       arguments: { projectId: "proj_123", patch: { engines: ["chatgpt", "perplexity"], prompts: [{ text: "kontraktor kaca terbaik surabaya" }] } }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         patch: {
+           engines: ["chatgpt", "perplexity"],
+           prompts: [{ text: "kontraktor kaca terbaik surabaya" }]
+         }
+       }
      });
      // Inspect data quote envelope:
      const quote = estimate.structuredContent?.data;
@@ -400,31 +444,44 @@ try {
      ```ts
      await client.callTool({
        name: "save_ai_visibility_tracker",
-       arguments: { projectId: "proj_123", engines: ["chatgpt", "perplexity"], prompts: [{ text: "kontraktor kaca terbaik surabaya" }] }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         engines: ["chatgpt", "perplexity"],
+         prompts: [{ text: "kontraktor kaca terbaik surabaya" }]
+       }
      });
      ```
-  4. Configure and enable recurrence schedule (triggers an immediate initial baseline check upon enabling):
+  4. Configure and enable recurrence schedule (triggers an immediate initial baseline check upon enabling, nested under `data.run`; subsequent updates leave `data.run` nullable):
      ```ts
      const schedRes = await client.callTool({
        name: "set_ai_visibility_schedule",
        arguments: {
-         projectId: "proj_123",
+         projectId: "00000000-0000-0000-0000-000000000001",
          enabled: true,
          scheduleInterval: "weekly",
          scheduleTime: { weekday: 1, hour: 9, minute: 0, timeZone: "Asia/Jakarta" }
        }
      });
-     // Inspect the returned initial baseline run from schedule activation (nested under data.run)
+     // Inspect initial baseline run from schedule activation (nested under data.run)
      const baselineRun = schedRes.structuredContent?.data?.run;
      if (baselineRun?.id) {
-       await client.callTool({ name: "get_ai_visibility_run", arguments: { projectId: "proj_123", runId: baselineRun.id } });
+       await client.callTool({
+         name: "get_ai_visibility_run",
+         arguments: {
+           projectId: "00000000-0000-0000-0000-000000000001",
+           runId: baselineRun.id
+         }
+       });
      }
      ```
   5. (Optional Live Run): If operator explicitly requests a separate immediate on-demand run:
      ```ts
      await client.callTool({
        name: "run_ai_visibility_check",
-       arguments: { projectId: "proj_123", maxCostUsd: runNowUsd }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         maxCostUsd: runNowUsd
+       }
      });
      ```
 
@@ -433,48 +490,53 @@ try {
 - **MCP Tools**: `get_search_console_performance`, `inspect_urls`
 - **Prerequisite**: Google OAuth connected in project settings with GSC property bound (`sc-domain:kaca.co.id`).
 - **Workflow**:
-  1. Query metrics: `get_search_console_performance({ projectId: "proj_123", startDate: "2026-10-01", endDate: "2026-11-20", dimensions: ["query", "page"] })`.
-  2. Inspect index status: `inspect_urls({ projectId: "proj_123", urls: ["https://kaca.co.id/produk/"] })`.
+  1. Query metrics: `get_search_console_performance({ projectId: "00000000-0000-0000-0000-000000000001", startDate: "2026-10-01", endDate: "2026-11-20", dimensions: ["query", "page"] })`.
+  2. Inspect index status: `inspect_urls({ projectId: "00000000-0000-0000-0000-000000000001", urls: ["https://kaca.co.id/produk/"] })`.
 
 ### Playbook 6D: Google Analytics 4 Organic Overview (`/ga4-overview`)
 - **UI Route**: `/p/:projectId/settings/integrations#google-analytics`
 - **MCP Tools**: `get_google_analytics_organic_overview`
 - **Prerequisite**: GA4 property ID bound (`properties/<id>`).
 - **Workflow**:
-  1. Fetch organic acquisition and engagement: `get_google_analytics_organic_overview({ projectId: "proj_123", startDate: "2026-10-01", endDate: "2026-11-20" })`.
+  1. Fetch organic acquisition and engagement: `get_google_analytics_organic_overview({ projectId: "00000000-0000-0000-0000-000000000001", startDate: "2026-10-01", endDate: "2026-11-20" })`.
 
-### Playbook 6E: Backlinks & Domain Intelligence (`/backlinks`, `/domain`)
-- **UI Route**: `/p/:projectId/backlinks` and `/domain`
+### Playbook 6E: Backlinks & Domain Intelligence (`/domain`, `/backlinks`)
+- **UI Route**: `/p/:projectId/domain` and `/p/:projectId/backlinks`
 - **MCP Tools**: `get_backlinks_overview`, `get_backlinks_profile`
 - **Workflow**:
-  1. Overview: `get_backlinks_overview({ projectId: "proj_123", target: "kaca.co.id" })`.
-  2. Detailed referring domains and anchors: `get_backlinks_profile({ projectId: "proj_123", target: "kaca.co.id", pageSize: 50, page: 1 })`.
+  1. Overview: `get_backlinks_overview({ projectId: "00000000-0000-0000-0000-000000000001", target: "kaca.co.id" })`.
+  2. Detailed referring domains and anchors: `get_backlinks_profile({ projectId: "00000000-0000-0000-0000-000000000001", target: "kaca.co.id", pageSize: 50, page: 1 })`.
 
 ### Playbook 6F: Executive SEO Reports & Sharing (`/reports`)
 - **UI Route**: `/p/:projectId/reports`
 - **MCP Tools**: `list_report_templates`, `list_reports`, `save_report`, `get_report`, `set_report_sharing`
 - **Workflow**:
   1. List available report templates: `list_report_templates({})`.
-  2. List existing reports: `list_reports({ projectId: "proj_123" })`.
-  3. Save complete audit report: `save_report({ projectId: "proj_123", title: "Q4 2026 Technical Audit", summary: "Executive technical audit summary for Q4", html: "<!DOCTYPE html><html><head><title>Q4 Audit</title></head><body><h1>Audit Report</h1></body></html>" })`.
-  4. Read back report: `get_report({ projectId: "proj_123", reportId: "rep_123" })`.
+  2. List existing reports: `list_reports({ projectId: "00000000-0000-0000-0000-000000000001" })`.
+  3. Save complete audit report: `save_report({ projectId: "00000000-0000-0000-0000-000000000001", title: "Q4 2026 Technical Audit", summary: "Executive technical audit summary for Q4", html: "<!DOCTYPE html><html><head><title>Q4 Audit</title></head><body><h1>Audit Report</h1></body></html>" })`.
+  4. Read back report: `get_report({ projectId: "00000000-0000-0000-0000-000000000001", reportId: "00000000-0000-0000-0000-000000000002" })`.
   5. (Hosted Only) Operator-Authorized Public Sharing:
      Explicit operator confirmation is required prior to public disclosure:
      ```ts
      // Enable public sharing
-     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "proj_123", reportId: "rep_123", public: true } });
+     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "00000000-0000-0000-0000-000000000001", reportId: "00000000-0000-0000-0000-000000000002", public: true } });
      // Revoke public sharing
-     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "proj_123", reportId: "rep_123", public: false } });
+     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "00000000-0000-0000-0000-000000000001", reportId: "00000000-0000-0000-0000-000000000002", public: false } });
      ```
 
-### Playbook 6G: Project Setup & Brand Onboarding (`/projects/new`)
-- **UI Route**: `/projects/new` or `/p/:projectId/settings`
+### Playbook 6G: Project Setup & Brand Onboarding (`/projects`, `/settings`)
+- **UI Route**: `/projects` (project creation) or `/p/:projectId/settings` (configuration)
 - **MCP Tools**: `whoami`, `create_project`, `research_project_website`, `save_project_website_setup`, `get_project_context`
 - **Workflow**:
-  1. Verify caller identity and workspace:
+  1. Verify caller identity, mode, and credits:
      ```ts
      const user = await client.callTool({ name: "whoami", arguments: {} });
-     console.log("Authenticated as:", user.structuredContent?.email, "org:", user.structuredContent?.organizationId);
+     console.log(
+       "Authenticated as:", user.structuredContent?.userEmail,
+       "scopes:", user.structuredContent?.scopes,
+       "mode:", user.structuredContent?.mode,
+       "creditsRemaining:", user.structuredContent?.creditsRemaining
+     );
      ```
   2. Create tracked domain project:
      ```ts
@@ -485,23 +547,39 @@ try {
      const projectId = projRes.structuredContent?.project?.id;
      if (!projectId) throw new Error("Project creation did not return an ID");
      ```
-  3. Extract initial brand profile and save reviewed setup:
+  3. Extract initial brand profile and save reviewed setup (passing required `name`, `domain`, `overview`, `competitors` and optional `suggestedTopics`, `suggestedKeywords`):
      ```ts
      await client.callTool({ name: "research_project_website", arguments: { projectId, website: "https://toiletcubicle.co.id" } });
      await client.callTool({
        name: "save_project_website_setup",
        arguments: {
          projectId,
-         businessSummary: "Surabaya commercial cubicle contractor",
-         targetAudience: "B2B / Facility managers",
-         suggestedTopics: ["cubicle toilet", "partisi phenolic"]
+         name: "Toilet Cubicle Surabaya",
+         domain: "toiletcubicle.co.id",
+         overview: "Surabaya commercial toilet cubicle contractor providing phenolic and glass cubicle installations.",
+         competitors: [
+           { name: "Cubicle ID", domain: "cubicle.id", notes: "Local competitor" }
+         ],
+         suggestedTopics: [
+           {
+             name: "Cubicle Toilet Surabaya",
+             prompts: [
+               "kontraktor cubicle toilet surabaya",
+               "harga partisi toilet surabaya",
+               "pasang cubicle phenolic surabaya",
+               "distributor toilet cubicle surabaya",
+               "spesialis partisi cubicle surabaya"
+             ]
+           }
+         ],
+         suggestedKeywords: ["cubicle toilet surabaya", "partisi toilet surabaya"]
        }
      });
      const context = await client.callTool({ name: "get_project_context", arguments: { projectId } });
      ```
 
 ### Playbook 6H: Keyword & SERP Research Workflows (`/keywords`)
-- **UI Route**: `/p/:projectId/keywords` and `/p/:projectId/serp`
+- **UI Route**: `/p/:projectId/keywords` and `/p/:projectId/keywords/research`
 - **MCP Tools**: `research_keywords`, `get_keyword_metrics`, `get_serp_results`, `save_keywords`, `get_ranked_keywords`
 - **Workflow**:
   1. Research candidate keywords by seed array (1–5 seeds, allowed resultLimit: 150, 300, 500):
@@ -509,36 +587,46 @@ try {
      const res = await client.callTool({
        name: "research_keywords",
        arguments: {
-         projectId: "proj_123",
+         projectId: "00000000-0000-0000-0000-000000000001",
          seeds: [{ seed: "cubicle toilet surabaya", locationCode: 2360, languageCode: "id" }],
          resultLimit: 150
        }
      });
      ```
-  2. Inspect live SERP competitors and rankings:
+  2. Inspect live SERP competitors and rankings (requires `projectId` and `queries` array):
      ```ts
      const serp = await client.callTool({
        name: "get_serp_results",
-       arguments: { keyword: "cubicle toilet surabaya", locationCode: 2360, languageCode: "id" }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         queries: [{ keyword: "cubicle toilet surabaya", locationCode: 2360, languageCode: "id" }]
+       }
      });
      ```
   3. Save high-intent keywords to project tracking:
      ```ts
      await client.callTool({
        name: "save_keywords",
-       arguments: { projectId: "proj_123", keywords: ["cubicle toilet surabaya", "partisi toilet phenolic"] }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         keywords: ["cubicle toilet surabaya", "partisi toilet phenolic"]
+       }
      });
      ```
 
-### Playbook 6I: Local SEO & Geo-Grid Visibility (`/local-seo`)
-- **UI Route**: `/p/:projectId/local-seo`
+### Playbook 6I: Local SEO & Geo-Grid Visibility (`/keywords`, `/domain`)
+- **UI Route**: Headless MCP capability (integrated with `/p/:projectId/keywords` and `/p/:projectId/domain`)
 - **MCP Tools**: `search_local_businesses`, `get_local_rank_grid`
 - **Workflow**:
-  1. Search and bind target Google Business Profile:
+  1. Search and bind target Google Business Profile (requires `projectId` and `near` coordinates/radius):
      ```ts
      const businesses = await client.callTool({
        name: "search_local_businesses",
-       arguments: { query: "Toilet Cubicle Surabaya", country: "ID" }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         query: "Toilet Cubicle Surabaya",
+         near: { latitude: -7.2575, longitude: 112.7521, radiusKm: 10 }
+       }
      });
      ```
   2. Dispatch local geo-grid search around target coordinates:
@@ -546,7 +634,7 @@ try {
      const grid = await client.callTool({
        name: "get_local_rank_grid",
        arguments: {
-         projectId: "proj_123",
+         projectId: "00000000-0000-0000-0000-000000000001",
          keyword: "partisi toilet",
          target: { name: "Toilet Cubicle Surabaya" },
          center: { latitude: -7.2575, longitude: 112.7521 },
@@ -556,13 +644,19 @@ try {
      });
      ```
 
-### Playbook 6J: Audit Follow-Through & Granular Issue Inspection (`/audits`)
+### Playbook 6J: Audit Follow-Through & Granular Issue Inspection (`/audit`)
 - **UI Route**: `/p/:projectId/audit?auditId=:auditId`
 - **MCP Tools**: `get_audit_status`, `get_audit_issues`, `get_audit_pages`
 - **Workflow**:
   1. Inspect running or completed crawl progress (status object wrapped in structuredContent.status):
      ```ts
-     const statusRes = await client.callTool({ name: "get_audit_status", arguments: { projectId: "proj_123", auditId: "aud_123" } });
+     const statusRes = await client.callTool({
+       name: "get_audit_status",
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         auditId: "00000000-0000-0000-0000-000000000003"
+       }
+     });
      const status = statusRes.structuredContent?.status;
      console.log(`Audit phase: ${status?.currentPhase}, crawled: ${status?.pagesCrawled}`);
      ```
@@ -570,14 +664,23 @@ try {
      ```ts
      const issues = await client.callTool({
        name: "get_audit_issues",
-       arguments: { projectId: "proj_123", auditId: "aud_123", severity: "critical", limit: 50 }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         auditId: "00000000-0000-0000-0000-000000000003",
+         severity: "critical",
+         limit: 50
+       }
      });
      ```
   3. Query crawled pages:
      ```ts
      const pages = await client.callTool({
        name: "get_audit_pages",
-       arguments: { projectId: "proj_123", auditId: "aud_123", limit: 50 }
+       arguments: {
+         projectId: "00000000-0000-0000-0000-000000000001",
+         auditId: "00000000-0000-0000-0000-000000000003",
+         limit: 50
+       }
      });
      ```
 

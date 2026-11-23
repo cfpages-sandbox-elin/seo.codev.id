@@ -162,13 +162,13 @@ export async function getAggregatedFleetIssues(options: {
     whereClauses.push(`i.issue_type = '${options.issueType.trim().replace(/'/g, "''")}'`);
   }
 
-  // Sol P2-06: Query latest completed audit per active project, ordering by unixepoch(completed_at)
+  // Sol F10: Query latest completed audit per active project, ordering by fractional julianday(completed_at)
   const query = `
     WITH ranked_audits AS (
       SELECT a.id, a.project_id,
              ROW_NUMBER() OVER (
                PARTITION BY a.project_id
-               ORDER BY unixepoch(a.completed_at) DESC, a.id DESC
+               ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
              ) AS audit_rank
       FROM audits a
       JOIN projects p ON p.id = a.project_id

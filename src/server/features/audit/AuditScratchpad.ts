@@ -104,22 +104,9 @@ const CLEANUP_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const LINK_STORAGE_BUDGET_BYTES = 500 * 1024 * 1024;
 
 export class AuditScratchpad extends DurableObject {
-  private hasTruncatedLinks = false;
-
   constructor(ctx: DurableObjectState, workerEnv: Env) {
     super(ctx, workerEnv);
     this.ctx.storage.sql.exec(SCRATCHPAD_SCHEMA_SQL);
-    // Sol F5: Restore link completeness from durable storage across restarts/evictions
-    try {
-      const meta = this.ctx.storage.sql
-        .exec<{ value: string }>(
-          `SELECT value FROM meta WHERE key = 'link_graph_incomplete'`,
-        )
-        .toArray();
-      if (meta.length > 0 && meta[0].value === "1") {
-        this.hasTruncatedLinks = true;
-      }
-    } catch {}
 
     // Guarantee the cleanup alarm on EVERY instantiation, not just at seed:
     // any RPC (even one racing in right after destroy()) re-creates the
@@ -234,7 +221,6 @@ export class AuditScratchpad extends DurableObject {
         skippedLinks = true;
       }
       if (input.hasTruncatedLinks || skippedLinks) {
-        this.hasTruncatedLinks = true;
         this.ctx.storage.sql.exec(
           `INSERT OR REPLACE INTO meta (key, value) VALUES ('link_graph_incomplete', '1')`,
         );
@@ -290,21 +276,15 @@ export class AuditScratchpad extends DurableObject {
     // and nothing redirects to it. Only meaningful on a completed crawl with
     // a complete link graph — if the storage budget truncated link writes or
     // truncation occurred, "no inbound edge" is missing data, not evidence of orphanhood.
-    let durableIncomplete = false;
-    try {
-      const meta = this.ctx.storage.sql
-        .exec<{ value: string }>(
-          `SELECT value FROM meta WHERE key = 'link_graph_incomplete'`,
-        )
-        .toArray();
-      if (meta.length > 0 && meta[0].value === "1") {
-        durableIncomplete = true;
-      }
-    } catch {}
+    const meta = this.ctx.storage.sql
+      .exec<{ value: string }>(
+        `SELECT value FROM meta WHERE key = 'link_graph_incomplete'`,
+      )
+      .toArray();
+    const incomplete = meta.some((entry) => entry.value === "1");
 
     const linkGraphComplete =
-      !this.hasTruncatedLinks &&
-      !durableIncomplete &&
+      !incomplete &&
       this.ctx.storage.sql.databaseSize < LINK_STORAGE_BUDGET_BYTES;
     const orphanPages =
       input.crawlCompleted && linkGraphComplete

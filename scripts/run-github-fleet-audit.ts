@@ -97,6 +97,7 @@ interface RepoMapping {
   domain: string;
   repoName: string;
   projectId?: string;
+  publishRoot?: string;
 }
 
 function loadRepoMappings(): Map<string, RepoMapping> {
@@ -113,6 +114,7 @@ function loadRepoMappings(): Map<string, RepoMapping> {
           map.set(item.canonicalHost.toLowerCase().trim(), {
             domain: item.canonicalHost.toLowerCase().trim(),
             repoName: repoSlug,
+            publishRoot: item.publishRoot ?? ".",
           });
         }
       }
@@ -132,7 +134,7 @@ function loadRepoMappings(): Map<string, RepoMapping> {
         const site = match[3].trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
         const slug = `${owner}/${repo}`;
         if (owner && repo && site && !map.has(site) && isValidRepoSlug(slug)) {
-          map.set(site, { domain: site, repoName: slug });
+          map.set(site, { domain: site, repoName: slug, publishRoot: "." });
         }
       }
     }
@@ -160,6 +162,9 @@ const normalizeRoute = (urlOrPath: string): string => {
 
 async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchive = false, isRemote = true): Promise<boolean> {
   const { domain, repoName, projectId } = mapping;
+  if (!projectId) {
+    throw new Error(`Cannot audit repository '${repoName}' for domain '${domain}': missing projectId`);
+  }
   console.log(`\n======================================================`);
   console.log(`Auditing ${domain} directly from GitHub repo ${repoName}`);
   console.log(`======================================================`);
@@ -181,18 +186,14 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     return false;
   }
 
-  // 2. Build comprehensive unified route index with collision detection & served identity admission (Sol F1)
-  type RouteOwner =
-    | { kind: "page"; path: string; pageUrl: string }
-    | { kind: "asset"; path: string }
-    | { kind: "ambiguous"; paths: string[] };
+  // 2. Build comprehensive unified route index with collision detection & served identity admission (Sol F01, F02)
+  const publishRoot = mapping.publishRoot ?? ".";
+  const prefix = publishRoot === "." ? "" : (publishRoot.replace(/^\/+|\/+$/g, "") + "/");
 
-  const physicalRoutes = new Map<string, RouteOwner>();
-  const inferredAliases = new Map<string, RouteOwner>();
-
-  // Helper to map repo path to public page URL using canonical served identities (Sol Snippet 3)
+  // Helper to map repo path to public page URL using canonical served identities (Sol Snippet 3, F01)
   const pathToUrl = (path: string): string => {
-    const segments = path.split("/").map(encodeURIComponent);
+    const relativePath = prefix && path.startsWith(prefix) ? path.slice(prefix.length) : path;
+    const segments = relativePath.split("/").map(encodeURIComponent);
     const isDirectoryIndex = /^(?:index\.html|index\.htm)$/i.test(segments.at(-1) ?? "");
     if (isDirectoryIndex) segments.pop();
     const pathname = "/" + segments.join("/") + (isDirectoryIndex && segments.length ? "/" : "");
@@ -203,9 +204,35 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   const htmlBlobsByServedUrl = new Map<string, GitTreeItem[]>();
   const ambiguousServedUrls = new Set<string>();
 
+  type RouteOwner =
+    | { kind: "page"; gitPath: string; pageUrl: string }
+    | { kind: "asset"; gitPath: string }
+    | { kind: "ambiguous"; gitPaths: string[] };
+
+  const physicalRoutes = new Map<string, RouteOwner>();
+  const aliases = new Map<string, Map<string, RouteOwner>>();
+
+  function addAlias(route: string, owner: RouteOwner) {
+    const owners = aliases.get(route) ?? new Map<string, RouteOwner>();
+    const key = owner.kind === "ambiguous" ? owner.gitPaths.join(",") : owner.gitPath;
+    owners.set(key, owner);
+    aliases.set(route, owners);
+  }
+
+  function resolveRoute(route: string) {
+    const exact = physicalRoutes.get(route);
+    if (exact) return { kind: "known" as const, owner: exact };
+    const candidates = [...(aliases.get(route)?.values() ?? [])];
+    if (candidates.length === 1) return { kind: "known" as const, owner: candidates[0] };
+    if (candidates.length > 1) return { kind: "ambiguous" as const, candidates };
+    return { kind: "missing" as const };
+  }
+
   for (const item of treeItems) {
     if (item.type !== "blob" || (item.mode !== "100644" && item.mode !== "100755")) continue;
     const p = item.path;
+    // Sol F01: filter by declared publish root boundary
+    if (prefix && !p.startsWith(prefix)) continue;
     const isHtml = p.endsWith(".html") || p.endsWith(".htm");
 
     if (isHtml) {
@@ -215,9 +242,10 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       htmlBlobsByServedUrl.set(served, list);
     } else {
       // Register static asset physical route
-      const encodedPath = p.split("/").map(encodeURIComponent).join("/");
+      const servedPath = prefix ? p.slice(prefix.length) : p;
+      const encodedPath = servedPath.split("/").map(encodeURIComponent).join("/");
       const physicalRoute = normalizeRoute(`${domain}/${encodedPath}`);
-      physicalRoutes.set(physicalRoute, { kind: "asset", path: p });
+      physicalRoutes.set(physicalRoute, { kind: "asset", gitPath: p });
     }
   }
 
@@ -237,42 +265,42 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   // Sort HTML candidate files by path for deterministic audit order
   htmlFiles.sort((a, b) => a.path.localeCompare(b.path));
 
-  // Register physical and clean alias routes for admitted HTML files
+  // Register physical and clean alias routes for admitted HTML files (Sol F02)
   for (const file of htmlFiles) {
     const p = file.path;
-    const encodedPath = p.split("/").map(encodeURIComponent).join("/");
+    const servedPath = prefix ? p.slice(prefix.length) : p;
+    const encodedPath = servedPath.split("/").map(encodeURIComponent).join("/");
     const pageUrl = pathToUrl(p);
     const physicalKey = normalizeRoute(`${domain}/${encodedPath}`);
 
     if (ambiguousServedUrls.has(pageUrl)) {
       const allPaths = (htmlBlobsByServedUrl.get(pageUrl) ?? [file]).map((it) => it.path);
-      physicalRoutes.set(physicalKey, { kind: "ambiguous", paths: allPaths });
+      const ambigOwner: RouteOwner = { kind: "ambiguous", gitPaths: allPaths };
+      physicalRoutes.set(physicalKey, ambigOwner);
+      addAlias(normalizeRoute(pageUrl), ambigOwner);
     } else {
-      physicalRoutes.set(physicalKey, { kind: "page", path: p, pageUrl });
-    }
+      const pageOwner: RouteOwner = { kind: "page", gitPath: p, pageUrl };
+      physicalRoutes.set(physicalKey, pageOwner);
 
-    // Inferred aliases: extensionless & directory roots
-    let cleanSlug: string | null = null;
-    if (p === "index.html" || p === "index.htm") {
-      cleanSlug = "";
-    } else if (p.endsWith("/index.html")) {
-      cleanSlug = encodedPath.slice(0, -11);
-    } else if (p.endsWith("/index.htm")) {
-      cleanSlug = encodedPath.slice(0, -10);
-    } else if (p.endsWith(".html")) {
-      cleanSlug = encodedPath.slice(0, -5);
-    } else if (p.endsWith(".htm")) {
-      cleanSlug = encodedPath.slice(0, -4);
-    }
-
-    if (cleanSlug !== null) {
-      const cleanRoute = cleanSlug === "" ? normalizeRoute(domain) : normalizeRoute(`${domain}/${cleanSlug}`);
-      if (!physicalRoutes.has(cleanRoute)) {
-        inferredAliases.set(cleanRoute, { kind: "page", path: p, pageUrl });
+      // Inferred aliases: extensionless & directory roots
+      let cleanSlug: string | null = null;
+      if (servedPath === "index.html" || servedPath === "index.htm") {
+        cleanSlug = "";
+      } else if (servedPath.endsWith("/index.html")) {
+        cleanSlug = encodedPath.slice(0, -11);
+      } else if (servedPath.endsWith("/index.htm")) {
+        cleanSlug = encodedPath.slice(0, -10);
+      } else if (servedPath.endsWith(".html")) {
+        cleanSlug = encodedPath.slice(0, -5);
+      } else if (servedPath.endsWith(".htm")) {
+        cleanSlug = encodedPath.slice(0, -4);
       }
-      const cleanSlashRoute = cleanSlug === "" ? normalizeRoute(`${domain}/`) : normalizeRoute(`${domain}/${cleanSlug}/`);
-      if (!physicalRoutes.has(cleanSlashRoute)) {
-        inferredAliases.set(cleanSlashRoute, { kind: "page", path: p, pageUrl });
+
+      if (cleanSlug !== null) {
+        const cleanRoute = cleanSlug === "" ? normalizeRoute(domain) : normalizeRoute(`${domain}/${cleanSlug}`);
+        addAlias(cleanRoute, pageOwner);
+        const cleanSlashRoute = cleanSlug === "" ? normalizeRoute(`${domain}/`) : normalizeRoute(`${domain}/${cleanSlug}/`);
+        addAlias(cleanSlashRoute, pageOwner);
       }
     }
   }
@@ -412,23 +440,43 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
           );
           detectedIssues.push(...issues);
 
-          // Check internal links using unified route owner index and apex/www equivalence (Sol F1)
+          // Check internal links using unified route owner index and apex/www equivalence (Sol F02)
+          let effectiveBaseUrl = new URL(pageUrl);
+          const baseMatch = html.match(/<base\s+[^>]*href=["']([^"']+)["']/i);
+          if (baseMatch && baseMatch[1]) {
+            try {
+              effectiveBaseUrl = new URL(baseMatch[1].trim(), effectiveBaseUrl);
+            } catch {}
+          }
+
           for (const link of analysis.links) {
             if (link.isInternal && link.targetUrl) {
               try {
-                const servedUrl = new URL(pageUrl);
-                const target = new URL(link.targetUrl, servedUrl);
-                // Recognize same origin including www <-> apex pairs (Sol F1)
-                if (isSameOrigin(target.href, servedUrl.href)) {
+                const target = new URL(link.targetUrl, effectiveBaseUrl);
+                // Recognize same origin including www <-> apex pairs and default port http/https (Sol F02)
+                const isInternal =
+                  isSameOrigin(target.href, pageUrl) ||
+                  (target.hostname.toLowerCase().replace(/^www\./, "") === domain.toLowerCase().replace(/^www\./, "") &&
+                    (target.port === "" || target.port === "80" || target.port === "443"));
+
+                if (isInternal) {
                   const normTarget = normalizeRoute(`https://${domain}${target.pathname}`);
-                  const owner = physicalRoutes.get(normTarget) ?? inferredAliases.get(normTarget);
-                  if (owner?.kind === "page") {
-                    if (owner.pageUrl !== pageUrl) {
-                      inboundLinkCounts.set(owner.pageUrl, (inboundLinkCounts.get(owner.pageUrl) || 0) + 1);
+                  const res = resolveRoute(normTarget);
+                  if (res.kind === "known") {
+                    const owner = res.owner;
+                    if (owner.kind === "page") {
+                      if (owner.pageUrl !== pageUrl) {
+                        inboundLinkCounts.set(owner.pageUrl, (inboundLinkCounts.get(owner.pageUrl) || 0) + 1);
+                      }
                     }
-                  } else if (owner?.kind === "asset" || owner?.kind === "ambiguous") {
-                    // Valid link to asset or ambiguous route
-                  } else if (!owner && !isTreeTruncated && candidateFiles.length === htmlFiles.length) {
+                  } else if (res.kind === "ambiguous") {
+                    // Credit inbound edge to possible candidates so neither is falsely orphaned
+                    for (const cand of res.candidates) {
+                      if (cand.kind === "page" && cand.pageUrl !== pageUrl) {
+                        inboundLinkCounts.set(cand.pageUrl, (inboundLinkCounts.get(cand.pageUrl) || 0) + 1);
+                      }
+                    }
+                  } else if (!isTreeTruncated && candidateFiles.length === htmlFiles.length) {
                     // Internal dead link confirmed only when tree is complete
                     detectedIssues.push({
                       issueType: "broken-internal-link",
@@ -615,34 +663,39 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
             Math.min(100, Math.round(100 - (detectedIssues.length / Math.max(1, htmlFiles.length)) * 100))
           );
           const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
-          const coverage = Math.round((processedCount / Math.max(1, htmlFiles.length)) * 100);
+          const coverage = Math.round((processedCount / Math.max(1, htmlFiles.length)) * 100 * 100) / 100;
 
           const runStatus = isComplete ? "completed" : "partial";
           const itemStatus = isComplete ? "completed" : (processedCount > 0 ? "partial" : "failed");
+          const nowIso = new Date().toISOString();
 
           const diagnosticSql = [
             `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-             VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', '${runStatus}', 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, datetime('now'), datetime('now'))
-             ON CONFLICT(id) DO UPDATE SET status = '${runStatus}', completed_at = datetime('now');`,
+             VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', '${runStatus}', 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, '${nowIso}', '${nowIso}')
+             ON CONFLICT(id) DO UPDATE SET status = '${runStatus}', completed_at = '${nowIso}';`,
             `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-             VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${itemStatus}', 1, datetime('now'), datetime('now'))
-             ON CONFLICT(id) DO UPDATE SET status = '${itemStatus}', completed_at = datetime('now');`,
+             VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${itemStatus}', 1, '${nowIso}', '${nowIso}')
+             ON CONFLICT(id) DO UPDATE SET status = '${itemStatus}', completed_at = '${nowIso}';`,
             `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-             VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, datetime('now'))
-             ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = '${grade}', coverage = ${coverage}, observed_at = datetime('now');`
+             VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, '${nowIso}')
+             ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = '${grade}', coverage = ${coverage}, observed_at = '${nowIso}';`
           ];
           executeD1SqlStatements(diagnosticSql, isRemote);
 
-          // Verify exact triple persisted (Sol P1-02)
-          const verifyTriple = runD1Query(
-            `SELECT r.id as run_id, i.id as item_id, s.id as snap_id
-             FROM fleet_runs r
-             JOIN fleet_run_items i ON i.run_id = r.id
-             JOIN fleet_snapshots s ON s.run_item_id = i.id
-             WHERE r.id = '${runId}' AND i.id = '${runItemId}' AND s.id = '${snapshotId}' AND i.audit_id = '${auditId}';`,
-            isRemote
+          // Verify exact triple persisted with full identities (Sol F07)
+          const isVerified = verifyDiagnosticTriple(
+            runId,
+            runItemId,
+            snapshotId,
+            auditId,
+            organization_id,
+            version_id,
+            member_id,
+            projectId,
+            domain,
+            isRemote,
           );
-          if (verifyTriple.length !== 1) {
+          if (!isVerified) {
             throw new Error(`Diagnostic triple verification failed for audit ${auditId}`);
           }
           console.log(`[DIAGNOSTIC] Recorded and verified fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%, status: ${itemStatus})`);
@@ -689,6 +742,44 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   }
 }
 
+function verifyDiagnosticTriple(
+  runId: string,
+  runItemId: string,
+  snapshotId: string,
+  auditId: string,
+  orgId: string,
+  rosterId: string,
+  memberId: string,
+  projectId: string,
+  canonicalHost: string,
+  isRemote = true,
+): boolean {
+  const query = `
+    SELECT r.id as run_id, i.id as item_id, s.id as snap_id
+    FROM fleet_runs r
+    JOIN fleet_run_items i ON i.run_id = r.id
+    JOIN fleet_snapshots s ON s.run_item_id = i.id
+    WHERE r.id = '${runId}'
+      AND i.id = '${runItemId}'
+      AND s.id = '${snapshotId}'
+      AND r.organization_id = '${orgId}'
+      AND r.roster_version_id = '${rosterId}'
+      AND i.audit_id = '${auditId}'
+      AND i.member_id = '${memberId}'
+      AND i.project_id = '${projectId}'
+      AND s.member_id = '${memberId}'
+      AND s.project_id = '${projectId}'
+      AND s.canonical_host = '${canonicalHost.replace(/'/g, "''")}'
+      AND i.primary_series_key = 'diagnostic'
+      AND s.series_key = 'diagnostic'
+      AND r.status = 'completed'
+      AND i.status = 'completed'
+      AND 1 = (SELECT count(*) FROM fleet_run_items WHERE audit_id = '${auditId}' AND primary_series_key = 'diagnostic');
+  `;
+  const res = runD1Query(query, isRemote);
+  return res.length === 1;
+}
+
 function repairDiagnosticObservation(
   auditId: string,
   projectId: string,
@@ -724,55 +815,49 @@ function repairDiagnosticObservation(
     const snapshotId = "snap_" + crypto.createHash("sha256").update(auditId + ":snap").digest("hex").slice(0, 16);
 
     const counts = runD1Query(
-      `SELECT a.pages_crawled, a.pages_total,
+      `SELECT a.pages_crawled, a.pages_total, a.completed_at,
               (SELECT COUNT(*) FROM audit_issues WHERE audit_id = a.id) as issue_count
        FROM audits a WHERE a.id = '${auditId}';`,
       isRemote,
     );
     if (counts.length === 0) return false;
-    const { pages_crawled, pages_total, issue_count } = counts[0];
+    const { pages_crawled, pages_total, completed_at, issue_count } = counts[0];
     const crawled = Number(pages_crawled || 0);
     const total = Number(pages_total || 1);
     const issues = Number(issue_count || 0);
 
     const score = Math.max(10, Math.min(100, Math.round(100 - (issues / Math.max(1, total)) * 100)));
     const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
-    const coverage = Math.round((crawled / Math.max(1, total)) * 100);
+    const coverage = Math.round((crawled / Math.max(1, total)) * 100 * 100) / 100;
+    const observedAt = completed_at || new Date().toISOString();
 
     const diagnosticSql = [
       `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-       VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, datetime('now'), datetime('now'))
-       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = datetime('now');`,
+       VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, '${observedAt}', '${observedAt}')
+       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = '${observedAt}';`,
       `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-       VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', 'completed', 1, datetime('now'), datetime('now'))
-       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = datetime('now');`,
+       VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', 'completed', 1, '${observedAt}', '${observedAt}')
+       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = '${observedAt}';`,
       `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-       VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, datetime('now'))
-       ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = '${grade}', coverage = ${coverage}, observed_at = datetime('now');`
+       VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, '${observedAt}')
+       ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = '${grade}', coverage = ${coverage}, observed_at = '${observedAt}';`
     ];
     executeD1SqlStatements(diagnosticSql, isRemote);
 
-    // Strict full exact triple verification (Sol F4)
-    const verify = runD1Query(
-      `SELECT r.id as run_id, i.id as item_id, s.id as snap_id
-       FROM fleet_runs r
-       JOIN fleet_run_items i ON i.run_id = r.id
-       JOIN fleet_snapshots s ON s.run_item_id = i.id
-       WHERE r.id = '${runId}'
-         AND i.id = '${runItemId}'
-         AND s.id = '${snapshotId}'
-         AND i.audit_id = '${auditId}'
-         AND i.member_id = '${member_id}'
-         AND i.project_id = '${projectId}'
-         AND s.member_id = '${member_id}'
-         AND s.project_id = '${projectId}'
-         AND i.primary_series_key = 'diagnostic'
-         AND s.series_key = 'diagnostic'
-         AND r.status = 'completed'
-         AND i.status = 'completed';`,
+    // Strict full exact triple verification (Sol F07)
+    const isVerified = verifyDiagnosticTriple(
+      runId,
+      runItemId,
+      snapshotId,
+      auditId,
+      organization_id,
+      version_id,
+      member_id,
+      projectId,
+      domain,
       isRemote,
     );
-    if (verify.length === 1) {
+    if (isVerified) {
       console.log(`[REPAIR] Successfully repaired diagnostic observation for ${domain} (${auditId})`);
       return true;
     }
@@ -793,6 +878,7 @@ async function main() {
       limit: { type: "string", short: "l" },
       all: { type: "boolean", short: "a" },
       force: { type: "boolean", short: "f" },
+      workspace: { type: "boolean", short: "w" },
       archive: { type: "boolean" },
       "max-pages": { type: "string", short: "m", default: "10000" },
       remote: { type: "boolean", default: true },
@@ -838,6 +924,7 @@ async function main() {
     limit = parseInt(rawLimit, 10);
   }
   const force = !!args.values.force;
+  const isWorkspace = !!args.values.workspace;
 
   // Sol P2-04: Strict numeric and scope validation
   const rawMaxPages = args.values["max-pages"] ? String(args.values["max-pages"]) : "10000";
@@ -857,23 +944,50 @@ async function main() {
     process.exit(1);
   }
 
-  // Load project mappings from D1
+  // Load project mappings from D1 with duplicate domain detection (Sol F01)
   const projectRows = runD1Query(
     "SELECT id, domain FROM projects WHERE organization_id = 'shared-workspace' AND domain IS NOT NULL AND archived_at IS NULL;",
     isRemote
   );
   const projectIdByDomain = new Map<string, string>();
   for (const p of projectRows) {
-    projectIdByDomain.set(p.domain.toLowerCase().trim(), p.id);
+    const dom = p.domain.toLowerCase().trim();
+    if (projectIdByDomain.has(dom) && projectIdByDomain.get(dom) !== p.id) {
+      console.error(`[ERROR] Conflicting active project IDs found for domain '${dom}': ${projectIdByDomain.get(dom)} and ${p.id}.`);
+      process.exit(1);
+    }
+    projectIdByDomain.set(dom, p.id);
   }
 
-  // Load deterministic latest completed source audits with verified diagnostic triple (Sol F4)
+  // Load effective approved roster for admission scoping (Sol F01)
+  const allRosterVersions = runD1Query(
+    `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';`,
+    isRemote
+  );
+  const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
+  const approvedHosts = new Set<string>();
+  if (effectiveRoster) {
+    const rosterRows = runD1Query(
+      `SELECT m.canonical_host, m.project_id
+       FROM fleet_roster_members m
+       JOIN fleet_roster_versions v ON v.id = m.version_id
+       WHERE v.id = '${effectiveRoster.id}'
+         AND v.organization_id = 'shared-workspace'
+         AND m.project_id IS NOT NULL;`,
+      isRemote
+    );
+    for (const r of rosterRows) {
+      approvedHosts.add(r.canonical_host.toLowerCase().trim());
+    }
+  }
+
+  // Load deterministic latest completed source audits with verified diagnostic triple (Sol F07, F10)
   const completedAudits = runD1Query(
     `WITH ranked_audits AS (
        SELECT a.id, a.project_id, a.completed_at,
               ROW_NUMBER() OVER (
                 PARTITION BY a.project_id
-                ORDER BY unixepoch(a.completed_at) DESC, a.id DESC
+                ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
               ) AS audit_rank
        FROM audits a
        WHERE a.status = 'completed'
@@ -886,11 +1000,16 @@ async function main() {
               FROM fleet_runs r
               JOIN fleet_run_items fri ON fri.run_id = r.id
               JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
+              JOIN fleet_roster_members rm ON fri.member_id = rm.id
               WHERE fri.audit_id = ra.id
                 AND fri.primary_series_key = 'diagnostic'
                 AND fs.series_key = 'diagnostic'
                 AND r.status = 'completed'
                 AND fri.status = 'completed'
+                AND fri.project_id = ra.project_id
+                AND fs.project_id = ra.project_id
+                AND fs.canonical_host = rm.canonical_host
+                AND r.organization_id = 'shared-workspace'
             ) AS has_verified_triple
      FROM ranked_audits ra
      WHERE ra.audit_rank = 1;`,
@@ -907,7 +1026,7 @@ async function main() {
   const repoMappings = loadRepoMappings();
   console.log(`Loaded ${repoMappings.size} repository mappings from manifest & PROJECTS_GITHUB.md.`);
 
-  // Build deterministic planned actions list (Sol F2: prevents repair bleed across limits)
+  // Build deterministic planned actions list (Sol F01, F2: respects approved roster vs workspace scope)
   const plannedActions: FleetAction[] = [];
 
   if (targetDomain) {
@@ -915,6 +1034,10 @@ async function main() {
     const repoMeta = repoMappings.get(targetDomain);
     if (!projId || !repoMeta) {
       console.error(`[ERROR] Domain '${targetDomain}' is not found among enrolled projects or repository mappings.`);
+      process.exit(1);
+    }
+    if (!isWorkspace && effectiveRoster && !approvedHosts.has(targetDomain)) {
+      console.error(`[ERROR] Domain '${targetDomain}' is not in approved fleet roster '${effectiveRoster.id}'. Pass --workspace to audit wider inventory.`);
       process.exit(1);
     }
     const existingAudit = auditByProjectId.get(projId);
@@ -931,7 +1054,8 @@ async function main() {
   } else {
     for (const [dom, m] of repoMappings.entries()) {
       const projId = projectIdByDomain.get(dom);
-      if (projId) {
+      const isEligible = isWorkspace || approvedHosts.has(dom);
+      if (projId && isEligible) {
         const existingAudit = auditByProjectId.get(projId);
         if (!force && existingAudit) {
           if (!existingAudit.hasDiagnostic) {

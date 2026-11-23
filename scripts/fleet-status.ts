@@ -41,12 +41,14 @@ function extractJson(raw: string): any {
   return JSON.parse(raw);
 }
 
+const isRemote = !process.argv.includes("--local");
+
 function runD1Query(query: string): any[] {
-  return executeD1SqlBatches([query], true);
+  return executeD1SqlBatches([query], isRemote);
 }
 
 async function main() {
-  console.log("=== OpenSEO Fleet Status Summary ===");
+  console.log(`=== OpenSEO Fleet Status Summary (${isRemote ? "Remote D1" : "Local D1"}) ===`);
 
   // 1. Audit status breakdown (scoped to shared-workspace and active projects)
   const auditStatus = runD1Query(`
@@ -64,7 +66,7 @@ async function main() {
   );
   console.log("Total active projects:", projectStats[0]?.total_projects);
 
-  // 3. Mutually exclusive coverage stats on eligible domain population (Sol F11)
+  // 3. Mutually exclusive coverage stats on eligible domain population (Sol F03, F10)
   const auditedStats = runD1Query(`
     WITH latest_attempt AS (
       SELECT p.id AS project_id, p.domain,
@@ -74,7 +76,7 @@ async function main() {
       LEFT JOIN audits a ON a.id = (
         SELECT a2.id FROM audits a2
         WHERE a2.project_id = p.id
-        ORDER BY unixepoch(a2.created_at) DESC, a2.id DESC
+        ORDER BY julianday(a2.started_at) DESC NULLS LAST, a2.id DESC
         LIMIT 1
       )
       WHERE p.organization_id = 'shared-workspace'
@@ -83,10 +85,10 @@ async function main() {
     )
     SELECT
       COUNT(*) AS total_enrolled_domains,
-      SUM(CASE WHEN latest_status = 'completed' THEN 1 ELSE 0 END) AS completed_projects,
-      SUM(CASE WHEN latest_status = 'running' THEN 1 ELSE 0 END) AS running_projects,
-      SUM(CASE WHEN latest_status = 'failed' THEN 1 ELSE 0 END) AS failed_projects,
-      SUM(CASE WHEN latest_audit_id IS NULL THEN 1 ELSE 0 END) AS never_audited_projects
+      COUNT(*) FILTER (WHERE latest_status = 'completed') AS completed_projects,
+      COUNT(*) FILTER (WHERE latest_status = 'running') AS running_projects,
+      COUNT(*) FILTER (WHERE latest_status = 'failed') AS failed_projects,
+      COUNT(*) FILTER (WHERE latest_audit_id IS NULL) AS never_audited_projects
     FROM latest_attempt;
   `);
   console.log("Audited coverage stats (mutually exclusive):", auditedStats[0]);
@@ -99,7 +101,7 @@ async function main() {
     WHERE a.status = 'completed'
       AND p.organization_id = 'shared-workspace'
       AND p.archived_at IS NULL
-    ORDER BY unixepoch(a.completed_at) DESC, a.id DESC LIMIT 10;
+    ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC LIMIT 10;
   `);
   console.log("\nRecent completed audits (sample 10):");
   for (const r of recentCompleted) {
@@ -114,7 +116,7 @@ async function main() {
     WHERE a.status = 'failed'
       AND p.organization_id = 'shared-workspace'
       AND p.archived_at IS NULL
-    ORDER BY unixepoch(a.started_at) DESC, a.id DESC LIMIT 10;
+    ORDER BY julianday(a.started_at) DESC NULLS LAST, a.id DESC LIMIT 10;
   `);
   console.log("\nRecent failed audits (sample 10):");
   for (const f of failedAudits) {
