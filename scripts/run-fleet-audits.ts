@@ -113,14 +113,22 @@ async function main() {
       domain: { type: "string", short: "d" },
       "max-pages": { type: "string", short: "m", default: "500" },
       "skip-recent": { type: "boolean", default: true },
+      all: { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
 
   const maxPages = parseInt(args.values["max-pages"] || "500", 10);
-  const concurrency = parseInt(args.values.concurrency || "2", 10);
+  const concurrency = Math.max(1, parseInt(args.values.concurrency || "2", 10) || 2);
   const limit = args.values.limit ? parseInt(args.values.limit, 10) : undefined;
   const targetDomainFilter = args.values.domain?.toLowerCase().trim();
+  const isAll = !!args.values.all;
+
+  // Sol P1-05: Require explicit execution scope (fail closed against unintended global audits)
+  if (!targetDomainFilter && !isAll && !limit) {
+    console.error("[ERROR] Missing explicit execution scope. Please specify --domain <canonical-host>, --all, or --limit <n>.");
+    process.exit(1);
+  }
 
   console.log("=== OpenSEO Fleet Audit Runner ===");
   console.log(`Pacing Concurrency: ${concurrency}`);
@@ -151,7 +159,7 @@ async function main() {
 
   if (targetDomainFilter) {
     candidates = candidates.filter((c) =>
-      c.domain.toLowerCase().includes(targetDomainFilter),
+      c.domain.toLowerCase() === targetDomainFilter,
     );
   }
 
@@ -268,6 +276,9 @@ async function main() {
   console.log("\n=== Fleet Audit Run Finished ===");
   console.log(`Total Completed: ${completedCount}`);
   console.log(`Total Failed: ${failedCount}`);
+  if (failedCount > 0) {
+    process.exitCode = 1;
+  }
 }
 
 main().catch((err) => {

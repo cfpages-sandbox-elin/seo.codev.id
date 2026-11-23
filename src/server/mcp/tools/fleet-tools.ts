@@ -1,11 +1,11 @@
-import { and, desc, eq, inArray, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
-import { auditIssues, auditPages, audits, projects } from "@/db/schema";
+import { auditIssues, audits, projects } from "@/db/schema";
 import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
-import { formatMcpCell, formatMcpTable, type McpTableColumn } from "@/server/mcp/table";
+import { formatMcpTable, type McpTableColumn } from "@/server/mcp/table";
 
 function routeIssueToSkill(issueType: string, url: string = ""): {
   skill: string;
@@ -189,13 +189,15 @@ export const getFleetIssuesTool = {
     const severityBreakdown = { critical: 0, warning: 0, info: 0 };
     const skillRoutingBreakdown: Record<string, number> = {};
 
+    const detailSchema = z.object({ targetUrl: z.string().optional() });
+
     const enrichedIssues: EnrichedFleetIssue[] = rows.map((r) => {
       let parsedTargetUrl: string | null = null;
       if (r.detailsJson) {
         try {
-          const parsed = JSON.parse(r.detailsJson);
-          if (parsed && typeof parsed.targetUrl === "string") {
-            parsedTargetUrl = parsed.targetUrl;
+          const parsed = detailSchema.safeParse(JSON.parse(r.detailsJson) as unknown);
+          if (parsed.success && parsed.data.targetUrl) {
+            parsedTargetUrl = parsed.data.targetUrl;
           }
         } catch {}
       }
@@ -284,6 +286,8 @@ export const runFleetAuditTool = {
     outputSchema: z
       .object({
         status: z.string(),
+        runId: z.string(),
+        organizationId: z.string(),
         mode: z.string(),
         targetDomain: z.string().nullable().optional(),
         message: z.string(),
@@ -298,12 +302,31 @@ export const runFleetAuditTool = {
       openWorldHint: false,
     },
   },
-  handler: async (args: RunFleetAuditArgs, _context: ToolContext) => {
+  handler: async (args: RunFleetAuditArgs, context: ToolContext) => {
+    const orgId = context.auth?.organizationId || "shared-workspace";
     const mode = args.mode ?? "repository_direct";
     const domain = args.domain?.toLowerCase().trim();
     const maxPages = args.maxPages || 2000;
     const concurrency = args.concurrency || 2;
 
+    if (domain) {
+      const proj = await db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(
+          and(
+            eq(projects.organizationId, orgId),
+            eq(projects.domain, domain),
+            isNull(projects.archivedAt),
+          ),
+        )
+        .limit(1);
+      if (proj.length === 0) {
+        throw new Error(`Domain '${domain}' is not enrolled in organization '${orgId}'.`);
+      }
+    }
+
+    const runId = "plan_" + crypto.randomUUID();
     let argv: string[] = [];
     if (mode === "repository_direct") {
       argv = [
@@ -335,6 +358,8 @@ export const runFleetAuditTool = {
     return mcpResponse({
       structuredContent: {
         status: "configured",
+        runId,
+        organizationId: orgId,
         mode,
         targetDomain: domain ?? null,
         message,

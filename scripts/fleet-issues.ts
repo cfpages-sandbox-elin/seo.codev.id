@@ -242,20 +242,19 @@ export async function getAggregatedFleetIssues(options: {
 
 // CLI execution
 if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
-  // Extract custom --csv argument to support both `--csv` and `--csv <filename>`
-  const csvArgIdx = process.argv.indexOf("--csv");
+  // Extract custom --csv argument cleanly preserving subsequent options (Sol P2-02)
+  const words = process.argv.slice(2);
+  const csvIndex = words.indexOf("--csv");
   let csvTargetFile: string | null = null;
-  if (csvArgIdx !== -1) {
-    const nextArg = process.argv[csvArgIdx + 1];
-    if (nextArg && !nextArg.startsWith("-")) {
-      csvTargetFile = nextArg;
-    } else {
-      csvTargetFile = "fleet-issues.csv";
-    }
+  if (csvIndex >= 0) {
+    const nextWord = words[csvIndex + 1];
+    const hasFilename = Boolean(nextWord && !nextWord.startsWith("-"));
+    csvTargetFile = hasFilename ? nextWord : "fleet-issues.csv";
+    words.splice(csvIndex, hasFilename ? 2 : 1);
   }
 
   const { values } = parseArgs({
-    args: process.argv.slice(2).filter((a, idx, arr) => a !== "--csv" && arr[idx - 1] !== "--csv"),
+    args: words,
     options: {
       remote: { type: "boolean", default: true },
       local: { type: "boolean", default: false },

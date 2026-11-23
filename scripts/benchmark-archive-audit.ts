@@ -11,6 +11,7 @@
 import { execSync } from "node:child_process";
 import fs, { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { parseArgs } from "node:util";
 
@@ -96,6 +97,11 @@ export function parseTarHtmlFiles(
 }
 
 export async function runBenchmark(repoName: string) {
+  const ownerRepoRegex = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
+  if (!ownerRepoRegex.test(repoName)) {
+    throw new Error(`Invalid repository name '${repoName}'. Must match 'owner/repo'.`);
+  }
+
   console.log(`\n=== Streaming Archive Reader Benchmark (FLEET-GH-02) ===`);
   console.log(`Repository: ${repoName}`);
 
@@ -170,16 +176,22 @@ export async function runBenchmark(repoName: string) {
   const memStart2 = process.memoryUsage().rss;
   const t0_lane2 = performance.now();
 
-  const tempTarFile = resolve(`scratch/bench_${Date.now()}.tar.gz`);
+  const scratchDir = resolve("scratch");
+  if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir, { recursive: true });
+  const tempTarFile = resolve(scratchDir, `bench_${Date.now()}.tar.gz`);
+  const authHeader = GITHUB_TOKEN ? `-H "Authorization: token ${GITHUB_TOKEN}"` : "";
   execSync(
-    `curl.exe -sL -H "User-Agent: OpenSEO-Benchmark" "https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}" -o "${tempTarFile}"`,
+    `curl.exe -sL ${authHeader} -H "User-Agent: OpenSEO-Benchmark" "https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}" -o "${tempTarFile}"`,
     { stdio: ["pipe", "pipe", "pipe"] }
   );
   const tDownload_lane2 = performance.now();
 
   const tarballBuffer = readFileSync(tempTarFile);
   const archiveWireBytes = tarballBuffer.length;
-  const decompressed = zlib.gunzipSync(tarballBuffer);
+  if (archiveWireBytes > 100 * 1024 * 1024) {
+    throw new Error(`Archive wire payload exceeds safe 100MB bound (${archiveWireBytes} bytes)`);
+  }
+  const decompressed = zlib.gunzipSync(tarballBuffer, { maxOutputLength: 250 * 1024 * 1024 });
   const tDecompress_lane2 = performance.now();
 
   const lane2Results = parseTarHtmlFiles(decompressed);
@@ -208,14 +220,17 @@ export async function runBenchmark(repoName: string) {
   // ─── Parity & Performance Comparison ───────────────────────────────────────
   console.log(`\n=== Parity & Performance Analysis ===`);
 
-  // Sol P1-4: Deterministic parity assertion: verify all candidate files exist in both lanes and have 100% byte equality
+  // Sol P1-04: Deterministic cryptographic byte parity assertion:
+  // Compare SHA-256 digests of all candidate blobs to ensure genuine byte equality across both lanes
   let matchedFiles = 0;
   let mismatchedContent = 0;
   for (const file of htmlBlobs) {
     const text1 = lane1Results.get(file.path);
     const text2 = lane2Results.get(file.path);
     if (text1 !== undefined && text2 !== undefined) {
-      if (text1 === text2) {
+      const d1 = crypto.createHash("sha256").update(text1).digest("hex");
+      const d2 = crypto.createHash("sha256").update(text2).digest("hex");
+      if (d1 === d2) {
         matchedFiles++;
       } else {
         mismatchedContent++;
@@ -231,12 +246,15 @@ export async function runBenchmark(repoName: string) {
     htmlBlobs.every((b: any) => {
       const left = lane1Results.get(b.path);
       const right = lane2Results.get(b.path);
-      return left !== undefined && right !== undefined && left === right;
+      if (left === undefined || right === undefined) return false;
+      const d1 = crypto.createHash("sha256").update(left).digest("hex");
+      const d2 = crypto.createHash("sha256").update(right).digest("hex");
+      return d1 === d2;
     });
 
   if (!parity) {
     throw new Error(
-      `PARITY FAILURE: Candidate set mismatch (Tree: ${htmlBlobs.length}, Lane 1: ${lane1Results.size}, Lane 2: ${lane2Results.size}, Matched: ${matchedFiles})`
+      `PARITY FAILURE: Candidate set mismatch (Tree: ${htmlBlobs.length}, Lane 1: ${lane1Results.size}, Lane 2: ${lane2Results.size}, Matched: ${matchedFiles}, Mismatches: ${mismatchedContent})`
     );
   }
 

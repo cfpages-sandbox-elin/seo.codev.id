@@ -49,7 +49,7 @@ describe("Fleet MCP Tools", () => {
         toolContext,
       );
 
-      const data = result.structuredContent as any;
+      const data = getFleetIssuesTool.config.outputSchema.parse(result.structuredContent);
       expect(data).toBeDefined();
       expect(data.totalIssues).toBe(2);
       expect(data.severityBreakdown.critical).toBe(1);
@@ -67,7 +67,7 @@ describe("Fleet MCP Tools", () => {
         toolContext,
       );
 
-      const data = result.structuredContent as any;
+      const data = runFleetAuditTool.config.outputSchema.parse(result.structuredContent);
       expect(data.status).toBe("configured");
       expect(data.mode).toBe("repository_direct");
       expect(data.executable).toBe("pnpm");
@@ -89,7 +89,7 @@ describe("Fleet MCP Tools", () => {
         toolContext,
       );
 
-      const data = result.structuredContent as any;
+      const data = runFleetAuditTool.config.outputSchema.parse(result.structuredContent);
       expect(data.status).toBe("configured");
       expect(data.mode).toBe("edge_workflow");
       expect(data.executionCommand).toContain("run-fleet-audits.ts");

@@ -9,7 +9,7 @@
  *   pnpm exec tsx scripts/run-github-fleet-audit.ts [--domain <domain>] [--limit <n>] [--all] [--force]
  */
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
@@ -313,6 +313,33 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     return `https://${domain}${pathname}`;
   };
 
+  // Build bidirectional alias-to-canonical route map to eliminate false orphan reports (Sol P1-03)
+  const aliasToCanonicalUrl = new Map<string, string>();
+  for (const file of htmlFiles) {
+    const canonical = pathToUrl(file.path);
+    const normCanonical = normalizeRoute(canonical);
+    aliasToCanonicalUrl.set(normCanonical, canonical);
+
+    // Direct path aliases (/docs/index.html -> /docs/)
+    aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${file.path}`), canonical);
+    aliasToCanonicalUrl.set(normalizeRoute(`/${file.path}`), canonical);
+
+    if (file.path === "index.html" || file.path === "index.htm") {
+      aliasToCanonicalUrl.set(normalizeRoute(domain), canonical);
+      aliasToCanonicalUrl.set(normalizeRoute("/"), canonical);
+    } else if (file.path.endsWith("/index.html")) {
+      const dirSlug = file.path.slice(0, -11);
+      aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${dirSlug}`), canonical);
+      aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}`), canonical);
+      aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}/`), canonical);
+    } else if (file.path.endsWith("/index.htm")) {
+      const dirSlug = file.path.slice(0, -10);
+      aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${dirSlug}`), canonical);
+      aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}`), canonical);
+      aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}/`), canonical);
+    }
+  }
+
   // 3. Fetch and analyze HTML files with paced concurrency
   const auditId = crypto.randomUUID();
   const startTime = Date.now();
@@ -324,13 +351,19 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   if (useArchive) {
     try {
       console.log(`[ARCHIVE] Streaming commit-pinned tarball for ${repoName} (${commitSha.slice(0, 10)})...`);
-      const tempTar = resolve(`scratch/tar_${Date.now()}.tar.gz`);
+      const scratchDir = resolve("scratch");
+      if (!existsSync(scratchDir)) mkdirSync(scratchDir, { recursive: true });
+      const tempTar = resolve(scratchDir, `tar_${Date.now()}.tar.gz`);
+      const authHeader = GITHUB_TOKEN ? `-H "Authorization: token ${GITHUB_TOKEN}"` : "";
       execSync(
-        `curl.exe -sL -H "User-Agent: OpenSEO-Audit" "https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}" -o "${tempTar}"`,
+        `curl.exe -sL ${authHeader} -H "User-Agent: OpenSEO-Audit" "https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}" -o "${tempTar}"`,
         { stdio: ["pipe", "pipe", "pipe"] }
       );
       const tarBuf = readFileSync(tempTar);
-      const decompressed = zlib.gunzipSync(tarBuf);
+      if (tarBuf.length > 100 * 1024 * 1024) {
+        throw new Error(`Archive exceeds 100MB bound (${tarBuf.length} bytes)`);
+      }
+      const decompressed = zlib.gunzipSync(tarBuf, { maxOutputLength: 250 * 1024 * 1024 });
       archiveHtmlMap = parseTarHtmlFiles(decompressed);
       try {
         unlinkSync(tempTar);
@@ -423,7 +456,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
           );
           detectedIssues.push(...issues);
 
-          // Check internal links against known repository routes using URL resolution (Sol Snippet 3)
+          // Check internal links against known repository routes using URL resolution (Sol Snippet 3 & P1-03)
           for (const link of analysis.links) {
             if (link.isInternal && link.targetUrl) {
               try {
@@ -434,10 +467,11 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
                   const normPageUrl = normalizeRoute(pageUrl);
 
                   if (normTarget && normTarget !== normPageUrl) {
-                    if (validRouteSet.has(normTarget)) {
-                      inboundLinkCounts.set(normTarget, (inboundLinkCounts.get(normTarget) || 0) + 1);
-                    } else {
-                      // Internal dead link confirmed
+                    if (validRouteSet.has(normTarget) || aliasToCanonicalUrl.has(normTarget)) {
+                      const destCanonical = aliasToCanonicalUrl.get(normTarget) || normTarget;
+                      inboundLinkCounts.set(destCanonical, (inboundLinkCounts.get(destCanonical) || 0) + 1);
+                    } else if (!isTreeTruncated && candidateFiles.length === htmlFiles.length) {
+                      // Internal dead link confirmed only when tree is complete
                       detectedIssues.push({
                         issueType: "broken-internal-link",
                         pageId,
@@ -460,25 +494,33 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   }
   console.log("\nPage analysis completed.");
 
-  // 4. Detect Orphan Pages
-  const homeNorm = normalizeRoute(domain);
-  for (const page of crawledPages) {
-    const pageNorm = normalizeRoute(page.url);
-    if (pageNorm !== homeNorm && (inboundLinkCounts.get(pageNorm) || 0) === 0) {
-      detectedIssues.push({
-        issueType: "orphan-page",
-        pageId: page.id,
-        pageUrl: page.url,
-      });
-    }
-  }
-
-  const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
   const attemptedCount = candidateFiles.length;
   const processedCount = crawledPages.length;
   const unreadCount = attemptedCount - processedCount;
   const isComplete = !isTreeTruncated && candidateFiles.length === htmlFiles.length && unreadCount === 0 && processedCount > 0;
-  const finalStatus = isComplete ? "completed" : "partial";
+  const finalStatus = isComplete ? "completed" : "failed";
+
+  // 4. Detect Orphan Pages (only when tree is complete and all eligible pages read — Sol P1-03)
+  const homeNorm = normalizeRoute(domain);
+  if (isComplete && unreadCount === 0) {
+    for (const page of crawledPages) {
+      if (normalizeRoute(page.url) === homeNorm) continue;
+      const inlinks =
+        inboundLinkCounts.get(page.url) ||
+        inboundLinkCounts.get(normalizeRoute(page.url)) ||
+        0;
+      if (inlinks === 0) {
+        detectedIssues.push({
+          issueType: "orphan-page",
+          pageId: page.id,
+          pageUrl: page.url,
+          dedupeKey: `orphan:${page.url}`,
+        });
+      }
+    }
+  }
+
+  const durationSec = ((Date.now() - startTime) / 1000).toFixed(1);
 
   console.log(`Analyzed ${processedCount}/${attemptedCount} pages (${unreadCount} unread, treeTruncated: ${isTreeTruncated}), detected ${detectedIssues.length} issues in ${durationSec}s.`);
   console.log(`Final evaluation status: ${finalStatus}`);
@@ -509,19 +551,21 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       ) ON CONFLICT(id) DO UPDATE SET status = 'running';`,
     ]);
 
-    // Stage 2: Insert audit pages (preserving source provenance, NULL unmeasured runtime evidence)
+    // Stage 2: Insert audit pages (preserving source provenance, NULL unmeasured runtime evidence, including OpenGraph — Sol P1-03)
     const pageSqlLines: string[] = [];
     for (const p of crawledPages) {
       const esc = (s: string | null | undefined) => (s ? `'${s.replace(/'/g, "''")}'` : "NULL");
       pageSqlLines.push(`
         INSERT INTO audit_pages (
           id, audit_id, url, status_code, fetch_class, title, meta_description,
-          canonical_url, robots_meta, h1_count, h2_count, h3_count, h4_count, h5_count, h6_count,
+          canonical_url, robots_meta, og_title, og_description, og_image,
+          h1_count, h2_count, h3_count, h4_count, h5_count, h6_count,
           word_count, content_hash, images_total, images_missing_alt, internal_link_count,
           external_link_count, has_structured_data, is_indexable, crawl_depth, in_sitemap, response_time_ms
         ) VALUES (
           '${p.id}', '${auditId}', '${p.url.replace(/'/g, "''")}', NULL, '${p.fetchClass}',
           ${esc(p.title)}, ${esc(p.metaDescription)}, ${esc(p.canonicalUrl)}, ${esc(p.robotsMeta)},
+          ${esc(p.ogTitle)}, ${esc(p.ogDescription)}, ${esc(p.ogImage)},
           ${p.h1Count}, ${p.h2Count}, ${p.h3Count}, ${p.h4Count}, ${p.h5Count}, ${p.h6Count},
           ${p.wordCount}, ${esc(p.contentHash)}, ${p.imagesTotal}, ${p.imagesMissingAlt},
           ${p.links.filter((l) => l.isInternal).length}, ${p.links.filter((l) => !l.isInternal).length},
@@ -552,21 +596,24 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       executeD1SqlStatements(issueSqlLines);
     }
 
-    // Stage 4: Atomic compare-and-set flip to final status with child row count reconciliation (Sol P1-5)
-    executeD1SqlStatements([
-      `UPDATE audits
-       SET status = 'completed',
-           current_phase = 'completed',
+    // Stage 4: Atomic compare-and-set flip to final status with child row count reconciliation and RETURNING assertion (Sol P1-01, P1-05)
+    const casSql = `UPDATE audits
+       SET status = '${finalStatus}',
+           current_phase = '${finalStatus}',
            pages_crawled = ${processedCount},
            pages_total = ${htmlFiles.length},
            completed_at = datetime('now')
        WHERE id = '${auditId}'
          AND status = 'running'
          AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = '${auditId}') = ${crawledPages.length}
-         AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') = ${detectedIssues.length};`,
-    ]);
+         AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') = ${detectedIssues.length}
+       RETURNING id;`;
+    const casResult = runD1Query(casSql);
+    if (!casResult || casResult.length !== 1) {
+      throw new Error(`Audit CAS finalization failed for ${auditId} (updated ${casResult?.length ?? 0} rows, expected 1). State conflict or child count mismatch.`);
+    }
 
-    // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration strictly scoped to organization and approved roster (Sol P1-6)
+    // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration strictly scoped to organization and approved roster (Sol P1-02, P1-06)
     try {
       const rosterRows = runD1Query(
         `SELECT m.id AS member_id, m.version_id, v.organization_id
@@ -574,6 +621,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
          JOIN fleet_roster_versions v ON v.id = m.version_id
          JOIN projects p ON p.id = m.project_id
          WHERE m.canonical_host = '${domain.replace(/'/g, "''")}'
+           AND m.project_id = '${projectId}'
            AND p.organization_id = 'shared-workspace'
            AND v.organization_id = 'shared-workspace'
          ORDER BY v.approved_at DESC LIMIT 1;`
@@ -596,19 +644,20 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
           `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
            VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, datetime('now'), datetime('now'));`,
           `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-           VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', 'completed', 1, datetime('now'), datetime('now'));`,
-          `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_and_perf, score_schema, score_ai_search, observed_at)
-           VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', ${score}, ${score}, ${score}, NULL, NULL, NULL, datetime('now'));`
+           VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${isComplete ? "completed" : "partial"}', 1, datetime('now'), datetime('now'));`,
+          `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
+           VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', ${score}, NULL, ${score}, NULL, NULL, NULL, datetime('now'));`
         ];
         executeD1SqlStatements(diagnosticSql);
         console.log(`[DIAGNOSTIC] Recorded fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%)`);
       }
     } catch (diagErr: any) {
-      console.warn(`[WARN] Diagnostic fleet series linking skipped:`, diagErr?.message || diagErr);
+      console.error(`[ERROR] Diagnostic fleet series linking failed:`, diagErr?.message || diagErr);
+      throw diagErr;
     }
 
     console.log(`[SUCCESS] ${domain} audit successfully finalized in D1 as '${finalStatus}'! (${processedCount} pages, ${detectedIssues.length} issues)`);
-    return true;
+    return isComplete;
   } catch (d1Err: any) {
     console.error(`[ERROR] D1 persistence failed for ${domain}:`, d1Err?.message || d1Err);
     // Mark audit as failed on error
@@ -663,8 +712,10 @@ async function main() {
     projectIdByDomain.set(p.domain.toLowerCase().trim(), p.id);
   }
 
-  // Load completed audits to avoid redundant work unless --force is given
-  const completedAudits = runD1Query("SELECT DISTINCT project_id FROM audits WHERE status = 'completed';");
+  // Load truly completed audits to avoid redundant work unless --force is given (Sol P1-01)
+  const completedAudits = runD1Query(
+    "SELECT DISTINCT project_id FROM audits WHERE status = 'completed' AND pages_crawled >= pages_total;"
+  );
   const alreadyAuditedProjectIds = new Set(completedAudits.map((a) => a.project_id));
 
   const repoMappings = loadRepoMappings();

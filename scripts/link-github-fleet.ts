@@ -123,6 +123,11 @@ export async function linkFleet(options: {
   const isRemote = options.remote ?? false;
   const orgId = options.orgId ?? "shared-workspace";
 
+  // Sol P2-05: Validate organization ID against injection
+  if (!/^[a-zA-Z0-9_-]+$/.test(orgId)) {
+    throw new Error(`Invalid organization ID '${orgId}'. Must contain only alphanumeric, dash, or underscore characters.`);
+  }
+
   console.log(`\n=== OpenSEO Fleet Linking Runner (FLEET-SYNC-01) ===`);
   console.log(`Target: ${isRemote ? "Cloudflare D1 (Remote)" : "Local D1"}`);
   console.log(`Mode: ${isDryRun ? "DRY RUN (Preview Only)" : "LIVE EXECUTION"}`);
@@ -246,10 +251,25 @@ export async function linkFleet(options: {
     }
   }
 
+  const alreadyLinkedCount = existingMembers.filter((m) => m.project_id !== null).length;
+  const linkableCount = membersToLink.length;
+  const unmappedCount = existingMembers.filter(
+    (m) => m.project_id === null && !existingProjectDomainMap.has(m.canonical_host.toLowerCase().trim())
+  ).length;
+
   console.log(`\nReconciliation Summary:`);
   console.log(`  - Missing projects to insert: ${missingProjects.length}`);
-  console.log(`  - Fleet roster members to link: ${membersToLink.length}`);
-  console.log(`  - Already linked roster members: ${existingMembers.length - membersToLink.length}`);
+  console.log(`  - Fleet roster members to link: ${linkableCount}`);
+  console.log(`  - Already linked roster members: ${alreadyLinkedCount}`);
+  console.log(`  - Unmapped roster members: ${unmappedCount}`);
+
+  // Sol P2-01: Reconcile complete partition: total must equal alreadyLinked + linkable + unmapped
+  const totalPartition = alreadyLinkedCount + linkableCount + unmappedCount;
+  if (totalPartition !== existingMembers.length) {
+    throw new Error(
+      `Reconciliation partition mismatch: partitioned ${totalPartition} members vs ${existingMembers.length} total members in approved roster.`
+    );
+  }
 
   if (isDryRun) {
     console.log(`\n[DRY RUN] Actions preview:`);
