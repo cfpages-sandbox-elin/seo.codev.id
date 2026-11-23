@@ -20,6 +20,7 @@ import {
   verifyGitBlob,
   parseTarHtmlFiles,
   decompressGzipStream,
+  discoverGitHubTree,
 } from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
@@ -54,28 +55,14 @@ export async function runBenchmark(repoName: string) {
   console.log(`\n=== Streaming Archive Reader Benchmark (FLEET-GH-02) ===`);
   console.log(`Repository: ${repoName}`);
 
-  // 1. Resolve commit SHA and tree
-  const repoInfo = JSON.parse(
-    execSync(`gh api /repos/${repoName}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }),
-  );
-  const defaultBranch = repoInfo.default_branch || "main";
-  const commitInfo = JSON.parse(
-    execSync(`gh api /repos/${repoName}/commits/${defaultBranch}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }),
-  );
-  const commitSha = commitInfo.sha;
+  // 1. Resolve commit SHA and tree via shell-free discovery helper (Sol P1-04)
+  const discovered = discoverGitHubTree(repoName);
+  const defaultBranch = discovered.defaultBranch;
+  const commitSha = discovered.commitSha;
+  const treeItems = discovered.tree;
   console.log(`Pinned commit: ${commitSha.slice(0, 10)} (${defaultBranch})`);
 
-  const treeJson = execSync(`gh api /repos/${repoName}/git/trees/${commitSha}?recursive=1`, {
-    encoding: "utf8",
-    maxBuffer: 30 * 1024 * 1024,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  const parsedTree = JSON.parse(treeJson);
-  if (parsedTree.truncated) {
-    throw new Error(`Tree was truncated by GitHub API for ${repoName}. Cannot guarantee complete parity.`);
-  }
-
-  const htmlBlobs = (parsedTree.tree || []).filter(
+  const htmlBlobs = treeItems.filter(
     (item: any) =>
       item.type === "blob" &&
       (item.mode === "100644" || item.mode === "100755") &&
@@ -157,14 +144,22 @@ export async function runBenchmark(repoName: string) {
   if (!archiveRes.body) {
     throw new Error("Empty archive response body");
   }
-  const tDownload_lane2 = performance.now();
+
+  let compressedWireBytes = 0;
+  const countStream = new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      compressedWireBytes += chunk.byteLength;
+      controller.enqueue(chunk);
+    },
+  });
 
   const tarStream = archiveRes.body
+    .pipeThrough(countStream)
     .pipeThrough(capBytes(100 * 1024 * 1024, "compressed archive"))
     .pipeThrough(decompressGzipStream())
     .pipeThrough(capBytes(250 * 1024 * 1024, "expanded archive"));
   const decompressed = await streamToBuffer(tarStream);
-  const archiveWireBytes = decompressed.length;
+  const expandedArchiveBytes = decompressed.length;
   const tDecompress_lane2 = performance.now();
 
   const lane2Results = parseTarHtmlFiles(decompressed);
@@ -180,17 +175,16 @@ export async function runBenchmark(repoName: string) {
     verifyGitBlob(buf, file.sha);
   }
 
-  const downloadDurationMs = Math.round(tDownload_lane2 - t0_lane2);
-  const decompressDurationMs = Math.round(tDecompress_lane2 - tDownload_lane2);
+  const decompressDurationMs = Math.round(tDecompress_lane2 - t0_lane2);
   const parseDurationMs = Math.round(t1_lane2 - tDecompress_lane2);
   const lane2DurationMs = Math.round(t1_lane2 - t0_lane2);
   const lane2MemMb = Math.round((memEnd2 - memStart2) / (1024 * 1024));
 
   console.log(`Lane 2 Complete:`);
   console.log(`  - Files extracted: ${lane2Results.size}/${htmlBlobs.length}`);
-  console.log(`  - Archive wire bytes transferred: ${(archiveWireBytes / (1024 * 1024)).toFixed(2)} MB`);
-  console.log(`  - Tarball download time: ${downloadDurationMs} ms`);
-  console.log(`  - Gzip decompression time: ${decompressDurationMs} ms`);
+  console.log(`  - Compressed wire bytes: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB`);
+  console.log(`  - Expanded tarball payload: ${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB`);
+  console.log(`  - Download & gzip decompression time: ${decompressDurationMs} ms`);
   console.log(`  - In-memory tar parse time: ${parseDurationMs} ms`);
   console.log(`  - Total elapsed time: ${lane2DurationMs} ms (${(lane2DurationMs / 1000).toFixed(2)}s)`);
   console.log(`  - RSS end-minus-start: ${lane2MemMb} MB`);
@@ -209,7 +203,6 @@ export async function runBenchmark(repoName: string) {
   }
 
   const parity =
-    !parsedTree.truncated &&
     htmlBlobs.length > 0 &&
     lane1Results.size === htmlBlobs.length &&
     lane2Results.size === htmlBlobs.length &&
@@ -223,12 +216,13 @@ export async function runBenchmark(repoName: string) {
 
   console.log(`\nWorkload Tradeoff Assessment:`);
   console.log(`  - Selective Blob Lane: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB wire payload, ${lane1DurationMs} ms`);
-  console.log(`  - Archive Tarball Lane: ${(archiveWireBytes / (1024 * 1024)).toFixed(2)} MB wire payload, ${lane2DurationMs} ms`);
+  console.log(`  - Archive Tarball Lane: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB wire payload (${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB expanded), ${lane2DurationMs} ms`);
   return {
     lane1DurationMs,
     lane2DurationMs,
     lane1TotalBytes,
-    archiveWireBytes,
+    compressedWireBytes,
+    expandedArchiveBytes,
     fileCount: htmlBlobs.length,
     parity: true,
   };

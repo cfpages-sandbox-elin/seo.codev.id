@@ -5,6 +5,8 @@ import {
   streamToBuffer,
   verifyGitBlob,
   isValidCanonicalHostname,
+  isValidRepoSlug,
+  selectEffectiveRosterVersion,
   parseTarHtmlFiles,
 } from "./github-archive-utils";
 import { analyzeHtml } from "../src/server/lib/audit/page-analyzer";
@@ -113,12 +115,70 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
     });
   });
 
+  describe("isValidRepoSlug (Sol P1-04)", () => {
+    it("accepts valid owner/repo slugs", () => {
+      expect(isValidRepoSlug("owner/repo")).toBe(true);
+      expect(isValidRepoSlug("owner-name/repo.name")).toBe(true);
+      expect(isValidRepoSlug("org_123/sub-repo")).toBe(true);
+      expect(isValidRepoSlug("cfpages-site/toiletcubicle-co-id")).toBe(true);
+    });
+
+    it("rejects malicious or malformed repository slugs", () => {
+      expect(isValidRepoSlug("")).toBe(false);
+      expect(isValidRepoSlug("bare-repo")).toBe(false);
+      expect(isValidRepoSlug("owner/repo/extra")).toBe(false);
+      expect(isValidRepoSlug("owner/$(calc.exe)")).toBe(false);
+      expect(isValidRepoSlug("owner/repo;rm -rf /")).toBe(false);
+      expect(isValidRepoSlug("owner/repo&whoami")).toBe(false);
+      expect(isValidRepoSlug("owner /repo")).toBe(false);
+    });
+  });
+
+  describe("selectEffectiveRosterVersion (Sol P1-03)", () => {
+    const nowMs = Date.parse("2026-11-24T00:00:00.000Z");
+
+    it("selects newest effective roster before cutoff and filters future approvals", () => {
+      const versions = [
+        { id: "v_future", approved_at: "2026-12-01 00:00:00" },
+        { id: "v_older", approved_at: "2026-11-20 12:00:00" },
+        { id: "v_effective", approved_at: "2026-11-23 09:00:00" },
+      ];
+      const selected = selectEffectiveRosterVersion(versions, nowMs);
+      expect(selected?.id).toBe("v_effective");
+    });
+
+    it("normalizes mixed timestamp formats (ISO vs space) and breaks ties by ID", () => {
+      const versions = [
+        { id: "v_a", approved_at: "2026-11-22T10:00:00.000Z" },
+        { id: "v_b", approved_at: "2026-11-22 10:00:00" },
+      ];
+      // Same timestamp -> tie-breaker by id descending ("v_b" > "v_a")
+      const selected = selectEffectiveRosterVersion(versions, nowMs);
+      expect(selected?.id).toBe("v_b");
+    });
+
+    it("returns null if no versions are at or before nowMs", () => {
+      const versions = [{ id: "v_future", approved_at: "2026-11-25 00:00:00" }];
+      expect(selectEffectiveRosterVersion(versions, nowMs)).toBeNull();
+    });
+  });
+
   describe("analyzeHtml link truncation detection (Sol P2-03)", () => {
     it("reports truncatedLinks=false on ordinary pages with <1,000 links", () => {
       const html = "<html><body><a href='/about'>About</a><a href='/contact'>Contact</a></body></html>";
       const result = analyzeHtml(html, "https://example.com/", 200, 50);
       expect(result.truncatedLinks).toBe(false);
       expect(result.links.length).toBe(2);
+    });
+
+    it("does NOT trip truncatedLinks on duplicate anchors after 1,000 distinct links (Sol P2-02)", () => {
+      // 1,000 unique links + 10 duplicate links of the first target
+      const uniqueLinks = Array.from({ length: 1000 }, (_, i) => `<a href="/page-${i}">Link ${i}</a>`).join("\n");
+      const duplicates = Array.from({ length: 10 }, () => `<a href="/page-0">Duplicate</a>`).join("\n");
+      const html = `<html><body>${uniqueLinks}\n${duplicates}</body></html>`;
+      const result = analyzeHtml(html, "https://example.com/", 200, 50);
+      expect(result.truncatedLinks).toBe(false);
+      expect(result.links.length).toBe(1000);
     });
 
     it("reports truncatedLinks=true when unique links exceed MAX_EXTRACTED_LINKS (1,000)", () => {

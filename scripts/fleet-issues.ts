@@ -13,7 +13,7 @@ import fs, { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import Papa from "papaparse";
 import { parseArgs } from "node:util";
-import { isValidCanonicalHostname } from "./github-archive-utils";
+import { isValidCanonicalHostname, executeD1SqlBatches } from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
 
@@ -55,22 +55,7 @@ function extractJson(raw: string): any {
 }
 
 function runD1Query(query: string, isRemote: boolean): any[] {
-  const sanitized = query.replace(/\r?\n/g, " ").trim();
-  const flag = isRemote ? "--remote" : "--local";
-  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
-  const cmd = `npx wrangler d1 execute ${dbName} ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
-  const out = execSync(cmd, {
-    cwd: resolve("."),
-    env: { ...process.env, ...envVars },
-    encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  const parsed = extractJson(out);
-  if (Array.isArray(parsed) && parsed[0]?.results) {
-    return parsed[0].results;
-  }
-  return [];
+  return executeD1SqlBatches([query], isRemote);
 }
 
 export function routeIssueToSkill(issueType: string, url: string = ""): {
@@ -165,7 +150,6 @@ export async function getAggregatedFleetIssues(options: {
   const whereClauses: string[] = [
     "p.organization_id = 'shared-workspace'",
     "p.archived_at IS NULL",
-    "a.status = 'completed'",
   ];
 
   if (options.domain) {
@@ -178,13 +162,24 @@ export async function getAggregatedFleetIssues(options: {
     whereClauses.push(`i.issue_type = '${options.issueType.trim().replace(/'/g, "''")}'`);
   }
 
-  // Sol P1-7: Select authoritative i.page_url directly rather than pg.url from LEFT JOIN,
-  // preventing null dereference for site-level issues where page_id is NULL.
+  // Sol P2-06: Query latest completed audit per active project, ordering by unixepoch(completed_at)
   const query = `
+    WITH ranked_audits AS (
+      SELECT a.id, a.project_id,
+             ROW_NUMBER() OVER (
+               PARTITION BY a.project_id
+               ORDER BY unixepoch(a.completed_at) DESC, a.id DESC
+             ) AS audit_rank
+      FROM audits a
+      JOIN projects p ON p.id = a.project_id
+      WHERE a.status = 'completed'
+        AND p.organization_id = 'shared-workspace'
+        AND p.archived_at IS NULL
+    )
     SELECT 
       p.id AS project_id,
       p.domain AS domain,
-      a.id AS audit_id,
+      ra.id AS audit_id,
       i.id AS issue_id,
       i.issue_type AS issue_type,
       i.severity AS severity,
@@ -192,8 +187,8 @@ export async function getAggregatedFleetIssues(options: {
       pg.title AS page_title,
       i.details_json AS details_json
     FROM audit_issues i
-    JOIN audits a ON a.id = i.audit_id
-    JOIN projects p ON p.id = a.project_id
+    JOIN ranked_audits ra ON ra.id = i.audit_id AND ra.audit_rank = 1
+    JOIN projects p ON p.id = ra.project_id
     LEFT JOIN audit_pages pg ON pg.id = i.page_id AND pg.audit_id = i.audit_id
     WHERE ${whereClauses.join(" AND ")}
     ORDER BY 

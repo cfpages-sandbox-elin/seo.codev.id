@@ -1,6 +1,7 @@
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { executeD1SqlBatches } from "./github-archive-utils";
 
 const ENV_FILE = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/.env.selfhost");
 
@@ -41,20 +42,7 @@ function extractJson(raw: string): any {
 }
 
 function runD1Query(query: string): any[] {
-  const sanitized = query.replace(/\r?\n/g, " ").trim();
-  const cmd = `npx wrangler d1 execute open-seo-db-selfhost --remote --json --command "${sanitized.replace(/"/g, '\\"')}"`;
-  const out = execSync(cmd, {
-    cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
-    env: { ...process.env, ...envVars },
-    encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  const parsed = extractJson(out);
-  if (Array.isArray(parsed) && parsed[0]?.results) {
-    return parsed[0].results;
-  }
-  return [];
+  return executeD1SqlBatches([query], true);
 }
 
 async function main() {
@@ -98,7 +86,7 @@ async function main() {
     WHERE a.status = 'completed'
       AND p.organization_id = 'shared-workspace'
       AND p.archived_at IS NULL
-    ORDER BY a.completed_at DESC LIMIT 10;
+    ORDER BY unixepoch(a.completed_at) DESC, a.id DESC LIMIT 10;
   `);
   console.log("\nRecent completed audits (sample 10):");
   for (const r of recentCompleted) {
@@ -113,7 +101,7 @@ async function main() {
     WHERE a.status = 'failed'
       AND p.organization_id = 'shared-workspace'
       AND p.archived_at IS NULL
-    ORDER BY a.started_at DESC LIMIT 10;
+    ORDER BY unixepoch(a.started_at) DESC, a.id DESC LIMIT 10;
   `);
   console.log("\nRecent failed audits (sample 10):");
   for (const f of failedAudits) {

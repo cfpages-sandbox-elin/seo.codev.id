@@ -78,6 +78,13 @@ describe("Fleet MCP Tools", () => {
         domain: "-invalid.com",
       });
     });
+
+    it("rejects caller outside shared-workspace organization (Sol P2-06)", async () => {
+      const foreignContext = makeToolContext({ organizationId: "foreign_org" });
+      await expect(
+        getFleetIssuesTool.handler({ limit: 10 }, foreignContext),
+      ).rejects.toThrow(/shared-workspace/);
+    });
   });
 
   describe("run_fleet_audit", () => {

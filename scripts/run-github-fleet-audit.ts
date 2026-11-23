@@ -20,6 +20,12 @@ import {
   verifyGitBlob,
   parseTarHtmlFiles,
   decompressGzipStream,
+  isValidCanonicalHostname,
+  isValidRepoSlug,
+  discoverGitHubTree,
+  selectEffectiveRosterVersion,
+  executeD1SqlBatches,
+  type GitTreeItem,
 } from "./github-archive-utils";
 import { analyzeHtml } from "../src/server/lib/audit/page-analyzer";
 import { runPageReporters, type DetectedIssue } from "../src/server/lib/audit/issues/page-reporters";
@@ -78,48 +84,11 @@ function extractJson(raw: string): any {
 }
 
 function runD1Query(query: string, isRemote = true): any[] {
-  const sanitized = query.replace(/\r?\n/g, " ").trim();
-  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
-  const flag = isRemote ? "--remote" : "--local";
-  const cmd = `npx wrangler d1 execute ${dbName} ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
-  const out = execSync(cmd, {
-    cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
-    env: { ...process.env, ...envVars },
-    encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  const parsed = extractJson(out);
-  if (Array.isArray(parsed) && parsed[0]?.results) {
-    return parsed[0].results;
-  }
-  return [];
+  return executeD1SqlBatches([query], isRemote);
 }
 
 function executeD1SqlStatements(sqlLines: string[], isRemote = true): void {
-  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
-  const flag = isRemote ? "--remote" : "--local";
-  const CHUNK_SIZE = 500;
-  for (let i = 0; i < sqlLines.length; i += CHUNK_SIZE) {
-    const chunk = sqlLines.slice(i, i + CHUNK_SIZE).join("\n");
-    const scratchDir = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/scratch");
-    if (!existsSync(scratchDir)) mkdirSync(scratchDir, { recursive: true });
-    const tempFile = resolve(scratchDir, `batch_${Date.now()}_${i}.sql`);
-    writeFileSync(tempFile, chunk, "utf8");
-    try {
-      const cmd = `npx wrangler d1 execute ${dbName} ${flag} --file "${tempFile}"`;
-      execSync(cmd, {
-        cwd: "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
-        env: { ...process.env, ...envVars },
-        encoding: "utf8",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } finally {
-      try {
-        unlinkSync(tempFile);
-      } catch {}
-    }
-  }
+  executeD1SqlBatches(sqlLines, isRemote);
 }
 
 interface RepoMapping {
@@ -137,10 +106,13 @@ function loadRepoMappings(): Map<string, RepoMapping> {
     const list = JSON.parse(raw);
     for (const item of list) {
       if (item.canonicalHost && item.repoName) {
-        map.set(item.canonicalHost.toLowerCase().trim(), {
-          domain: item.canonicalHost.toLowerCase().trim(),
-          repoName: item.repoName.trim(),
-        });
+        const repoSlug = item.repoName.trim();
+        if (isValidRepoSlug(repoSlug)) {
+          map.set(item.canonicalHost.toLowerCase().trim(), {
+            domain: item.canonicalHost.toLowerCase().trim(),
+            repoName: repoSlug,
+          });
+        }
       }
     }
   } catch (err) {
@@ -156,8 +128,9 @@ function loadRepoMappings(): Map<string, RepoMapping> {
         const owner = match[1].trim();
         const repo = match[2].trim();
         const site = match[3].trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/+$/, "");
-        if (owner && repo && site && !map.has(site)) {
-          map.set(site, { domain: site, repoName: `${owner}/${repo}` });
+        const slug = `${owner}/${repo}`;
+        if (owner && repo && site && !map.has(site) && isValidRepoSlug(slug)) {
+          map.set(site, { domain: site, repoName: slug });
         }
       }
     }
@@ -189,42 +162,28 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   console.log(`Auditing ${domain} directly from GitHub repo ${repoName}`);
   console.log(`======================================================`);
 
-  // 1. Resolve default branch and immutable commit SHA
+  // 1. Resolve default branch and immutable commit SHA via shell-free discovery (Sol P1-04)
   let defaultBranch = "main";
   let commitSha = "";
-  let treeItems: Array<{ path: string; mode: string; type: string; sha: string; size?: number }> = [];
-  let isTreeTruncated = false;
+  let treeItems: GitTreeItem[] = [];
+  const isTreeTruncated = false;
 
   try {
-    const repoInfo = JSON.parse(
-      execSync(`gh api /repos/${repoName}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] })
-    );
-    defaultBranch = repoInfo.default_branch || "main";
-
-    const commitInfo = JSON.parse(
-      execSync(`gh api /repos/${repoName}/commits/${defaultBranch}`, { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] })
-    );
-    commitSha = commitInfo.sha;
+    const discovered = discoverGitHubTree(repoName);
+    defaultBranch = discovered.defaultBranch;
+    commitSha = discovered.commitSha;
+    treeItems = discovered.tree;
     console.log(`Pinned commit: ${commitSha.slice(0, 10)} (branch: ${defaultBranch})`);
-
-    const treeJson = execSync(
-      `gh api /repos/${repoName}/git/trees/${commitSha}?recursive=1`,
-      { encoding: "utf8", maxBuffer: 30 * 1024 * 1024, stdio: ["pipe", "pipe", "pipe"] }
-    );
-    const parsedTree = JSON.parse(treeJson);
-    if (parsedTree.truncated) {
-      isTreeTruncated = true;
-      throw new Error(`DISCOVERY_TRUNCATED: Git tree for ${repoName} is truncated by GitHub (exceeds limit); recursive subtree enumeration required`);
-    }
-    treeItems = parsedTree.tree || [];
   } catch (err: any) {
     console.error(`Failed to fetch git tree for ${repoName}:`, err?.message || err);
     return false;
   }
 
   // 2. Build comprehensive route set from ALL tree items (pages + static assets)
+  // Physical routes take precedence over inferred aliases; segment-encode all path segments (Sol P2-01)
+  const physicalRouteSet = new Set<string>();
   const validRouteSet = new Set<string>();
-  const htmlFiles: typeof treeItems = [];
+  const htmlFiles: GitTreeItem[] = [];
 
   for (const item of treeItems) {
     if (item.type !== "blob" || (item.mode !== "100644" && item.mode !== "100755")) continue;
@@ -235,26 +194,35 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       htmlFiles.push(item);
     }
 
-    // Segment-encode path to ensure static assets with special characters resolve consistently (Sol P2-02)
+    // Segment-encode path to ensure static assets with special characters resolve consistently (Sol P2-01)
     const encodedPath = p.split("/").map(encodeURIComponent).join("/");
-    validRouteSet.add(normalizeRoute(`${domain}/${encodedPath}`));
-    validRouteSet.add(normalizeRoute(`${domain}/${p}`));
+    const physicalRoute = normalizeRoute(`${domain}/${encodedPath}`);
+    physicalRouteSet.add(physicalRoute);
+    validRouteSet.add(physicalRoute);
+  }
 
-    if (isHtml) {
-      if (p === "index.html" || p === "index.htm") {
-        validRouteSet.add(normalizeRoute(domain));
-      } else if (p.endsWith("/index.html")) {
-        const slug = encodedPath.slice(0, -11);
-        validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
-      } else if (p.endsWith("/index.htm")) {
-        const slug = encodedPath.slice(0, -10);
-        validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
-      } else if (p.endsWith(".html")) {
-        const slug = encodedPath.slice(0, -5);
-        validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
-      } else if (p.endsWith(".htm")) {
-        const slug = encodedPath.slice(0, -4);
-        validRouteSet.add(normalizeRoute(`${domain}/${slug}`));
+  // Register clean HTML routes with physical priority and collision detection (Sol P2-01)
+  for (const item of htmlFiles) {
+    const p = item.path;
+    const encodedPath = p.split("/").map(encodeURIComponent).join("/");
+    let cleanSlug: string | null = null;
+    if (p === "index.html" || p === "index.htm") {
+      cleanSlug = "";
+    } else if (p.endsWith("/index.html")) {
+      cleanSlug = encodedPath.slice(0, -11);
+    } else if (p.endsWith("/index.htm")) {
+      cleanSlug = encodedPath.slice(0, -10);
+    } else if (p.endsWith(".html")) {
+      cleanSlug = encodedPath.slice(0, -5);
+    } else if (p.endsWith(".htm")) {
+      cleanSlug = encodedPath.slice(0, -4);
+    }
+
+    if (cleanSlug !== null) {
+      const cleanRoute = cleanSlug === "" ? normalizeRoute(domain) : normalizeRoute(`${domain}/${cleanSlug}`);
+      // Physical routes take absolute precedence over inferred aliases
+      if (!physicalRouteSet.has(cleanRoute)) {
+        validRouteSet.add(cleanRoute);
       }
     }
   }
@@ -276,31 +244,40 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     return `https://${domain}${pathname}`;
   };
 
-  // Build bidirectional alias-to-canonical route map to eliminate false orphan reports (Sol P1-03, F3)
+  // Build bidirectional alias-to-canonical route map to eliminate false orphan reports (Sol P2-01)
   const aliasToCanonicalUrl = new Map<string, string>();
+  // 1. Register physical file routes first
   for (const file of htmlFiles) {
     const encoded = file.path.split("/").map(encodeURIComponent).join("/");
     const canonical = pathToUrl(file.path);
     const normCanonical = normalizeRoute(canonical);
     aliasToCanonicalUrl.set(normCanonical, canonical);
-
-    // Direct path aliases (/docs/index.html -> /docs/)
     aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${encoded}`), canonical);
     aliasToCanonicalUrl.set(normalizeRoute(`/${encoded}`), canonical);
-
+  }
+  // 2. Register inferred aliases without overriding existing physical route targets
+  for (const file of htmlFiles) {
+    const encoded = file.path.split("/").map(encodeURIComponent).join("/");
+    const canonical = pathToUrl(file.path);
     if (file.path === "index.html" || file.path === "index.htm") {
-      aliasToCanonicalUrl.set(normalizeRoute(domain), canonical);
-      aliasToCanonicalUrl.set(normalizeRoute("/"), canonical);
+      const normApex = normalizeRoute(domain);
+      const normRoot = normalizeRoute("/");
+      if (!aliasToCanonicalUrl.has(normApex)) aliasToCanonicalUrl.set(normApex, canonical);
+      if (!aliasToCanonicalUrl.has(normRoot)) aliasToCanonicalUrl.set(normRoot, canonical);
     } else if (/(?:^|\/)index\.html?$/i.test(encoded)) {
       const dirSlug = encoded.replace(/(?:^|\/)index\.html?$/i, "");
-      aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${dirSlug}`), canonical);
-      aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}`), canonical);
-      aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}/`), canonical);
+      const r1 = normalizeRoute(`https://${domain}/${dirSlug}`);
+      const r2 = normalizeRoute(`/${dirSlug}`);
+      const r3 = normalizeRoute(`/${dirSlug}/`);
+      if (!aliasToCanonicalUrl.has(r1)) aliasToCanonicalUrl.set(r1, canonical);
+      if (!aliasToCanonicalUrl.has(r2)) aliasToCanonicalUrl.set(r2, canonical);
+      if (!aliasToCanonicalUrl.has(r3)) aliasToCanonicalUrl.set(r3, canonical);
     } else {
-      // Extensionless non-index pages (Sol F3) e.g. /about.html -> /about
       const extensionless = encoded.replace(/\.html?$/i, "");
-      aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${extensionless}`), canonical);
-      aliasToCanonicalUrl.set(normalizeRoute(`/${extensionless}`), canonical);
+      const r1 = normalizeRoute(`https://${domain}/${extensionless}`);
+      const r2 = normalizeRoute(`/${extensionless}`);
+      if (!aliasToCanonicalUrl.has(r1)) aliasToCanonicalUrl.set(r1, canonical);
+      if (!aliasToCanonicalUrl.has(r2)) aliasToCanonicalUrl.set(r2, canonical);
     }
   }
 
@@ -607,48 +584,77 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       throw new Error(`Audit CAS finalization failed for ${auditId} (updated ${casResult?.length ?? 0} rows, expected 1 matching id). State conflict or child count mismatch.`);
     }
 
-    // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration strictly scoped to organization and approved roster (Sol P1-02, P1-06)
+    // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration strictly scoped to effective roster and active projects (Sol P1-02, P1-03)
     let diagnosticFailed = false;
     try {
-      const rosterRows = runD1Query(
-        `SELECT m.id AS member_id, m.version_id, v.organization_id
-         FROM fleet_roster_members m
-         JOIN fleet_roster_versions v ON v.id = m.version_id
-         JOIN projects p ON p.id = m.project_id
-         WHERE m.canonical_host = '${domain.replace(/'/g, "''")}'
-           AND m.project_id = '${projectId}'
-           AND p.organization_id = 'shared-workspace'
-           AND v.organization_id = 'shared-workspace'
-         ORDER BY v.approved_at DESC LIMIT 1;`,
+      const allRosterVersions = runD1Query(
+        `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';`,
         isRemote
       );
-
-      if (rosterRows.length > 0) {
-        const { member_id, version_id, organization_id } = rosterRows[0];
-        const runId = "run_" + crypto.randomBytes(8).toString("hex");
-        const runItemId = "item_" + crypto.randomBytes(8).toString("hex");
-        const snapshotId = "snap_" + crypto.randomBytes(8).toString("hex");
-
-        const score = Math.max(
-          10,
-          Math.min(100, Math.round(100 - (detectedIssues.length / Math.max(1, htmlFiles.length)) * 100))
+      const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
+      if (!effectiveRoster) {
+        console.warn(`[DIAGNOSTIC] No effective approved roster found for organization 'shared-workspace'. Skipping diagnostic series.`);
+      } else {
+        const rosterRows = runD1Query(
+          `SELECT m.id AS member_id, m.version_id, v.organization_id
+           FROM fleet_roster_members m
+           JOIN fleet_roster_versions v ON v.id = m.version_id
+           JOIN projects p ON p.id = m.project_id
+           WHERE v.id = '${effectiveRoster.id}'
+             AND v.organization_id = 'shared-workspace'
+             AND m.canonical_host = '${domain.replace(/'/g, "''")}'
+             AND p.id = '${projectId}'
+             AND p.organization_id = v.organization_id
+             AND p.archived_at IS NULL;`,
+          isRemote
         );
-        const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
-        const coverage = Math.round((processedCount / Math.max(1, htmlFiles.length)) * 100);
 
-        const runStatus = isComplete ? "completed" : "partial";
-        const itemStatus = isComplete ? "completed" : (processedCount > 0 ? "partial" : "failed");
+        if (rosterRows.length > 0) {
+          const { member_id, version_id, organization_id } = rosterRows[0];
+          // Deterministic IDs derived from auditId (Sol P1-02)
+          const runId = "run_" + crypto.createHash("sha256").update(auditId + ":run").digest("hex").slice(0, 16);
+          const runItemId = "item_" + crypto.createHash("sha256").update(auditId + ":item").digest("hex").slice(0, 16);
+          const snapshotId = "snap_" + crypto.createHash("sha256").update(auditId + ":snap").digest("hex").slice(0, 16);
 
-        const diagnosticSql = [
-          `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-           VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', '${runStatus}', 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, datetime('now'), datetime('now'));`,
-          `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-           VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${itemStatus}', 1, datetime('now'), datetime('now'));`,
-          `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-           VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, datetime('now'));`
-        ];
-        executeD1SqlStatements(diagnosticSql, isRemote);
-        console.log(`[DIAGNOSTIC] Recorded fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%, status: ${itemStatus})`);
+          const score = Math.max(
+            10,
+            Math.min(100, Math.round(100 - (detectedIssues.length / Math.max(1, htmlFiles.length)) * 100))
+          );
+          const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
+          const coverage = Math.round((processedCount / Math.max(1, htmlFiles.length)) * 100);
+
+          const runStatus = isComplete ? "completed" : "partial";
+          const itemStatus = isComplete ? "completed" : (processedCount > 0 ? "partial" : "failed");
+
+          const diagnosticSql = [
+            `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
+             VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', '${runStatus}', 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, datetime('now'), datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET status = '${runStatus}', completed_at = datetime('now');`,
+            `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
+             VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${itemStatus}', 1, datetime('now'), datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET status = '${itemStatus}', completed_at = datetime('now');`,
+            `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
+             VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, datetime('now'))
+             ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = '${grade}', coverage = ${coverage}, observed_at = datetime('now');`
+          ];
+          executeD1SqlStatements(diagnosticSql, isRemote);
+
+          // Verify exact triple persisted (Sol P1-02)
+          const verifyTriple = runD1Query(
+            `SELECT r.id as run_id, i.id as item_id, s.id as snap_id
+             FROM fleet_runs r
+             JOIN fleet_run_items i ON i.run_id = r.id
+             JOIN fleet_snapshots s ON s.run_item_id = i.id
+             WHERE r.id = '${runId}' AND i.id = '${runItemId}' AND s.id = '${snapshotId}' AND i.audit_id = '${auditId}';`,
+            isRemote
+          );
+          if (verifyTriple.length !== 1) {
+            throw new Error(`Diagnostic triple verification failed for audit ${auditId}`);
+          }
+          console.log(`[DIAGNOSTIC] Recorded and verified fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%, status: ${itemStatus})`);
+        } else {
+          console.log(`[DIAGNOSTIC] Host '${domain}' is not in effective roster '${effectiveRoster.id}' or project is inactive. Skipped fleet diagnostic series.`);
+        }
       }
     } catch (diagErr: any) {
       console.error(`[ERROR] Diagnostic fleet series linking failed:`, diagErr?.message || diagErr);
@@ -689,6 +695,87 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   }
 }
 
+function repairDiagnosticObservation(
+  auditId: string,
+  projectId: string,
+  domain: string,
+  isRemote = true,
+): boolean {
+  try {
+    const allRosterVersions = runD1Query(
+      `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';`,
+      isRemote,
+    );
+    const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
+    if (!effectiveRoster) return false;
+
+    const rosterRows = runD1Query(
+      `SELECT m.id AS member_id, m.version_id, v.organization_id
+       FROM fleet_roster_members m
+       JOIN fleet_roster_versions v ON v.id = m.version_id
+       JOIN projects p ON p.id = m.project_id
+       WHERE v.id = '${effectiveRoster.id}'
+         AND v.organization_id = 'shared-workspace'
+         AND m.canonical_host = '${domain.replace(/'/g, "''")}'
+         AND p.id = '${projectId}'
+         AND p.organization_id = v.organization_id
+         AND p.archived_at IS NULL;`,
+      isRemote,
+    );
+    if (rosterRows.length === 0) return false;
+
+    const { member_id, version_id, organization_id } = rosterRows[0];
+    const runId = "run_" + crypto.createHash("sha256").update(auditId + ":run").digest("hex").slice(0, 16);
+    const runItemId = "item_" + crypto.createHash("sha256").update(auditId + ":item").digest("hex").slice(0, 16);
+    const snapshotId = "snap_" + crypto.createHash("sha256").update(auditId + ":snap").digest("hex").slice(0, 16);
+
+    const counts = runD1Query(
+      `SELECT a.pages_crawled, a.pages_total,
+              (SELECT COUNT(*) FROM audit_issues WHERE audit_id = a.id) as issue_count
+       FROM audits a WHERE a.id = '${auditId}';`,
+      isRemote,
+    );
+    if (counts.length === 0) return false;
+    const { pages_crawled, pages_total, issue_count } = counts[0];
+    const crawled = Number(pages_crawled || 0);
+    const total = Number(pages_total || 1);
+    const issues = Number(issue_count || 0);
+
+    const score = Math.max(10, Math.min(100, Math.round(100 - (issues / Math.max(1, total)) * 100)));
+    const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
+    const coverage = Math.round((crawled / Math.max(1, total)) * 100);
+
+    const diagnosticSql = [
+      `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
+       VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, datetime('now'), datetime('now'))
+       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = datetime('now');`,
+      `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
+       VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', 'completed', 1, datetime('now'), datetime('now'))
+       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = datetime('now');`,
+      `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
+       VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, datetime('now'))
+       ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = '${grade}', coverage = ${coverage}, observed_at = datetime('now');`
+    ];
+    executeD1SqlStatements(diagnosticSql, isRemote);
+
+    const verify = runD1Query(
+      `SELECT r.id as run_id, i.id as item_id, s.id as snap_id
+       FROM fleet_runs r
+       JOIN fleet_run_items i ON i.run_id = r.id
+       JOIN fleet_snapshots s ON s.run_item_id = i.id
+       WHERE r.id = '${runId}' AND i.id = '${runItemId}' AND s.id = '${snapshotId}' AND i.audit_id = '${auditId}';`,
+      isRemote,
+    );
+    if (verify.length === 1) {
+      console.log(`[REPAIR] Successfully repaired diagnostic observation for ${domain} (${auditId})`);
+      return true;
+    }
+  } catch (err: any) {
+    console.error(`[REPAIR ERROR] Failed to repair diagnostic observation:`, err?.message || err);
+  }
+  return false;
+}
+
 async function main() {
   const args = parseArgs({
     options: {
@@ -704,25 +791,46 @@ async function main() {
     allowPositionals: true,
   });
 
+  if (args.positionals.length > 0) {
+    console.error(`[ERROR] Stray positional arguments detected (${args.positionals.join(", ")}). Positional arguments not permitted.`);
+    process.exit(1);
+  }
+
   console.log("=== OpenSEO Zero-Limit GitHub Repository Audit Runner ===");
   const targetDomain = args.values.domain?.toLowerCase().trim();
   const isRemote = !args.values.local;
   let limit: number | undefined;
-  if (args.values.limit) {
-    if (!/^[1-9][0-9]*$/.test(args.values.limit)) {
-      console.error("[ERROR] Invalid --limit value. Must be a positive integer.");
+  if (args.values.limit !== undefined) {
+    const rawLimit = String(args.values.limit);
+    if (!/^[1-9][0-9]*$/.test(rawLimit) || !Number.isSafeInteger(Number(rawLimit))) {
+      console.error("[ERROR] Invalid --limit value. Must be a safe positive integer.");
       process.exit(1);
     }
-    limit = parseInt(args.values.limit, 10);
+    limit = parseInt(rawLimit, 10);
   }
   const force = !!args.values.force;
   const isAll = !!args.values.all;
-  const rawMaxPages = parseInt(args.values["max-pages"] || "10000", 10);
-  const maxPages = Number.isFinite(rawMaxPages) && rawMaxPages > 0 ? rawMaxPages : 10000;
 
-  // Sol P1-2: Require explicit execution scope (fail closed against unintended global audits)
-  if (!targetDomain && !isAll && !limit) {
-    console.error("[ERROR] Missing explicit execution scope. Please specify --domain <canonical-host>, --all, or --limit <n>.");
+  // Sol P2-04: Strict numeric and scope validation
+  const rawMaxPages = args.values["max-pages"] ? String(args.values["max-pages"]) : "10000";
+  const numMaxPages = Number(rawMaxPages);
+  if (!/^[1-9][0-9]*$/.test(rawMaxPages) || !Number.isSafeInteger(numMaxPages) || numMaxPages > 10000) {
+    console.error("[ERROR] Invalid --max-pages value. Must be a safe positive integer between 1 and 10000.");
+    process.exit(1);
+  }
+  const maxPages = numMaxPages;
+
+  const scopeCount =
+    Number(args.values.domain !== undefined) +
+    Number(args.values.all === true) +
+    Number(args.values.limit !== undefined);
+  if (scopeCount !== 1) {
+    console.error("[ERROR] Missing or conflicting execution scope. Specify exactly one of --domain <canonical-host>, --all, or --limit <n>.");
+    process.exit(1);
+  }
+
+  if (targetDomain && !isValidCanonicalHostname(targetDomain)) {
+    console.error(`[ERROR] Invalid fleet hostname: "${targetDomain}". Must be a valid lowercase RFC 1123 hostname without protocol, port, or path.`);
     process.exit(1);
   }
 
@@ -736,12 +844,21 @@ async function main() {
     projectIdByDomain.set(p.domain.toLowerCase().trim(), p.id);
   }
 
-  // Load truly completed audits from github source engine to avoid redundant work unless --force is given (Sol P1-01)
+  // Load completed audits with diagnostic observation check (Sol P1-02)
   const completedAudits = runD1Query(
-    "SELECT DISTINCT project_id FROM audits WHERE status = 'completed' AND workflow_instance_id LIKE 'github-audit-%' AND pages_crawled >= pages_total;",
+    `SELECT a.id, a.project_id,
+            (SELECT COUNT(*) FROM fleet_run_items fri WHERE fri.audit_id = a.id AND fri.primary_series_key = 'diagnostic') AS has_diagnostic
+     FROM audits a
+     WHERE a.status = 'completed' AND a.workflow_instance_id LIKE 'github-audit-%' AND a.pages_crawled >= a.pages_total;`,
     isRemote
   );
-  const alreadyAuditedProjectIds = new Set(completedAudits.map((a) => a.project_id));
+  const auditByProjectId = new Map<string, { id: string; hasDiagnostic: boolean }>();
+  for (const a of completedAudits) {
+    auditByProjectId.set(a.project_id, {
+      id: a.id,
+      hasDiagnostic: Number(a.has_diagnostic ?? 0) > 0,
+    });
+  }
 
   const repoMappings = loadRepoMappings();
   console.log(`Loaded ${repoMappings.size} repository mappings from manifest & PROJECTS_GITHUB.md.`);
@@ -754,17 +871,36 @@ async function main() {
       console.error(`[ERROR] Domain '${targetDomain}' is not found among enrolled projects or repository mappings.`);
       process.exit(1);
     }
-    if (!force && alreadyAuditedProjectIds.has(projId)) {
-      console.log(`[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit. Use --force to re-audit.`);
-      return;
+    const existingAudit = auditByProjectId.get(projId);
+    if (!force && existingAudit) {
+      if (!existingAudit.hasDiagnostic) {
+        console.log(`[REPAIR] Existing audit ${existingAudit.id} for '${targetDomain}' is missing diagnostic observation. Repairing...`);
+        const repaired = repairDiagnosticObservation(existingAudit.id, projId, targetDomain, isRemote);
+        if (repaired) {
+          console.log(`[REUSED] Project for domain '${targetDomain}' has verified completed audit ${existingAudit.id}. Use --force to re-audit.`);
+          return;
+        }
+      } else {
+        console.log(`[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit. Use --force to re-audit.`);
+        return;
+      }
     }
     candidates = [{ ...repoMeta, projectId: projId }];
   } else {
     for (const [dom, m] of repoMappings.entries()) {
       const projId = projectIdByDomain.get(dom);
       if (projId) {
-        if (!force && alreadyAuditedProjectIds.has(projId)) {
-          continue; // Already audited
+        const existingAudit = auditByProjectId.get(projId);
+        if (!force && existingAudit) {
+          if (!existingAudit.hasDiagnostic) {
+            console.log(`[REPAIR] Existing audit ${existingAudit.id} for '${dom}' is missing diagnostic observation. Repairing...`);
+            const repaired = repairDiagnosticObservation(existingAudit.id, projId, dom, isRemote);
+            if (repaired) {
+              continue;
+            }
+          } else {
+            continue; // Already audited with verified diagnostic triple
+          }
         }
         candidates.push({ ...m, projectId: projId });
       }

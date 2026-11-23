@@ -6,8 +6,10 @@ import { describe, expect, it } from "vitest";
 import { parse } from "yaml";
 import { z } from "zod";
 
-const GIT_BASH = "C:\\Program Files\\Git\\bin\\bash.exe";
-const BASH_CMD = process.platform === "win32" && existsSync(GIT_BASH) ? GIT_BASH : "bash";
+const DEFAULT_GIT_BASH = "C:\\Program Files\\Git\\bin\\bash.exe";
+const GIT_BASH = process.env.GIT_BASH_PATH ?? DEFAULT_GIT_BASH;
+const BASH_CMD =
+  process.platform === "win32" && existsSync(GIT_BASH) ? GIT_BASH : "bash";
 
 const workflow = z
   .object({

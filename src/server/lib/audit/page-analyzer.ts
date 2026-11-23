@@ -119,12 +119,12 @@ export function analyzeHtml(
     if (!openAnchor) return;
     const { href, rel, text } = openAnchor;
     openAnchor = null;
+    const resolved = normalizeUrl(href, pageUrl);
+    if (!resolved || linksByTarget.has(resolved)) return;
     if (linksByTarget.size >= MAX_EXTRACTED_LINKS) {
       truncatedLinks = true;
       return;
     }
-    const resolved = normalizeUrl(href, pageUrl);
-    if (!resolved || linksByTarget.has(resolved)) return;
     const anchor = text
       .join("")
       .replace(/\s+/g, " ")

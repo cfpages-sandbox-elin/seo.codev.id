@@ -162,9 +162,14 @@ export const getFleetIssuesTool = {
     },
   },
   handler: async (args: GetFleetIssuesArgs, context: ToolContext) => {
+    const orgId = context.auth?.organizationId;
+    if (!orgId || orgId !== "shared-workspace") {
+      throw new Error(`Fleet tools are currently constrained to the 'shared-workspace' organization; caller organization '${orgId ?? "unauthenticated"}' is not supported.`);
+    }
+
     const limit = Math.max(1, Math.min(200, args.limit || 50));
     const conditions = [
-      eq(projects.organizationId, context.auth.organizationId),
+      eq(projects.organizationId, orgId),
       isNull(projects.archivedAt),
       eq(audits.status, "completed"),
     ];

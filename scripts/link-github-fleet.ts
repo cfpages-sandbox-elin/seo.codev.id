@@ -13,6 +13,10 @@ import fs, { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import crypto from "node:crypto";
 import { parseArgs } from "node:util";
+import {
+  selectEffectiveRosterVersion,
+  executeD1SqlBatches,
+} from "./github-archive-utils";
 
 const MANIFEST_PATH = resolve("src/server/features/fleet/data/fleetManifest.json");
 const GITHUB_EVIDENCE_PATH = resolve("C:/Users/THINKPAD/OneDrive/MD/PORTFOLIO/EVIDENCE/PROJECTS_GITHUB.md");
@@ -56,45 +60,15 @@ function extractJson(raw: string): any {
 }
 
 function runD1Query(query: string, isRemote: boolean): any[] {
-  const sanitized = query.replace(/\r?\n/g, " ").trim();
-  const flag = isRemote ? "--remote" : "--local";
-  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
-  const cmd = `npx wrangler d1 execute ${dbName} ${flag} --json --command "${sanitized.replace(/"/g, '\\"')}"`;
-  const out = execSync(cmd, {
-    cwd: resolve("."),
-    env: { ...process.env, ...envVars },
-    encoding: "utf8",
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-
-  const parsed = extractJson(out);
-  if (Array.isArray(parsed) && parsed[0]?.results) {
-    return parsed[0].results;
-  }
-  return [];
+  return executeD1SqlBatches([query], isRemote);
 }
 
 function executeD1Sql(sqlContent: string, isRemote: boolean) {
-  const flag = isRemote ? "--remote" : "--local";
-  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
-  const scratchDir = resolve("scratch");
-  if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir, { recursive: true });
-  const randomSuffix = crypto.randomBytes(8).toString("hex");
-  const tempFile = resolve(`scratch/temp_link_${Date.now()}_${randomSuffix}.sql`);
-  writeFileSync(tempFile, sqlContent, "utf8");
-  try {
-    const cmd = `npx wrangler d1 execute ${dbName} ${flag} --file "${tempFile}"`;
-    execSync(cmd, {
-      cwd: resolve("."),
-      env: { ...process.env, ...envVars },
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } finally {
-    try {
-      if (fs.existsSync(tempFile)) fs.unlinkSync(tempFile);
-    } catch {}
-  }
+  const statements = sqlContent
+    .split(/;\s*(?:\r?\n|$)/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+  executeD1SqlBatches(statements, isRemote);
 }
 
 interface ManifestMember {
@@ -205,13 +179,12 @@ export async function linkFleet(options: {
     );
 
     const rosterVersions = runD1Query(
-      `SELECT id, version_tag, domain_count, manifest_hash FROM fleet_roster_versions WHERE organization_id = '${orgId}' ORDER BY approved_at DESC LIMIT 1;`,
+      `SELECT id, version_tag, approved_at, domain_count, manifest_hash FROM fleet_roster_versions WHERE organization_id = '${orgId}';`,
       isRemote,
     );
-    if (rosterVersions.length > 0) {
-      approvedRoster = rosterVersions[0];
-    } else {
-      throw new Error(`No approved roster version found for organization '${orgId}'.`);
+    approvedRoster = selectEffectiveRosterVersion(rosterVersions);
+    if (!approvedRoster) {
+      throw new Error(`No effective approved roster version found for organization '${orgId}'.`);
     }
 
     // Scoped strictly to the approved roster version to prevent mutating historical or foreign versions (P1-1)
@@ -388,7 +361,7 @@ function verifyRosterIntegrity(
   }
 
   console.log(`Executing ${sqlStatements.length - 1} SQL statements against D1...`);
-  executeD1Sql(sqlStatements.join("\n"), isRemote);
+  executeD1SqlBatches(sqlStatements, isRemote);
 
   // 5. Verification check strictly scoped to current roster and organization (Sol P1-01, F5)
   verifyRosterIntegrity(approvedRoster.id, orgId, approvedRoster.domain_count ?? existingMembers.length, isRemote);

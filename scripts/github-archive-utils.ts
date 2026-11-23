@@ -1,4 +1,8 @@
 import crypto from "node:crypto";
+import { execFileSync, spawnSync } from "node:child_process";
+import fs, { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { parseUtcTimestampMs } from "../src/server/features/fleet/services/fleetConstants";
 
 /**
  * Streaming byte capping transform stream (Sol P1 - F1).
@@ -67,6 +71,290 @@ export function verifyGitBlob(bytes: Buffer, expectedSha: string): void {
 export function isValidCanonicalHostname(domain: string): boolean {
   if (!domain || typeof domain !== "string" || domain.length > 253) return false;
   return /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(domain);
+}
+
+/**
+ * Validates repository slug format (Sol P1-04).
+ * Strictly requires owner/repo pattern with standard alphanumeric, dash, dot, or underscore characters.
+ */
+export function isValidRepoSlug(slug: string): boolean {
+  if (!slug || typeof slug !== "string") return false;
+  return /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(slug);
+}
+
+export interface GitTreeItem {
+  path: string;
+  mode: string;
+  type: string;
+  sha: string;
+  size?: number;
+}
+
+export interface DiscoveredGitTree {
+  defaultBranch: string;
+  commitSha: string;
+  tree: GitTreeItem[];
+}
+
+/**
+ * Discovers Git Tree via GitHub API CLI with zero shell interpolation (Sol P1-04).
+ * Enforces literal argument arrays, URL segment encoding, commit SHA validation,
+ * and fail-closed tree truncation checks.
+ */
+export function discoverGitHubTree(
+  repoName: string,
+  options?: { branch?: string; timeoutMs?: number },
+): DiscoveredGitTree {
+  if (!isValidRepoSlug(repoName)) {
+    throw new Error(`Invalid GitHub repository slug: "${repoName}". Must match owner/repo pattern.`);
+  }
+
+  const [owner, repo] = repoName.split("/");
+  const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const ghExe = process.platform === "win32" ? "gh.exe" : "gh";
+  const timeoutMs = options?.timeoutMs ?? 30_000;
+
+  // 1. Resolve default branch if not specified
+  let branch: string = options?.branch ?? "";
+  if (!branch) {
+    const repoRaw = execFileSync(ghExe, ["api", base], {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    const repoJson = JSON.parse(repoRaw);
+    branch = String(repoJson.default_branch || "main");
+  }
+
+  // 2. Fetch pinned commit SHA for branch
+  const commitRaw = execFileSync(
+    ghExe,
+    ["api", `${base}/commits/${encodeURIComponent(branch)}`],
+    {
+      encoding: "utf8",
+      timeout: timeoutMs,
+      shell: false,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  const commitJson = JSON.parse(commitRaw);
+  const commitSha = commitJson.sha;
+  if (!/^[a-f0-9]{40}$/i.test(commitSha)) {
+    throw new Error(`Invalid commit SHA returned by GitHub: ${commitSha}`);
+  }
+
+  // 3. Fetch recursive git tree for commit
+  const treeRaw = execFileSync(
+    ghExe,
+    ["api", `${base}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`],
+    {
+      encoding: "utf8",
+      timeout: Math.max(timeoutMs, 60_000),
+      shell: false,
+      maxBuffer: 50 * 1024 * 1024,
+      stdio: ["pipe", "pipe", "pipe"],
+    },
+  );
+  const treeJson = JSON.parse(treeRaw);
+  if (treeJson.truncated) {
+    throw new Error(
+      `DISCOVERY_TRUNCATED: Git tree for ${repoName} is truncated by GitHub (exceeds limit); recursive subtree enumeration required`,
+    );
+  }
+
+  return {
+    defaultBranch: branch,
+    commitSha,
+    tree: treeJson.tree || [],
+  };
+}
+
+/**
+ * Selects effective approved roster version with full parity to FleetRepository.getApprovedRoster (Sol P1-03).
+ * Filters approvals to valid UTC timestamps at or before clock, sorting newest first with id tie-breaker.
+ */
+export function selectEffectiveRosterVersion<
+  T extends {
+    id: string;
+    approved_at?: string | null;
+    approvedAt?: string | null;
+    domain_count?: number | null;
+  },
+>(versions: T[], nowMs = Date.now()): T | null {
+  if (!versions || versions.length === 0) return null;
+
+  const valid = versions.filter((v) => {
+    const raw = v.approved_at ?? v.approvedAt;
+    const t = parseUtcTimestampMs(raw);
+    return Number.isFinite(t) && t <= nowMs;
+  });
+
+  if (valid.length === 0) return null;
+
+  valid.sort((a, b) => {
+    const tA = parseUtcTimestampMs(a.approved_at ?? a.approvedAt);
+    const tB = parseUtcTimestampMs(b.approved_at ?? b.approvedAt);
+    const diff = (isNaN(tB) ? 0 : tB) - (isNaN(tA) ? 0 : tA);
+    if (diff !== 0) return diff;
+    return b.id.localeCompare(a.id);
+  });
+
+  return valid[0] ?? null;
+}
+
+/**
+ * Robust JSON extraction from mixed stdout.
+ */
+export function extractJsonFromOutput(stdout: string): any {
+  try {
+    return JSON.parse(stdout);
+  } catch {}
+
+  const jsonStart = stdout.indexOf("[");
+  const jsonEnd = stdout.lastIndexOf("]");
+  if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+    const slice = stdout.slice(jsonStart, jsonEnd + 1);
+    try {
+      return JSON.parse(slice);
+    } catch {}
+  }
+
+  const objStart = stdout.indexOf("{");
+  const objEnd = stdout.lastIndexOf("}");
+  if (objStart !== -1 && objEnd !== -1 && objEnd > objStart) {
+    const slice = stdout.slice(objStart, objEnd + 1);
+    try {
+      return JSON.parse(slice);
+    } catch {}
+  }
+
+  return null;
+}
+
+/**
+ * Loads environment variables from local config files.
+ */
+export function loadLocalEnv(repoRoot = "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id"): Record<string, string> {
+  const env: Record<string, string> = {};
+  const candidates = [resolve(repoRoot, ".env.selfhost"), resolve(repoRoot, ".env.local"), resolve(repoRoot, ".env")];
+  for (const filePath of candidates) {
+    if (fs.existsSync(filePath)) {
+      try {
+        const content = readFileSync(filePath, "utf8");
+        for (const line of content.split(/\r?\n/)) {
+          const trimmed = line.trim();
+          const eqIdx = trimmed.indexOf("=");
+          if (eqIdx > 0 && !trimmed.startsWith("#")) {
+            const key = trimmed.slice(0, eqIdx).trim();
+            const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, "");
+            if (!env[key]) env[key] = val;
+          }
+        }
+      } catch {}
+    }
+  }
+  return env;
+}
+
+/**
+ * Bounded D1 Multi-Statement Batch Execution via Direct Command (Sol P1-01).
+ * Completely eliminates Wrangler D1 import path (--file) and import database locks.
+ * Bounded by <= 25 statements and <= 50,000 bytes per batch envelope.
+ */
+export function executeD1SqlBatches(
+  statements: string[],
+  isRemote = true,
+  options?: {
+    maxStatementsPerBatch?: number;
+    maxBytesPerBatch?: number;
+    repoRoot?: string;
+  },
+): any[] {
+  if (!statements || statements.length === 0) return [];
+  const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
+  const flag = isRemote ? "--remote" : "--local";
+  const maxStatements = options?.maxStatementsPerBatch ?? 25;
+  const maxBytes = options?.maxBytesPerBatch ?? 50_000;
+  const repoRoot = options?.repoRoot ?? "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id";
+
+  const batches: string[][] = [];
+  let currentBatch: string[] = [];
+  let currentBytes = 0;
+
+  for (const rawStmt of statements) {
+    const trimmed = rawStmt.trim();
+    if (!trimmed) continue;
+    const stmt = trimmed.endsWith(";") ? trimmed : trimmed + ";";
+    const stmtBytes = Buffer.byteLength(stmt, "utf8");
+    if (stmtBytes > 100_000) {
+      throw new Error(`D1 statement exceeds maximum limit of 100,000 bytes (${stmtBytes} bytes)`);
+    }
+
+    if (
+      currentBatch.length >= maxStatements ||
+      (currentBatch.length > 0 && currentBytes + stmtBytes > maxBytes)
+    ) {
+      batches.push(currentBatch);
+      currentBatch = [];
+      currentBytes = 0;
+    }
+    currentBatch.push(stmt);
+    currentBytes += stmtBytes;
+  }
+  if (currentBatch.length > 0) {
+    batches.push(currentBatch);
+  }
+
+  const allResults: any[] = [];
+  const wranglerJs = resolve(repoRoot, "node_modules/wrangler/bin/wrangler.js");
+  const localEnv = loadLocalEnv(repoRoot);
+
+  for (let b = 0; b < batches.length; b++) {
+    const batch = batches[b];
+    const combinedSql = batch.join("\n");
+
+    const result = spawnSync(
+      process.execPath,
+      [wranglerJs, "d1", "execute", dbName, flag, "--json", "--command", combinedSql],
+      {
+        cwd: repoRoot,
+        env: { ...process.env, ...localEnv },
+        encoding: "utf8",
+        maxBuffer: 30 * 1024 * 1024,
+        shell: false,
+      },
+    );
+
+    if (result.error) {
+      throw new Error(`Failed to invoke Wrangler D1: ${result.error.message}`);
+    }
+    if (result.status !== 0) {
+      throw new Error(
+        `Wrangler D1 command failed with exit code ${result.status}: ${result.stderr || result.stdout}`,
+      );
+    }
+
+    const parsed = extractJsonFromOutput(result.stdout);
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `D1 execution did not return a valid result array for batch ${b + 1}/${batches.length}: ${result.stdout.slice(0, 500)}`,
+      );
+    }
+
+    for (const stmtResult of parsed) {
+      if (stmtResult && stmtResult.success === false) {
+        throw new Error(
+          `D1 statement failed in batch ${b + 1}: ${JSON.stringify(stmtResult.errors || stmtResult)}`,
+        );
+      }
+      if (stmtResult?.results) {
+        allResults.push(...stmtResult.results);
+      }
+    }
+  }
+
+  return allResults;
 }
 
 /**

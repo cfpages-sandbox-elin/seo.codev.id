@@ -77,6 +77,7 @@ interface RecordBatchInput {
   links: ScratchpadPageLinksRow[];
   /** Newly discovered same-origin URLs to enqueue (already policy-filtered). */
   discovered: Array<{ url: string; depth: number | null }>;
+  hasTruncatedLinks?: boolean;
 }
 
 interface BrokenLinkRow {
@@ -103,6 +104,8 @@ const CLEANUP_AFTER_MS = 7 * 24 * 60 * 60 * 1000;
 const LINK_STORAGE_BUDGET_BYTES = 500 * 1024 * 1024;
 
 export class AuditScratchpad extends DurableObject {
+  private hasTruncatedLinks = false;
+
   constructor(ctx: DurableObjectState, workerEnv: Env) {
     super(ctx, workerEnv);
     this.ctx.storage.sql.exec(SCRATCHPAD_SCHEMA_SQL);
@@ -217,6 +220,9 @@ export class AuditScratchpad extends DurableObject {
     for (const found of input.discovered) {
       this.ctx.storage.sql.exec(FRONTIER_DISCOVER_SQL, found.url, found.depth);
     }
+    if (input.hasTruncatedLinks) {
+      this.hasTruncatedLinks = true;
+    }
     return this.stats();
   }
 
@@ -265,6 +271,7 @@ export class AuditScratchpad extends DurableObject {
     // a complete link graph — if the storage budget truncated link writes,
     // "no inbound edge" is missing data, not evidence of orphanhood.
     const linkGraphComplete =
+      !this.hasTruncatedLinks &&
       this.ctx.storage.sql.databaseSize < LINK_STORAGE_BUDGET_BYTES;
     const orphanPages =
       input.crawlCompleted && linkGraphComplete

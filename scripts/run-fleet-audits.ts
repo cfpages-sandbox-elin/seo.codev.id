@@ -12,6 +12,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import crypto from "node:crypto";
 import { parseArgs } from "node:util";
+import { isValidCanonicalHostname } from "./github-archive-utils";
 
 // Sourced environment from .env.selfhost
 const ENV_FILE = resolve(
@@ -131,6 +132,11 @@ async function main() {
     allowPositionals: true,
   });
 
+  if (args.positionals.length > 0) {
+    console.error(`[ERROR] Stray positional arguments detected (${args.positionals.join(", ")}). Positional arguments not permitted.`);
+    process.exit(1);
+  }
+
   let maxPages = 500;
   if (args.values["max-pages"] !== undefined) {
     const raw = String(args.values["max-pages"]);
@@ -142,10 +148,10 @@ async function main() {
     maxPages = num;
   }
 
-  const rawConcurrency = args.values.concurrency ? String(args.values.concurrency) : "2";
+  const rawConcurrency = args.values.concurrency !== undefined ? String(args.values.concurrency) : "2";
   const numConcurrency = Number(rawConcurrency);
-  if (!/^[1-9][0-9]*$/.test(rawConcurrency) || !Number.isSafeInteger(numConcurrency) || numConcurrency < 1 || numConcurrency > 5) {
-    console.error("[ERROR] Invalid --concurrency value. Must be a safe positive integer between 1 and 5.");
+  if (!/^[1-5]$/.test(rawConcurrency) || !Number.isSafeInteger(numConcurrency)) {
+    console.error("[ERROR] Invalid --concurrency value. Must be a safe integer between 1 and 5.");
     process.exit(1);
   }
   const concurrency = numConcurrency;
@@ -159,21 +165,25 @@ async function main() {
     }
     limit = num;
   }
-  const targetDomainFilter = args.values.domain?.toLowerCase().trim();
+  const targetDomainFilter = args.values.domain !== undefined ? String(args.values.domain).toLowerCase().trim() : undefined;
+  if (targetDomainFilter !== undefined && !isValidCanonicalHostname(targetDomainFilter)) {
+    console.error(`[ERROR] Invalid fleet hostname: "${args.values.domain}". Must be a valid lowercase RFC 1123 hostname without protocol, port, or path.`);
+    process.exit(1);
+  }
+
   const isAll = !!args.values.all;
   const isRemote = args.values.local ? false : true;
   const target = isRemote
     ? { database: "open-seo-db-selfhost", dbFlag: "--remote", workflow: "site-audit-workflow-selfhost" }
     : { database: "DB", dbFlag: "--local", workflow: "site-audit-workflow" };
 
-  // Sol P2-07: Require mutually exclusive explicit execution scope
-  const scopeCount = (targetDomainFilter ? 1 : 0) + (isAll ? 1 : 0) + (limit !== undefined ? 1 : 0);
-  if (scopeCount === 0) {
-    console.error("[ERROR] Missing explicit execution scope. Please specify exactly one of --domain <canonical-host>, --all, or --limit <n>.");
-    process.exit(1);
-  }
-  if (scopeCount > 1) {
-    console.error("[ERROR] Conflicting execution scope flags: please specify exactly one of --domain, --all, or --limit.");
+  // Sol P2-04: Require mutually exclusive explicit execution scope
+  const scopeCount =
+    Number(args.values.domain !== undefined) +
+    Number(args.values.all === true) +
+    Number(args.values.limit !== undefined);
+  if (scopeCount !== 1) {
+    console.error("[ERROR] Missing or conflicting execution scope. Please specify exactly one of --domain <canonical-host>, --all, or --limit <n>.");
     process.exit(1);
   }
 
