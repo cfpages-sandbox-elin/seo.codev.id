@@ -258,9 +258,10 @@ export function loadLocalEnv(repoRoot = "C:/Users/THINKPAD/Documents/GitHub/seo.
 }
 
 /**
- * Bounded D1 Multi-Statement Batch Execution via Direct Command (Sol P1-01).
+ * Bounded D1 Multi-Statement Batch Execution via Direct Command (Sol P1-01, F3).
  * Completely eliminates Wrangler D1 import path (--file) and import database locks.
- * Bounded by <= 25 statements and <= 50,000 bytes per batch envelope.
+ * Bounded by <= 10 statements and <= 15,000 bytes per batch envelope to safely respect
+ * Windows CreateProcessW 32,767 character command-line limits with timeout supervision.
  */
 export function executeD1SqlBatches(
   statements: string[],
@@ -274,8 +275,8 @@ export function executeD1SqlBatches(
   if (!statements || statements.length === 0) return [];
   const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
   const flag = isRemote ? "--remote" : "--local";
-  const maxStatements = options?.maxStatementsPerBatch ?? 25;
-  const maxBytes = options?.maxBytesPerBatch ?? 50_000;
+  const maxStatements = options?.maxStatementsPerBatch ?? 10;
+  const maxBytes = options?.maxBytesPerBatch ?? 15_000;
   const repoRoot = options?.repoRoot ?? "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id";
 
   const batches: string[][] = [];
@@ -287,8 +288,8 @@ export function executeD1SqlBatches(
     if (!trimmed) continue;
     const stmt = trimmed.endsWith(";") ? trimmed : trimmed + ";";
     const stmtBytes = Buffer.byteLength(stmt, "utf8");
-    if (stmtBytes > 100_000) {
-      throw new Error(`D1 statement exceeds maximum limit of 100,000 bytes (${stmtBytes} bytes)`);
+    if (stmtBytes > 15_000) {
+      throw new Error(`D1 statement exceeds maximum limit of 15,000 bytes (${stmtBytes} bytes)`);
     }
 
     if (
@@ -314,15 +315,24 @@ export function executeD1SqlBatches(
     const batch = batches[b];
     const combinedSql = batch.join("\n");
 
+    const argv = [wranglerJs, "d1", "execute", dbName, flag, "--json", "--command", combinedSql];
+    const estimatedArgvLen = argv.reduce((sum, a) => sum + a.length + 3, 0);
+    if (estimatedArgvLen > 30_000) {
+      throw new Error(
+        `Serialized command line length (${estimatedArgvLen}) exceeds Windows CreateProcessW 32,767 character budget for batch ${b + 1}/${batches.length}`,
+      );
+    }
+
     const result = spawnSync(
       process.execPath,
-      [wranglerJs, "d1", "execute", dbName, flag, "--json", "--command", combinedSql],
+      argv,
       {
         cwd: repoRoot,
         env: { ...process.env, ...localEnv },
         encoding: "utf8",
         maxBuffer: 30 * 1024 * 1024,
         shell: false,
+        timeout: 60_000,
       },
     );
 
@@ -343,9 +353,9 @@ export function executeD1SqlBatches(
     }
 
     for (const stmtResult of parsed) {
-      if (stmtResult && stmtResult.success === false) {
+      if (!stmtResult || stmtResult.success === false) {
         throw new Error(
-          `D1 statement failed in batch ${b + 1}: ${JSON.stringify(stmtResult.errors || stmtResult)}`,
+          `D1 statement failed in batch ${b + 1}: ${JSON.stringify(stmtResult?.errors || stmtResult)}`,
         );
       }
       if (stmtResult?.results) {
@@ -355,6 +365,49 @@ export function executeD1SqlBatches(
   }
 
   return allResults;
+}
+
+/**
+ * Shared verified blob acquisition with cryptographic Git blob hash verification
+ * and transparent raw fallback (Sol P2 - F8).
+ */
+export async function acquireVerifiedBlob(
+  file: { path: string; sha: string },
+  repoName: string,
+  commitSha: string,
+  archiveMap?: Map<string, Buffer> | null,
+  token?: string,
+): Promise<{ buffer: Buffer; fromArchive: boolean }> {
+  if (archiveMap) {
+    const candidate = archiveMap.get(file.path);
+    if (candidate) {
+      try {
+        verifyGitBlob(candidate, file.sha);
+        return { buffer: candidate, fromArchive: true };
+      } catch {
+        // Mismatched or truncated archive entry: fall through to verified raw blob lane
+      }
+    }
+  }
+
+  const rawPath = file.path.split("/").map(encodeURIComponent).join("/");
+  const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${rawPath}`;
+  const res = await fetch(rawUrl, {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      "User-Agent": "OpenSEO-Verified-Blob-Acquisition",
+    },
+    signal: AbortSignal.timeout(60000),
+  });
+  if (!res.ok || !res.body) {
+    await res.body?.cancel().catch(() => {});
+    throw new Error(`HTTP ${res.status} acquiring blob for ${file.path}`);
+  }
+  const buf = await streamToBuffer(
+    res.body.pipeThrough(capBytes(10 * 1024 * 1024, "raw blob fallback")),
+  );
+  verifyGitBlob(buf, file.sha);
+  return { buffer: buf, fromArchive: false };
 }
 
 /**

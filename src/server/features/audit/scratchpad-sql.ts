@@ -47,6 +47,10 @@ export const SCRATCHPAD_SCHEMA_SQL = `
     redirect_url TEXT
   );
   CREATE INDEX IF NOT EXISTS page_mirror_redirect_idx ON page_mirror (redirect_url);
+  CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+  );
 `;
 
 /**

@@ -109,6 +109,18 @@ export class AuditScratchpad extends DurableObject {
   constructor(ctx: DurableObjectState, workerEnv: Env) {
     super(ctx, workerEnv);
     this.ctx.storage.sql.exec(SCRATCHPAD_SCHEMA_SQL);
+    // Sol F5: Restore link completeness from durable storage across restarts/evictions
+    try {
+      const meta = this.ctx.storage.sql
+        .exec<{ value: string }>(
+          `SELECT value FROM meta WHERE key = 'link_graph_incomplete'`,
+        )
+        .toArray();
+      if (meta.length > 0 && meta[0].value === "1") {
+        this.hasTruncatedLinks = true;
+      }
+    } catch {}
+
     // Guarantee the cleanup alarm on EVERY instantiation, not just at seed:
     // any RPC (even one racing in right after destroy()) re-creates the
     // schema, and without an alarm that storage would leak forever.
@@ -185,44 +197,52 @@ export class AuditScratchpad extends DurableObject {
     return { urls: fresh, isRetry: false };
   }
 
-  /** Persist one crawled sub-batch: completions, mirror rows, links, frontier. */
+  /** Persist one crawled sub-batch: completions, mirror rows, links, frontier. Wrapped in transactionSync (Sol F5). */
   async recordBatch(input: RecordBatchInput): Promise<FrontierStats> {
-    for (const url of input.crawledUrls) {
-      this.ctx.storage.sql.exec(
-        `UPDATE frontier SET state = 'crawled' WHERE url = ?`,
-        url,
-      );
-    }
-    for (const page of input.pages) {
-      this.ctx.storage.sql.exec(
-        `INSERT OR REPLACE INTO page_mirror (page_id, url, status_code, fetch_class, redirect_url)
-         VALUES (?, ?, ?, ?, ?)`,
-        page.pageId,
-        page.url,
-        page.statusCode,
-        page.fetchClass,
-        page.redirectUrl,
-      );
-    }
-    // Database size only ever grows (deletes happen solely via destroy), so
-    // once the budget trips it stays tripped — runFinalizeChecks uses the
-    // same comparison to know the link graph is incomplete.
-    if (this.ctx.storage.sql.databaseSize < LINK_STORAGE_BUDGET_BYTES) {
-      for (const page of input.links) {
+    this.ctx.storage.transactionSync(() => {
+      for (const url of input.crawledUrls) {
         this.ctx.storage.sql.exec(
-          `INSERT OR REPLACE INTO page_links (page_id, url, targets_json) VALUES (?, ?, ?)`,
-          page.pageId,
-          page.url,
-          JSON.stringify(page.targets),
+          `UPDATE frontier SET state = 'crawled' WHERE url = ?`,
+          url,
         );
       }
-    }
-    for (const found of input.discovered) {
-      this.ctx.storage.sql.exec(FRONTIER_DISCOVER_SQL, found.url, found.depth);
-    }
-    if (input.hasTruncatedLinks) {
-      this.hasTruncatedLinks = true;
-    }
+      for (const page of input.pages) {
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO page_mirror (page_id, url, status_code, fetch_class, redirect_url)
+           VALUES (?, ?, ?, ?, ?)`,
+          page.pageId,
+          page.url,
+          page.statusCode,
+          page.fetchClass,
+          page.redirectUrl,
+        );
+      }
+      // Database size only ever grows (deletes happen solely via destroy), so
+      // once the budget trips it stays tripped — runFinalizeChecks uses the
+      // same comparison to know the link graph is incomplete.
+      let skippedLinks = false;
+      if (this.ctx.storage.sql.databaseSize < LINK_STORAGE_BUDGET_BYTES) {
+        for (const page of input.links) {
+          this.ctx.storage.sql.exec(
+            `INSERT OR REPLACE INTO page_links (page_id, url, targets_json) VALUES (?, ?, ?)`,
+            page.pageId,
+            page.url,
+            JSON.stringify(page.targets),
+          );
+        }
+      } else {
+        skippedLinks = true;
+      }
+      if (input.hasTruncatedLinks || skippedLinks) {
+        this.hasTruncatedLinks = true;
+        this.ctx.storage.sql.exec(
+          `INSERT OR REPLACE INTO meta (key, value) VALUES ('link_graph_incomplete', '1')`,
+        );
+      }
+      for (const found of input.discovered) {
+        this.ctx.storage.sql.exec(FRONTIER_DISCOVER_SQL, found.url, found.depth);
+      }
+    });
     return this.stats();
   }
 
@@ -268,10 +288,23 @@ export class AuditScratchpad extends DurableObject {
 
     // A live 2xx page is an orphan when no OTHER crawled page links to it
     // and nothing redirects to it. Only meaningful on a completed crawl with
-    // a complete link graph — if the storage budget truncated link writes,
-    // "no inbound edge" is missing data, not evidence of orphanhood.
+    // a complete link graph — if the storage budget truncated link writes or
+    // truncation occurred, "no inbound edge" is missing data, not evidence of orphanhood.
+    let durableIncomplete = false;
+    try {
+      const meta = this.ctx.storage.sql
+        .exec<{ value: string }>(
+          `SELECT value FROM meta WHERE key = 'link_graph_incomplete'`,
+        )
+        .toArray();
+      if (meta.length > 0 && meta[0].value === "1") {
+        durableIncomplete = true;
+      }
+    } catch {}
+
     const linkGraphComplete =
       !this.hasTruncatedLinks &&
+      !durableIncomplete &&
       this.ctx.storage.sql.databaseSize < LINK_STORAGE_BUDGET_BYTES;
     const orphanPages =
       input.crawlCompleted && linkGraphComplete

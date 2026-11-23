@@ -248,6 +248,7 @@ async function main() {
   let queueIndex = 0;
   let completedCount = 0;
   let failedCount = 0;
+  let admissionPaused = false;
 
   async function pollActiveAudits() {
     for (const [auditId, info] of Array.from(activeAudits.entries())) {
@@ -262,38 +263,41 @@ async function main() {
         continue;
       }
 
-      if (Date.now() - info.startedAt > 15 * 60 * 1000) {
-        console.warn(`[TIMEOUT] Audit ${auditId} for ${info.project.domain} exceeded 15-minute polling deadline.`);
-        activeAudits.delete(auditId);
-        failedCount++;
-        continue;
-      }
-
       const audit = statusRows[0];
-      if (audit.status === "completed") {
-          console.log(
-            `[COMPLETED] ${info.project.domain} (Pages crawled: ${audit.pages_crawled})`,
-          );
-          activeAudits.delete(auditId);
-          completedCount++;
-        } else if (audit.status === "failed") {
-          console.log(
-            `[FAILED] ${info.project.domain} (Phase: ${audit.current_phase}, Error: ${audit.error_code || "UNKNOWN"})`,
-          );
-          activeAudits.delete(auditId);
-          failedCount++;
-        } else {
-          // Still running
-          console.log(
-            `[RUNNING] ${info.project.domain} - Phase: ${audit.current_phase || "crawling"}, Pages: ${audit.pages_crawled || 0}`,
-          );
+      const isTerminal = audit.status === "completed" || audit.status === "failed";
+
+      if (!isTerminal && Date.now() - info.startedAt > 15 * 60 * 1000) {
+        // Sol F6: At deadline, pause admission to avoid exceeding concurrency window while workflow still runs
+        if (!admissionPaused) {
+          admissionPaused = true;
+          console.warn(`[DEADLINE EXCEEDED] Audit ${auditId} for ${info.project.domain} still running after 15m. Admission paused to protect concurrency cap.`);
         }
       }
-    }
 
-  while (queueIndex < candidates.length || activeAudits.size > 0) {
-    // Fill concurrency window
-    while (activeAudits.size < concurrency && queueIndex < candidates.length) {
+      if (audit.status === "completed") {
+        console.log(
+          `[COMPLETED] ${info.project.domain} (Pages crawled: ${audit.pages_crawled})`,
+        );
+        activeAudits.delete(auditId);
+        completedCount++;
+      } else if (audit.status === "failed") {
+        console.log(
+          `[FAILED] ${info.project.domain} (Phase: ${audit.current_phase}, Error: ${audit.error_code || "UNKNOWN"})`,
+        );
+        activeAudits.delete(auditId);
+        failedCount++;
+      } else {
+        // Still running
+        console.log(
+          `[RUNNING] ${info.project.domain} - Phase: ${audit.current_phase || "crawling"}, Pages: ${audit.pages_crawled || 0}`,
+        );
+      }
+    }
+  }
+
+  while ((!admissionPaused && queueIndex < candidates.length) || activeAudits.size > 0) {
+    // Fill concurrency window only when admission is active
+    while (!admissionPaused && activeAudits.size < concurrency && queueIndex < candidates.length) {
       const project = candidates[queueIndex++];
       const auditId = crypto.randomUUID();
       const startUrl = `https://${project.domain}`;

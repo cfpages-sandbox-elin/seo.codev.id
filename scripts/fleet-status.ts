@@ -64,19 +64,32 @@ async function main() {
   );
   console.log("Total active projects:", projectStats[0]?.total_projects);
 
-  // 3. Audited vs Unaudiated
+  // 3. Mutually exclusive coverage stats on eligible domain population (Sol F11)
   const auditedStats = runD1Query(`
+    WITH latest_attempt AS (
+      SELECT p.id AS project_id, p.domain,
+             a.id AS latest_audit_id,
+             a.status AS latest_status
+      FROM projects p
+      LEFT JOIN audits a ON a.id = (
+        SELECT a2.id FROM audits a2
+        WHERE a2.project_id = p.id
+        ORDER BY unixepoch(a2.created_at) DESC, a2.id DESC
+        LIMIT 1
+      )
+      WHERE p.organization_id = 'shared-workspace'
+        AND p.domain IS NOT NULL
+        AND p.archived_at IS NULL
+    )
     SELECT
-      COUNT(DISTINCT p.id) as total_enrolled,
-      COUNT(DISTINCT CASE WHEN a.status = 'completed' THEN p.id END) as audited_projects,
-      COUNT(DISTINCT CASE WHEN a.status = 'running' THEN p.id END) as running_projects,
-      COUNT(DISTINCT CASE WHEN a.status = 'failed' AND a2.id IS NULL THEN p.id END) as only_failed_projects
-    FROM projects p
-    LEFT JOIN audits a ON p.id = a.project_id
-    LEFT JOIN audits a2 ON p.id = a2.project_id AND a2.status = 'completed'
-    WHERE p.organization_id = 'shared-workspace' AND p.archived_at IS NULL;
+      COUNT(*) AS total_enrolled_domains,
+      SUM(CASE WHEN latest_status = 'completed' THEN 1 ELSE 0 END) AS completed_projects,
+      SUM(CASE WHEN latest_status = 'running' THEN 1 ELSE 0 END) AS running_projects,
+      SUM(CASE WHEN latest_status = 'failed' THEN 1 ELSE 0 END) AS failed_projects,
+      SUM(CASE WHEN latest_audit_id IS NULL THEN 1 ELSE 0 END) AS never_audited_projects
+    FROM latest_attempt;
   `);
-  console.log("Audited coverage stats:", auditedStats[0]);
+  console.log("Audited coverage stats (mutually exclusive):", auditedStats[0]);
 
   // 4. Recent completed audits
   const recentCompleted = runD1Query(`

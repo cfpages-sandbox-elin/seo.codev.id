@@ -1,4 +1,4 @@
-import { and, desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { auditIssues, audits, projects } from "@/db/schema";
@@ -172,6 +172,11 @@ export const getFleetIssuesTool = {
       eq(projects.organizationId, orgId),
       isNull(projects.archivedAt),
       eq(audits.status, "completed"),
+      // Sol F9: Restrict issue triage to latest completed audit per active project
+      eq(
+        audits.id,
+        sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' ORDER BY unixepoch(a2.completed_at) DESC, a2.id DESC LIMIT 1)`,
+      ),
     ];
 
     if (args.domain) {
@@ -190,6 +195,9 @@ export const getFleetIssuesTool = {
       conditions.push(eq(auditIssues.issueType, args.issueType));
     }
 
+    // Sol F9: Order by severity priority (critical -> warning -> info), canonical domain, then issue ID
+    const severityOrder = sql`CASE ${auditIssues.severity} WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END`;
+
     // Sol P1-7: Select authoritative auditIssues.pageUrl directly rather than auditPages.url,
     // ensuring site-level issues with null pageId are fully preserved with valid URLs.
     const rows = await db
@@ -205,7 +213,7 @@ export const getFleetIssuesTool = {
       .innerJoin(audits, eq(audits.id, auditIssues.auditId))
       .innerJoin(projects, eq(projects.id, audits.projectId))
       .where(and(...conditions))
-      .orderBy(desc(auditIssues.id))
+      .orderBy(severityOrder, projects.domain, desc(auditIssues.id))
       .limit(limit);
 
     const severityBreakdown = { critical: 0, warning: 0, info: 0 };

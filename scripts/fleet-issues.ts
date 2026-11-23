@@ -193,9 +193,9 @@ export async function getAggregatedFleetIssues(options: {
     WHERE ${whereClauses.join(" AND ")}
     ORDER BY 
       CASE i.severity 
-        WHEN 'critical' THEN 1 
-        WHEN 'warning' THEN 2 
-        ELSE 3 
+        WHEN 'critical' THEN 0 
+        WHEN 'warning' THEN 1 
+        ELSE 2 
       END,
       p.domain ASC,
       i.id DESC
@@ -250,6 +250,13 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
     words.splice(csvIndex, hasFilename ? 2 : 1);
   }
 
+  const hasRemoteArg = words.includes("--remote");
+  const hasLocalArg = words.includes("--local");
+  if (hasRemoteArg && hasLocalArg) {
+    console.error("[ERROR] Conflicting flags: cannot specify both --remote and --local.");
+    process.exit(1);
+  }
+
   const { values } = parseArgs({
     args: words,
     options: {
@@ -264,7 +271,7 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
     strict: true,
   });
 
-  const isRemote = !values.local;
+  const isRemote = !hasLocalArg;
 
   if (values.domain !== undefined) {
     const trimmedDomain = String(values.domain).toLowerCase().trim();

@@ -25,5 +25,9 @@ describe("buildSamSkillSource", () => {
 
     const loaded = await source.load("seo-project-setup");
     expect(loaded?.body).toContain("Surface note: you are SAM");
+
+    // F7: Operator skill openseo-ops is internal repo-dev tooling and MUST stay out of public SAM catalog
+    const openseoOps = await source.load("openseo-ops");
+    expect(openseoOps).toBeNull();
   });
 });

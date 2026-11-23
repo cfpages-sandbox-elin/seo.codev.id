@@ -21,6 +21,7 @@ import {
   parseTarHtmlFiles,
   decompressGzipStream,
   discoverGitHubTree,
+  acquireVerifiedBlob,
 } from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
@@ -166,13 +167,16 @@ export async function runBenchmark(repoName: string) {
   const t1_lane2 = performance.now();
   const memEnd2 = process.memoryUsage().rss;
 
-  // Cryptographically verify every file in Lane 2 against its expected Git blob ID (Sol P1 - F2)
+  // Cryptographically verify every file in Lane 2 using shared acquireVerifiedBlob with raw fallback (Sol P2 - F8)
   for (const file of htmlBlobs) {
-    const buf = lane2Results.get(file.path);
-    if (!buf) {
-      throw new Error(`Lane 2 archive missing candidate file: ${file.path}`);
-    }
-    verifyGitBlob(buf, file.sha);
+    const { buffer: buf } = await acquireVerifiedBlob(
+      file,
+      repoName,
+      commitSha,
+      lane2Results,
+      GITHUB_TOKEN,
+    );
+    lane2Results.set(file.path, buf);
   }
 
   const decompressDurationMs = Math.round(tDecompress_lane2 - t0_lane2);

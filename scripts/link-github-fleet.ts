@@ -363,7 +363,19 @@ function verifyRosterIntegrity(
   console.log(`Executing ${sqlStatements.length - 1} SQL statements against D1...`);
   executeD1SqlBatches(sqlStatements, isRemote);
 
-  // 5. Verification check strictly scoped to current roster and organization (Sol P1-01, F5)
+  // 5. Re-check effective roster version post-apply to detect supersession (Sol F10)
+  const postApprovedVersions = runD1Query(
+    `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = '${orgId}';`,
+    isRemote
+  );
+  const postEffective = selectEffectiveRosterVersion(postApprovedVersions);
+  if (!postEffective || postEffective.id !== approvedRoster.id) {
+    throw new Error(
+      `Roster superseded during linking: effective roster changed from ${approvedRoster.id} to ${postEffective?.id ?? "none"}.`,
+    );
+  }
+
+  // 6. Verification check strictly scoped to current roster and organization (Sol P1-01, F5, F10)
   verifyRosterIntegrity(approvedRoster.id, orgId, approvedRoster.domain_count ?? existingMembers.length, isRemote);
 }
 

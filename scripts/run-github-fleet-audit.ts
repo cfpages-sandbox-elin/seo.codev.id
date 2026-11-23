@@ -25,8 +25,10 @@ import {
   discoverGitHubTree,
   selectEffectiveRosterVersion,
   executeD1SqlBatches,
+  acquireVerifiedBlob,
   type GitTreeItem,
 } from "./github-archive-utils";
+import { isSameOrigin } from "../src/server/lib/audit/url-utils";
 import { analyzeHtml } from "../src/server/lib/audit/page-analyzer";
 import { runPageReporters, type DetectedIssue } from "../src/server/lib/audit/issues/page-reporters";
 import type { CrawledPageResult } from "../src/server/lib/audit/types";
@@ -179,11 +181,27 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     return false;
   }
 
-  // 2. Build comprehensive route set from ALL tree items (pages + static assets)
-  // Physical routes take precedence over inferred aliases; segment-encode all path segments (Sol P2-01)
-  const physicalRouteSet = new Set<string>();
-  const validRouteSet = new Set<string>();
-  const htmlFiles: GitTreeItem[] = [];
+  // 2. Build comprehensive unified route index with collision detection & served identity admission (Sol F1)
+  type RouteOwner =
+    | { kind: "page"; path: string; pageUrl: string }
+    | { kind: "asset"; path: string }
+    | { kind: "ambiguous"; paths: string[] };
+
+  const physicalRoutes = new Map<string, RouteOwner>();
+  const inferredAliases = new Map<string, RouteOwner>();
+
+  // Helper to map repo path to public page URL using canonical served identities (Sol Snippet 3)
+  const pathToUrl = (path: string): string => {
+    const segments = path.split("/").map(encodeURIComponent);
+    const isDirectoryIndex = /^(?:index\.html|index\.htm)$/i.test(segments.at(-1) ?? "");
+    if (isDirectoryIndex) segments.pop();
+    const pathname = "/" + segments.join("/") + (isDirectoryIndex && segments.length ? "/" : "");
+    return `https://${domain}${pathname}`;
+  };
+
+  // Group candidate HTML files by served page URL to detect index collisions (.html vs .htm)
+  const htmlBlobsByServedUrl = new Map<string, GitTreeItem[]>();
+  const ambiguousServedUrls = new Set<string>();
 
   for (const item of treeItems) {
     if (item.type !== "blob" || (item.mode !== "100644" && item.mode !== "100755")) continue;
@@ -191,20 +209,49 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     const isHtml = p.endsWith(".html") || p.endsWith(".htm");
 
     if (isHtml) {
-      htmlFiles.push(item);
+      const served = pathToUrl(p);
+      const list = htmlBlobsByServedUrl.get(served) ?? [];
+      list.push(item);
+      htmlBlobsByServedUrl.set(served, list);
+    } else {
+      // Register static asset physical route
+      const encodedPath = p.split("/").map(encodeURIComponent).join("/");
+      const physicalRoute = normalizeRoute(`${domain}/${encodedPath}`);
+      physicalRoutes.set(physicalRoute, { kind: "asset", path: p });
     }
-
-    // Segment-encode path to ensure static assets with special characters resolve consistently (Sol P2-01)
-    const encodedPath = p.split("/").map(encodeURIComponent).join("/");
-    const physicalRoute = normalizeRoute(`${domain}/${encodedPath}`);
-    physicalRouteSet.add(physicalRoute);
-    validRouteSet.add(physicalRoute);
   }
 
-  // Register clean HTML routes with physical priority and collision detection (Sol P2-01)
-  for (const item of htmlFiles) {
-    const p = item.path;
+  // Admit unique served identities: if both index.html and index.htm exist, prefer .html and flag ambiguous
+  const htmlFiles: GitTreeItem[] = [];
+  for (const [servedUrl, items] of htmlBlobsByServedUrl.entries()) {
+    if (items.length === 1) {
+      htmlFiles.push(items[0]);
+    } else {
+      ambiguousServedUrls.add(servedUrl);
+      const htmlExt = items.find((it) => it.path.endsWith(".html"));
+      const chosen = htmlExt ?? items[0];
+      htmlFiles.push(chosen);
+    }
+  }
+
+  // Sort HTML candidate files by path for deterministic audit order
+  htmlFiles.sort((a, b) => a.path.localeCompare(b.path));
+
+  // Register physical and clean alias routes for admitted HTML files
+  for (const file of htmlFiles) {
+    const p = file.path;
     const encodedPath = p.split("/").map(encodeURIComponent).join("/");
+    const pageUrl = pathToUrl(p);
+    const physicalKey = normalizeRoute(`${domain}/${encodedPath}`);
+
+    if (ambiguousServedUrls.has(pageUrl)) {
+      const allPaths = (htmlBlobsByServedUrl.get(pageUrl) ?? [file]).map((it) => it.path);
+      physicalRoutes.set(physicalKey, { kind: "ambiguous", paths: allPaths });
+    } else {
+      physicalRoutes.set(physicalKey, { kind: "page", path: p, pageUrl });
+    }
+
+    // Inferred aliases: extensionless & directory roots
     let cleanSlug: string | null = null;
     if (p === "index.html" || p === "index.htm") {
       cleanSlug = "";
@@ -220,14 +267,17 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
 
     if (cleanSlug !== null) {
       const cleanRoute = cleanSlug === "" ? normalizeRoute(domain) : normalizeRoute(`${domain}/${cleanSlug}`);
-      // Physical routes take absolute precedence over inferred aliases
-      if (!physicalRouteSet.has(cleanRoute)) {
-        validRouteSet.add(cleanRoute);
+      if (!physicalRoutes.has(cleanRoute)) {
+        inferredAliases.set(cleanRoute, { kind: "page", path: p, pageUrl });
+      }
+      const cleanSlashRoute = cleanSlug === "" ? normalizeRoute(`${domain}/`) : normalizeRoute(`${domain}/${cleanSlug}/`);
+      if (!physicalRoutes.has(cleanSlashRoute)) {
+        inferredAliases.set(cleanSlashRoute, { kind: "page", path: p, pageUrl });
       }
     }
   }
 
-  console.log(`Discovered ${htmlFiles.length} static HTML pages and ${treeItems.length} total repository assets in ${repoName}`);
+  console.log(`Discovered ${htmlFiles.length} unique static HTML pages (${ambiguousServedUrls.size} ambiguous index collisions resolved) and ${treeItems.length} total repository assets in ${repoName}`);
   if (htmlFiles.length === 0) {
     console.warn(`No HTML pages found in repository ${repoName}. Skipping.`);
     return false;
@@ -235,50 +285,14 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
 
   const candidateFiles = htmlFiles.slice(0, maxPages);
 
-  // Helper to map repo path to public page URL using canonical served identities (Sol Snippet 3)
-  const pathToUrl = (path: string): string => {
-    const segments = path.split("/").map(encodeURIComponent);
-    const isDirectoryIndex = /^(?:index\.html|index\.htm)$/i.test(segments.at(-1) ?? "");
-    if (isDirectoryIndex) segments.pop();
-    const pathname = "/" + segments.join("/") + (isDirectoryIndex && segments.length ? "/" : "");
-    return `https://${domain}${pathname}`;
-  };
-
-  // Build bidirectional alias-to-canonical route map to eliminate false orphan reports (Sol P2-01)
+  // Build alias-to-canonical URL map for fast lookup
   const aliasToCanonicalUrl = new Map<string, string>();
-  // 1. Register physical file routes first
   for (const file of htmlFiles) {
+    const pageUrl = pathToUrl(file.path);
     const encoded = file.path.split("/").map(encodeURIComponent).join("/");
-    const canonical = pathToUrl(file.path);
-    const normCanonical = normalizeRoute(canonical);
-    aliasToCanonicalUrl.set(normCanonical, canonical);
-    aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${encoded}`), canonical);
-    aliasToCanonicalUrl.set(normalizeRoute(`/${encoded}`), canonical);
-  }
-  // 2. Register inferred aliases without overriding existing physical route targets
-  for (const file of htmlFiles) {
-    const encoded = file.path.split("/").map(encodeURIComponent).join("/");
-    const canonical = pathToUrl(file.path);
-    if (file.path === "index.html" || file.path === "index.htm") {
-      const normApex = normalizeRoute(domain);
-      const normRoot = normalizeRoute("/");
-      if (!aliasToCanonicalUrl.has(normApex)) aliasToCanonicalUrl.set(normApex, canonical);
-      if (!aliasToCanonicalUrl.has(normRoot)) aliasToCanonicalUrl.set(normRoot, canonical);
-    } else if (/(?:^|\/)index\.html?$/i.test(encoded)) {
-      const dirSlug = encoded.replace(/(?:^|\/)index\.html?$/i, "");
-      const r1 = normalizeRoute(`https://${domain}/${dirSlug}`);
-      const r2 = normalizeRoute(`/${dirSlug}`);
-      const r3 = normalizeRoute(`/${dirSlug}/`);
-      if (!aliasToCanonicalUrl.has(r1)) aliasToCanonicalUrl.set(r1, canonical);
-      if (!aliasToCanonicalUrl.has(r2)) aliasToCanonicalUrl.set(r2, canonical);
-      if (!aliasToCanonicalUrl.has(r3)) aliasToCanonicalUrl.set(r3, canonical);
-    } else {
-      const extensionless = encoded.replace(/\.html?$/i, "");
-      const r1 = normalizeRoute(`https://${domain}/${extensionless}`);
-      const r2 = normalizeRoute(`/${extensionless}`);
-      if (!aliasToCanonicalUrl.has(r1)) aliasToCanonicalUrl.set(r1, canonical);
-      if (!aliasToCanonicalUrl.has(r2)) aliasToCanonicalUrl.set(r2, canonical);
-    }
+    aliasToCanonicalUrl.set(normalizeRoute(pageUrl), pageUrl);
+    aliasToCanonicalUrl.set(normalizeRoute(`${domain}/${encoded}`), pageUrl);
+    aliasToCanonicalUrl.set(normalizeRoute(`/${encoded}`), pageUrl);
   }
 
   // 3. Fetch and analyze HTML files with paced concurrency
@@ -332,38 +346,14 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       slice.map(async (file) => {
         const pageUrl = pathToUrl(file.path);
         try {
-          let bytes: Buffer | null = null;
-          if (archiveHtmlMap && archiveHtmlMap.has(file.path)) {
-            bytes = archiveHtmlMap.get(file.path)!;
-          } else {
-            const encodedPath = file.path.split("/").map(encodeURIComponent).join("/");
-            const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${encodedPath}`;
-            const res = await fetch(rawUrl, {
-              headers: {
-                ...(GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {}),
-                "User-Agent": "OpenSEO-GitHub-Audit-Engine",
-              },
-              signal: AbortSignal.timeout(60000),
-            });
-
-            if (!res.ok) {
-              console.warn(`Failed to fetch ${file.path}: HTTP ${res.status}`);
-              await res.body?.cancel().catch(() => {});
-              return;
-            }
-            if (!res.body) {
-              console.warn(`Empty response body for ${file.path}`);
-              return;
-            }
-            bytes = await streamToBuffer(
-              res.body.pipeThrough(capBytes(10 * 1024 * 1024, "raw blob")),
-            );
-          }
-
-          if (!bytes) return;
-
-          // Cryptographic Git Blob Identity Verification (Sol P1 - F1/F2)
-          verifyGitBlob(bytes, file.sha);
+          // Sol F8: Acquire blob using shared verified acquisition with raw fallback
+          const { buffer: bytes } = await acquireVerifiedBlob(
+            file,
+            repoName,
+            commitSha,
+            archiveHtmlMap,
+            GITHUB_TOKEN,
+          );
 
           const html = bytes.toString("utf8");
           const analysis = analyzeHtml(html, pageUrl, 200, 50);
@@ -422,31 +412,31 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
           );
           detectedIssues.push(...issues);
 
-          // Check internal links against known repository routes using URL resolution (Sol Snippet 3 & P1-03)
+          // Check internal links using unified route owner index and apex/www equivalence (Sol F1)
           for (const link of analysis.links) {
             if (link.isInternal && link.targetUrl) {
               try {
                 const servedUrl = new URL(pageUrl);
                 const target = new URL(link.targetUrl, servedUrl);
-                if (target.origin === servedUrl.origin) {
+                // Recognize same origin including www <-> apex pairs (Sol F1)
+                if (isSameOrigin(target.href, servedUrl.href)) {
                   const normTarget = normalizeRoute(`https://${domain}${target.pathname}`);
-                  const normPageUrl = normalizeRoute(pageUrl);
-                  const destCanonical = aliasToCanonicalUrl.get(normTarget) || normTarget;
-                  const sourceCanonical = aliasToCanonicalUrl.get(normPageUrl) || normPageUrl;
-
-                  if (destCanonical && destCanonical !== sourceCanonical) {
-                    if (validRouteSet.has(normTarget) || aliasToCanonicalUrl.has(normTarget)) {
-                      inboundLinkCounts.set(destCanonical, (inboundLinkCounts.get(destCanonical) || 0) + 1);
-                    } else if (!isTreeTruncated && candidateFiles.length === htmlFiles.length) {
-                      // Internal dead link confirmed only when tree is complete
-                      detectedIssues.push({
-                        issueType: "broken-internal-link",
-                        pageId,
-                        pageUrl,
-                        dedupeKey: link.targetUrl,
-                        details: { targetUrl: link.targetUrl },
-                      });
+                  const owner = physicalRoutes.get(normTarget) ?? inferredAliases.get(normTarget);
+                  if (owner?.kind === "page") {
+                    if (owner.pageUrl !== pageUrl) {
+                      inboundLinkCounts.set(owner.pageUrl, (inboundLinkCounts.get(owner.pageUrl) || 0) + 1);
                     }
+                  } else if (owner?.kind === "asset" || owner?.kind === "ambiguous") {
+                    // Valid link to asset or ambiguous route
+                  } else if (!owner && !isTreeTruncated && candidateFiles.length === htmlFiles.length) {
+                    // Internal dead link confirmed only when tree is complete
+                    detectedIssues.push({
+                      issueType: "broken-internal-link",
+                      pageId,
+                      pageUrl,
+                      dedupeKey: link.targetUrl,
+                      details: { targetUrl: link.targetUrl },
+                    });
                   }
                 }
               } catch {}
@@ -475,6 +465,10 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     } else {
       for (const page of crawledPages) {
         if (normalizeRoute(page.url) === homeNorm) continue;
+        if (ambiguousServedUrls.has(page.url)) {
+          // Sol F1: Conflicting index paths (.html vs .htm) admit no orphan conclusion
+          continue;
+        }
         const inlinks =
           inboundLinkCounts.get(page.url) ||
           inboundLinkCounts.get(normalizeRoute(page.url)) ||
@@ -758,12 +752,24 @@ function repairDiagnosticObservation(
     ];
     executeD1SqlStatements(diagnosticSql, isRemote);
 
+    // Strict full exact triple verification (Sol F4)
     const verify = runD1Query(
       `SELECT r.id as run_id, i.id as item_id, s.id as snap_id
        FROM fleet_runs r
        JOIN fleet_run_items i ON i.run_id = r.id
        JOIN fleet_snapshots s ON s.run_item_id = i.id
-       WHERE r.id = '${runId}' AND i.id = '${runItemId}' AND s.id = '${snapshotId}' AND i.audit_id = '${auditId}';`,
+       WHERE r.id = '${runId}'
+         AND i.id = '${runItemId}'
+         AND s.id = '${snapshotId}'
+         AND i.audit_id = '${auditId}'
+         AND i.member_id = '${member_id}'
+         AND i.project_id = '${projectId}'
+         AND s.member_id = '${member_id}'
+         AND s.project_id = '${projectId}'
+         AND i.primary_series_key = 'diagnostic'
+         AND s.series_key = 'diagnostic'
+         AND r.status = 'completed'
+         AND i.status = 'completed';`,
       isRemote,
     );
     if (verify.length === 1) {
@@ -775,6 +781,10 @@ function repairDiagnosticObservation(
   }
   return false;
 }
+
+type FleetAction =
+  | { kind: "repair"; domain: string; projectId: string; auditId: string }
+  | { kind: "audit"; mapping: RepoMapping };
 
 async function main() {
   const args = parseArgs({
@@ -796,9 +806,28 @@ async function main() {
     process.exit(1);
   }
 
+  // Sol F2: Mutual exclusivity of --local and --remote
+  const hasRemoteArg = process.argv.includes("--remote");
+  const hasLocalArg = process.argv.includes("--local");
+  if (hasRemoteArg && hasLocalArg) {
+    console.error("[ERROR] Conflicting flags: cannot specify both --remote and --local.");
+    process.exit(1);
+  }
+  const isRemote = !hasLocalArg;
+
   console.log("=== OpenSEO Zero-Limit GitHub Repository Audit Runner ===");
-  const targetDomain = args.values.domain?.toLowerCase().trim();
-  const isRemote = !args.values.local;
+
+  // Sol F2: Strict tagged selector validation upfront
+  let targetDomain: string | undefined;
+  if (args.values.domain !== undefined) {
+    const raw = String(args.values.domain).trim().toLowerCase();
+    if (!raw || !isValidCanonicalHostname(raw)) {
+      console.error(`[ERROR] --domain requires a canonical RFC 1123 hostname. Received: "${args.values.domain}"`);
+      process.exit(1);
+    }
+    targetDomain = raw;
+  }
+
   let limit: number | undefined;
   if (args.values.limit !== undefined) {
     const rawLimit = String(args.values.limit);
@@ -809,7 +838,6 @@ async function main() {
     limit = parseInt(rawLimit, 10);
   }
   const force = !!args.values.force;
-  const isAll = !!args.values.all;
 
   // Sol P2-04: Strict numeric and scope validation
   const rawMaxPages = args.values["max-pages"] ? String(args.values["max-pages"]) : "10000";
@@ -821,16 +849,11 @@ async function main() {
   const maxPages = numMaxPages;
 
   const scopeCount =
-    Number(args.values.domain !== undefined) +
+    Number(targetDomain !== undefined) +
     Number(args.values.all === true) +
     Number(args.values.limit !== undefined);
   if (scopeCount !== 1) {
     console.error("[ERROR] Missing or conflicting execution scope. Specify exactly one of --domain <canonical-host>, --all, or --limit <n>.");
-    process.exit(1);
-  }
-
-  if (targetDomain && !isValidCanonicalHostname(targetDomain)) {
-    console.error(`[ERROR] Invalid fleet hostname: "${targetDomain}". Must be a valid lowercase RFC 1123 hostname without protocol, port, or path.`);
     process.exit(1);
   }
 
@@ -844,26 +867,49 @@ async function main() {
     projectIdByDomain.set(p.domain.toLowerCase().trim(), p.id);
   }
 
-  // Load completed audits with diagnostic observation check (Sol P1-02)
+  // Load deterministic latest completed source audits with verified diagnostic triple (Sol F4)
   const completedAudits = runD1Query(
-    `SELECT a.id, a.project_id,
-            (SELECT COUNT(*) FROM fleet_run_items fri WHERE fri.audit_id = a.id AND fri.primary_series_key = 'diagnostic') AS has_diagnostic
-     FROM audits a
-     WHERE a.status = 'completed' AND a.workflow_instance_id LIKE 'github-audit-%' AND a.pages_crawled >= a.pages_total;`,
+    `WITH ranked_audits AS (
+       SELECT a.id, a.project_id, a.completed_at,
+              ROW_NUMBER() OVER (
+                PARTITION BY a.project_id
+                ORDER BY unixepoch(a.completed_at) DESC, a.id DESC
+              ) AS audit_rank
+       FROM audits a
+       WHERE a.status = 'completed'
+         AND a.workflow_instance_id LIKE 'github-audit-%'
+         AND a.pages_crawled >= a.pages_total
+     )
+     SELECT ra.id, ra.project_id,
+            (
+              SELECT COUNT(*)
+              FROM fleet_runs r
+              JOIN fleet_run_items fri ON fri.run_id = r.id
+              JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
+              WHERE fri.audit_id = ra.id
+                AND fri.primary_series_key = 'diagnostic'
+                AND fs.series_key = 'diagnostic'
+                AND r.status = 'completed'
+                AND fri.status = 'completed'
+            ) AS has_verified_triple
+     FROM ranked_audits ra
+     WHERE ra.audit_rank = 1;`,
     isRemote
   );
   const auditByProjectId = new Map<string, { id: string; hasDiagnostic: boolean }>();
   for (const a of completedAudits) {
     auditByProjectId.set(a.project_id, {
       id: a.id,
-      hasDiagnostic: Number(a.has_diagnostic ?? 0) > 0,
+      hasDiagnostic: Number(a.has_verified_triple ?? 0) > 0,
     });
   }
 
   const repoMappings = loadRepoMappings();
   console.log(`Loaded ${repoMappings.size} repository mappings from manifest & PROJECTS_GITHUB.md.`);
 
-  let candidates: RepoMapping[] = [];
+  // Build deterministic planned actions list (Sol F2: prevents repair bleed across limits)
+  const plannedActions: FleetAction[] = [];
+
   if (targetDomain) {
     const projId = projectIdByDomain.get(targetDomain);
     const repoMeta = repoMappings.get(targetDomain);
@@ -874,18 +920,14 @@ async function main() {
     const existingAudit = auditByProjectId.get(projId);
     if (!force && existingAudit) {
       if (!existingAudit.hasDiagnostic) {
-        console.log(`[REPAIR] Existing audit ${existingAudit.id} for '${targetDomain}' is missing diagnostic observation. Repairing...`);
-        const repaired = repairDiagnosticObservation(existingAudit.id, projId, targetDomain, isRemote);
-        if (repaired) {
-          console.log(`[REUSED] Project for domain '${targetDomain}' has verified completed audit ${existingAudit.id}. Use --force to re-audit.`);
-          return;
-        }
+        plannedActions.push({ kind: "repair", domain: targetDomain, projectId: projId, auditId: existingAudit.id });
       } else {
-        console.log(`[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit. Use --force to re-audit.`);
+        console.log(`[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit with verified diagnostic observation. Use --force to re-audit.`);
         return;
       }
+    } else {
+      plannedActions.push({ kind: "audit", mapping: { ...repoMeta, projectId: projId } });
     }
-    candidates = [{ ...repoMeta, projectId: projId }];
   } else {
     for (const [dom, m] of repoMappings.entries()) {
       const projId = projectIdByDomain.get(dom);
@@ -893,38 +935,46 @@ async function main() {
         const existingAudit = auditByProjectId.get(projId);
         if (!force && existingAudit) {
           if (!existingAudit.hasDiagnostic) {
-            console.log(`[REPAIR] Existing audit ${existingAudit.id} for '${dom}' is missing diagnostic observation. Repairing...`);
-            const repaired = repairDiagnosticObservation(existingAudit.id, projId, dom, isRemote);
-            if (repaired) {
-              continue;
-            }
+            plannedActions.push({ kind: "repair", domain: dom, projectId: projId, auditId: existingAudit.id });
           } else {
             continue; // Already audited with verified diagnostic triple
           }
+        } else {
+          plannedActions.push({ kind: "audit", mapping: { ...m, projectId: projId } });
         }
-        candidates.push({ ...m, projectId: projId });
       }
-    }
-    if (limit) {
-      candidates = candidates.slice(0, limit);
     }
   }
 
-  console.log(`Eligible unaudited candidate sites ready for GitHub Direct Audit: ${candidates.length}`);
+  // Sol F2: Apply limit to the combined list of repairs and fresh audits before write selection
+  const selectedActions = limit !== undefined ? plannedActions.slice(0, limit) : plannedActions;
+  console.log(`Executing ${selectedActions.length} planned fleet actions (Total planned: ${plannedActions.length}, Limit: ${limit ?? "none"})...`);
 
   let successCount = 0;
   let failCount = 0;
 
-  for (let i = 0; i < candidates.length; i++) {
-    const c = candidates[i];
-    console.log(`\n[${i + 1}/${candidates.length}] Starting audit for ${c.domain} (${c.repoName})...`);
-    try {
-      const ok = await auditRepository(c, maxPages, !!args.values.archive, isRemote);
-      if (ok) successCount++;
-      else failCount++;
-    } catch (err: any) {
-      console.error(`Audit failed for ${c.domain}:`, err?.message || err);
-      failCount++;
+  for (let i = 0; i < selectedActions.length; i++) {
+    const action = selectedActions[i];
+    if (action.kind === "repair") {
+      console.log(`\n[${i + 1}/${selectedActions.length}] [REPAIR] Repairing diagnostic observation for ${action.domain} (${action.auditId})...`);
+      const ok = repairDiagnosticObservation(action.auditId, action.projectId, action.domain, isRemote);
+      if (ok) {
+        successCount++;
+      } else {
+        console.error(`[REPAIR FAILED] Failed to repair diagnostic observation for ${action.domain} (${action.auditId}). Aborting without fallback Git crawl (Sol F4).`);
+        failCount++;
+      }
+    } else {
+      const c = action.mapping;
+      console.log(`\n[${i + 1}/${selectedActions.length}] [AUDIT] Starting audit for ${c.domain} (${c.repoName})...`);
+      try {
+        const ok = await auditRepository(c, maxPages, !!args.values.archive, isRemote);
+        if (ok) successCount++;
+        else failCount++;
+      } catch (err: any) {
+        console.error(`Audit failed for ${c.domain}:`, err?.message || err);
+        failCount++;
+      }
     }
   }
 

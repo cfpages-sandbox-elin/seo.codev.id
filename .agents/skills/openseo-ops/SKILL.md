@@ -3,7 +3,8 @@ name: openseo-ops
 description: "Sovereign operational skills for OpenSEO (seo.codev.id) on Cloudflare Workers edge. Governs fleet observability (/onsite), approved roster synchronization (import-fleet-roster, link-github-fleet), full-depth dual-lane site audits (commit-pinned GitHub Direct Audit Engine & edge SiteAuditWorkflow), D1 migrations, Alchemy v2 deployments, DataForSEO BYOK cost tracking, and programmatic Model Context Protocol (MCP) execution across all 78 registered tools."
 metadata:
   author: Syamsul Alam & Gemini 4 Hydrogen
-  version: "1.7.0"
+  version: "1.7.1"
+  internal: true
 ---
 
 # OpenSEO Operational Skills (`openseo-ops`)
@@ -74,13 +75,13 @@ unmapped → exempt → unavailable → terminal partial (fresh_partial or stale
 ```
 1. `Unmapped`: Domain exists in `fleet_roster_members`, but `project_id` is NULL.
 2. `Exempt`: Intentionally excluded from automated fleet crawls (e.g. Tier 4 parked domains).
-3. `Unavailable`: Latest attempt failed, crashed, or errored without an admitted snapshot (`status: "unavailable"`). Displays score `—` (distinguished from measured 0%).
+3. `Unavailable`: Latest attempt failed, crashed, errored, or finalized without an admitted observation snapshot (`status: "unavailable"`). Displays score `—` (distinguished from measured 0%).
 4. `Terminal Partial`: Audit completed with partial evidence coverage between $80\%$ and $<100\%$, displayed as provisional interval $[L, U]$.
 5. `Never Audited`: Linked to an active project in `projects`, but no completed audit attempt exists.
 6. `Stale`: Previous audit completed, but results exceed the 10-day TTL freshness window.
 7. `Graded`: Audit completed with 100% evidence coverage within the 10-day TTL window (or provisional when partial coverage reconciles).
 
-**Interval Display Contract**: Provisional interval $[L, U]$ is displayed if and only if reconciled evidence coverage satisfies $80\% \le C < 100\%$. Full point scores require $C = 100\%$.
+**Interval Display Contract**: Provisional interval $[L, U]$ is a rendering presentation rule displayed if and only if reconciled evidence coverage satisfies $80\% \le C < 100\%$. Full point scores require $C = 100\%$. Freshness evaluation (10-day TTL window) and unavailable precedence operate independently of interval display eligibility.
 
 **Critical Incident Cap**: Requires qualified confirmation (`parseIncidentConfirmation` in `fleetEvidence.ts`) with essential failure codes (DNS failure, TLS failure, origin connection drops), verified expected intent, independent corroboration probe, and finite confirmation timestamps. Validated incidents cap the maximum score at **59 (F)** with a critical incident badge.
 
@@ -111,26 +112,31 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **Commit Pinning**: Resolves target branch to an immutable commit SHA (`gh api /repos/:owner/:repo/commits/:branch`). All Git tree queries and blob reads are bound to this commit.
 - **Git Tree Discovery**: Retrieves up to 100,000 files in a single atomic call (`GET /repos/:owner/:repo/git/trees/:commitSha?recursive=1`). Fails fast if `truncated: true`.
 - **Zero Edge Heap Pressure**: HTML parsing, heading extraction, meta tag inspection, and OpenGraph analysis execute host-side in Node.js, completely bypassing Cloudflare Workers Free Tier 128 MB isolate memory ceiling.
-- **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set to detect broken links and orphan pages with zero network calls.
+- **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set using unified route indexing and apex/www equivalence to detect broken links and orphan pages with zero network calls.
 - **Staged D1 Persistence**:
   1. Inserts parent audit in `running` phase with `github-audit-${auditId}` instance ID.
-  2. Ingests pages and issues in bounded 500-statement chunks (including `og_title`, `og_description`, `og_image`).
+  2. Ingests pages and issues in bounded $\le 10$-statement chunks ($\le 15,000$ bytes total per batch envelope, strictly respecting Windows CreateProcessW 32,767 character limits).
   3. Reconciles child row counts in atomic compare-and-set UPDATE with `RETURNING id` (`WHERE id = :id AND status = 'running' AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = :id) = :pages AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = :id) = :issues`).
-  4. On count mismatch or state conflict, throws immediately.
-- **Diagnostic Fleet Series Integration**: Writes `fleet_runs` (`requester_id = 'github-audit-runner'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`), and `fleet_snapshots` (`series_key = 'diagnostic'`, unmeasured pillars `NULL`).
+  4. On count mismatch or state conflict, throws immediately. Incomplete source acquisition ends with audit status `failed` and an isolated diagnostic item which can be `partial` (they are distinct).
+- **Diagnostic Fleet Series Integration**: Writes `fleet_runs` (`requester_id = 'github-audit-runner'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`), and `fleet_snapshots` (`series_key = 'diagnostic'`, unmeasured pillars `NULL`). Reused audits verify the full exact triple (`fleet_runs`, `fleet_run_items`, `fleet_snapshots`) with deterministic latest ordering and original-ID binding; repair failures abort without falling back to a redundant Git crawl.
 - **Evidence Boundary**: Records source-only evidence. Unmeasured runtime properties (`status_code`, `response_time_ms`, `crawl_depth`) remain `NULL` and `in_sitemap` is `0`. Runtime-only issue reporters (`deep-page`, `slow-response`) are excluded.
 
 ### Lane 2: Edge HTTP Workflow Crawler (`SiteAuditWorkflow`) — Live Runtime & Fleet Grading Lane
-- **Purpose**: Full live HTTP validation, external third-party crawls, robots.txt enforcement, real edge TTFB latency measurement, and official weekly fleet snapshot grading.
+- **Purpose**: Full live HTTP validation, external third-party crawls, robots.txt enforcement, and real edge TTFB latency measurement. (Note: neither `run-fleet-audits.ts` nor `run_site_audit` publishes official weekly fleet snapshots; official weekly baseline grading is reserved for dedicated aggregate grading publishers).
 - **Control Plane (`SiteAuditWorkflow`):** Cloudflare Workflow managing phase ordering, retries, and failure states on `open-seo-selfhost-audit`.
 - **Data Plane (`AuditScratchpad`):** SQLite-backed Durable Object instance per audit (`idFromName(auditId)`). Manages URL frontier leases in chunks of up to 100 URLs.
-- **Limits**: HTML crawls up to 10,000 pages for self-hosted instances; JavaScript-rendered crawls up to 1,000 pages (`RENDERED_MAX_AUDIT_PAGES`) via Cloudflare Browser Run.
+- **Limits & Defaults**: Edge crawler defaults to 500 pages (max 10,000 for self-hosted instances) and concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`). When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots until workflows terminate. JavaScript-rendered crawls up to 1,000 pages (`RENDERED_MAX_AUDIT_PAGES`) via Cloudflare Browser Run.
 
 ---
 
 ## 4. Operational Playbooks: Fleet & Site Audit
 
 ### Playbook 1: Roster Enrollment & Turnkey Linking
+**Prerequisites**:
+- The parent organization row (`id = 'shared-workspace'`) must exist in D1 before importing rosters to satisfy foreign key constraints.
+- Approval JSON requires canonical schema fields (`version`, `plan_hash` generated via `hashCanonicalRosterPlan`).
+- Roster importing (`import-fleet-roster.ts`) targets local D1 via `--approval`. Remote fleet linking (`link-github-fleet.ts`) requires an existing effective approved roster. Always run `--dry-run` to preview plans before live execution.
+
 For fresh **local development** (`localhost:3000` / `wrangler dev`):
 ```powershell
 # 1. Apply local migrations to local D1 (DB)
@@ -151,15 +157,15 @@ For **remote production D1** (`open-seo-db-selfhost` on Cloudflare edge):
 # Preview turnkey fleet linking plan across all portfolio targets and roster members (dry-run)
 pnpm exec tsx scripts/link-github-fleet.ts --remote --dry-run
 
-# Execute turnkey fleet linking against live remote D1 with post-link integrity verification
+# Execute turnkey fleet linking against live remote D1 with post-apply roster supersession checks
 pnpm exec tsx scripts/link-github-fleet.ts --remote
 ```
 
 > [!NOTE]
-> The linker's `--dry-run` flag operates as an execution plan preview that computes missing projects and link updates without mutating D1. Full database integrity assertions (zero unmapped, zero invalid links) run exclusively on live execution passes to confirm state convergence.
-> For all production fleet linking, use `scripts/link-github-fleet.ts` which uses bounded `--command` batches (zero D1 import warnings), performs write-time exact-match project resolution with `COUNT(*) = 1` guards, preserves manual links, and validates postcheck counts.
+> The linker's `--dry-run` flag operates as an execution plan preview that computes missing projects and link updates without mutating D1. Full database integrity assertions (zero unmapped, zero invalid links) and post-apply roster supersession checks run on live execution passes to confirm state convergence.
 
 ### Playbook 2A: Executing Commit-Pinned GitHub Repository Audit (Primary Source Lane)
+Direct audit accepts exactly one execution scope (`--domain <canonical-host>`, `--limit <n>`, or `--all`). D1 target defaults to `--remote` (`open-seo-db-selfhost`); pass `--local` for local D1 (`DB`).
 ```powershell
 # Audit a single property by exact domain directly from its GitHub repository (Selective Blob Lane)
 pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --force
@@ -167,13 +173,16 @@ pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --force
 # Streamed tarball archive mode for repositories without heavy binary assets
 pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --archive --force
 
-# Benchmark Selective Blob vs. Tarball Archive lane performance
+# Local D1 execution pass
+pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --local --force
+
+# Benchmark Selective Blob vs. Tarball Archive lane performance with verified blob acquisition
 pnpm exec tsx scripts/benchmark-archive-audit.ts --domain concrete.co.id
 
-# Audit a batch of un-audited enrolled portfolio properties
+# Audit a bounded slice of candidate portfolio properties (limits both repairs and fresh audits)
 pnpm exec tsx scripts/run-github-fleet-audit.ts --limit 20
 
-# Full fleet pass across all enrolled properties with custom page ceiling
+# Full fleet pass across all enrolled properties with custom page ceiling (max 10,000)
 pnpm exec tsx scripts/run-github-fleet-audit.ts --all --max-pages 5000
 ```
 
@@ -181,8 +190,8 @@ pnpm exec tsx scripts/run-github-fleet-audit.ts --all --max-pages 5000
 For live HTTP validation across deployed sites, dispatch via the CLI edge runner, `AuditService.startAudit`, or MCP `run_site_audit`:
 
 > [!NOTE]
-> The edge runner (`run-fleet-audits.ts`) creates site-audit rows and dispatches the live crawler workflow. Output from edge crawls represents site-audit instances; official weekly baseline grading (`weekly-baseline` series) is reserved for dedicated publishers that calculate and record official aggregate fleet scores.
-> When running locally, `--local` requires a running local dev session (`wrangler dev`). `--no-skip-recent` overrides the 10-day recency cutoff filter.
+> The edge runner (`run-fleet-audits.ts`) creates site-audit rows and dispatches the live crawler workflow. Output from edge crawls represents site-audit instances; official weekly baseline grading (`weekly-baseline` series) is reserved for dedicated aggregate grading publishers.
+> Edge defaults: 500 pages, concurrency 2 (allowed range 1–5), exactly one scope. When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots until workflows terminate. When running locally, `--local` requires a running local dev session (`wrangler dev`). `--no-skip-recent` overrides the 10-day recency cutoff filter.
 
 ```powershell
 # Run Cloudflare Workflows live HTTP crawler across target domain
@@ -228,12 +237,16 @@ await AuditService.startAudit({
 ```
 
 ### Playbook 2C: Fleet-Wide Issue Triage & CSV Export
+Queries the latest completed audit per active project, ordering by severity priority (critical $\rightarrow$ warning $\rightarrow$ info) then domain and issue ID:
 ```powershell
-# List top aggregated issues across all fleet audits with sovereign skill routing
+# List top aggregated issues across all fleet audits with sovereign skill routing (default limit 200, max 1000)
 pnpm exec tsx scripts/fleet-issues.ts --limit 50
 
-# Filter issues by exact domain and severity
-pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --severity critical
+# Filter issues by exact domain, severity, and issue type
+pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --severity critical --type broken-internal-link
+
+# Output structured JSON payload
+pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --json
 
 # Export fleet issues to RFC 4180 CSV with formula escaping
 pnpm exec tsx scripts/fleet-issues.ts --csv fleet-issues.csv
@@ -241,13 +254,13 @@ pnpm exec tsx scripts/fleet-issues.ts --csv fleet-issues.csv
 
 ### Playbook 2D: Programmatic Fleet Operations via MCP
 ```typescript
-// Query fleet aggregated issues with skill routing
+// Query fleet aggregated issues with skill routing (evaluates latest completed audit per active project)
 const issuesResult = await client.callTool({
   name: "get_fleet_issues",
   arguments: { domain: "concrete.co.id", severity: "critical", limit: 20 },
 });
 
-// Generate execution plan for fleet audit
+// Generate execution plan for fleet audit (emits configured argv; does not dispatch directly)
 const auditPlan = await client.callTool({
   name: "run_fleet_audit",
   arguments: { domain: "concrete.co.id", mode: "repository_direct", maxPages: 2000 },
@@ -257,14 +270,14 @@ console.log("Execution argv:", auditPlan.structuredContent.argv);
 
 ### Playbook 2E: Fleet Telemetry & Inventory Inspection
 ```powershell
-# View fleet status summary (audits breakdown, enrolled project counts, recent completed/failed samples)
+# View fleet status summary with mutually exclusive coverage stats (completed, running, failed, never_audited)
 pnpm exec tsx scripts/fleet-status.ts
 
 # Check repository presence and default branch across all portfolio entries
 pnpm exec tsx scripts/check-fleet-repos.ts
 ```
 > [!NOTE]
-> In `fleet-status.ts`, queries are strictly scoped with `p.organization_id = 'shared-workspace' AND p.archived_at IS NULL` to prevent cross-workspace bleeding or archived project pollution.
+> In `fleet-status.ts`, queries are strictly scoped with `p.organization_id = 'shared-workspace' AND p.archived_at IS NULL AND p.domain IS NOT NULL` to report accurate, mutually exclusive coverage buckets across the enrolled domain fleet.
 
 ### Playbook 3: Monitoring Workspace Audit Execution in Remote D1
 To inspect real-time crawler progress and audit state using workspace-scoped predicates:
@@ -383,7 +396,7 @@ try {
      const runNowUsd = quote?.runNowCostUsd;
      ```
   2. Explicit Operator Approval Gate: Require confirmation of nominal per-check and monthly recurring costs before saving or enabling recurring schedules.
-  3. Save tracker:
+  3. Save tracker (defaults to weekly cadence without running an immediate check; AI project IDs must be valid UUIDs):
      ```ts
      await client.callTool({
        name: "save_ai_visibility_tracker",
@@ -401,8 +414,8 @@ try {
          scheduleTime: { weekday: 1, hour: 9, minute: 0, timeZone: "Asia/Jakarta" }
        }
      });
-     // Inspect the returned initial baseline run from schedule activation
-     const baselineRun = schedRes.structuredContent?.run;
+     // Inspect the returned initial baseline run from schedule activation (nested under data.run)
+     const baselineRun = schedRes.structuredContent?.data?.run;
      if (baselineRun?.id) {
        await client.callTool({ name: "get_ai_visibility_run", arguments: { projectId: "proj_123", runId: baselineRun.id } });
      }
@@ -445,7 +458,14 @@ try {
   2. List existing reports: `list_reports({ projectId: "proj_123" })`.
   3. Save complete audit report: `save_report({ projectId: "proj_123", title: "Q4 2026 Technical Audit", summary: "Executive technical audit summary for Q4", html: "<!DOCTYPE html><html><head><title>Q4 Audit</title></head><body><h1>Audit Report</h1></body></html>" })`.
   4. Read back report: `get_report({ projectId: "proj_123", reportId: "rep_123" })`.
-  5. (Hosted Only) Generate public share link: In hosted deployment, `set_report_sharing({ projectId: "proj_123", reportId: "rep_123", public: true })` enables public web view. In self-host deployment without public gateway, reporting remains private within the authenticated workspace.
+  5. (Hosted Only) Operator-Authorized Public Sharing:
+     Explicit operator confirmation is required prior to public disclosure:
+     ```ts
+     // Enable public sharing
+     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "proj_123", reportId: "rep_123", public: true } });
+     // Revoke public sharing
+     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "proj_123", reportId: "rep_123", public: false } });
+     ```
 
 ### Playbook 6G: Project Setup & Brand Onboarding (`/projects/new`)
 - **UI Route**: `/projects/new` or `/p/:projectId/settings`
@@ -462,11 +482,21 @@ try {
        name: "create_project",
        arguments: { domain: "toiletcubicle.co.id", name: "Toilet Cubicle Surabaya", languageCode: "id", locationCode: 2360 }
      });
-     const projectId = projRes.structuredContent?.id;
+     const projectId = projRes.structuredContent?.project?.id;
+     if (!projectId) throw new Error("Project creation did not return an ID");
      ```
-  3. Extract initial brand profile:
+  3. Extract initial brand profile and save reviewed setup:
      ```ts
-     await client.callTool({ name: "research_project_website", arguments: { projectId, url: "https://toiletcubicle.co.id" } });
+     await client.callTool({ name: "research_project_website", arguments: { projectId, website: "https://toiletcubicle.co.id" } });
+     await client.callTool({
+       name: "save_project_website_setup",
+       arguments: {
+         projectId,
+         businessSummary: "Surabaya commercial cubicle contractor",
+         targetAudience: "B2B / Facility managers",
+         suggestedTopics: ["cubicle toilet", "partisi phenolic"]
+       }
+     });
      const context = await client.callTool({ name: "get_project_context", arguments: { projectId } });
      ```
 
@@ -474,11 +504,15 @@ try {
 - **UI Route**: `/p/:projectId/keywords` and `/p/:projectId/serp`
 - **MCP Tools**: `research_keywords`, `get_keyword_metrics`, `get_serp_results`, `save_keywords`, `get_ranked_keywords`
 - **Workflow**:
-  1. Research candidate keywords by seed:
+  1. Research candidate keywords by seed array (1–5 seeds, allowed resultLimit: 150, 300, 500):
      ```ts
      const res = await client.callTool({
        name: "research_keywords",
-       arguments: { projectId: "proj_123", query: "cubicle toilet surabaya", locationCode: 2360, languageCode: "id" }
+       arguments: {
+         projectId: "proj_123",
+         seeds: [{ seed: "cubicle toilet surabaya", locationCode: 2360, languageCode: "id" }],
+         resultLimit: 150
+       }
      });
      ```
   2. Inspect live SERP competitors and rankings:
@@ -498,54 +532,53 @@ try {
 
 ### Playbook 6I: Local SEO & Geo-Grid Visibility (`/local-seo`)
 - **UI Route**: `/p/:projectId/local-seo`
-- **MCP Tools**: `search_business_locations`, `list_local_locations`, `create_local_grid_search`, `get_local_grid_results`
+- **MCP Tools**: `search_local_businesses`, `get_local_rank_grid`
 - **Workflow**:
   1. Search and bind target Google Business Profile:
      ```ts
-     const locations = await client.callTool({
-       name: "search_business_locations",
+     const businesses = await client.callTool({
+       name: "search_local_businesses",
        arguments: { query: "Toilet Cubicle Surabaya", country: "ID" }
      });
      ```
   2. Dispatch local geo-grid search around target coordinates:
      ```ts
      const grid = await client.callTool({
-       name: "create_local_grid_search",
+       name: "get_local_rank_grid",
        arguments: {
          projectId: "proj_123",
-         businessName: "Toilet Cubicle Surabaya",
          keyword: "partisi toilet",
-         lat: -7.2575,
-         lng: 112.7521,
-         radiusKm: 10,
-         gridSize: 3
+         target: { name: "Toilet Cubicle Surabaya" },
+         center: { latitude: -7.2575, longitude: 112.7521 },
+         gridSize: 3,
+         spacingKm: 2
        }
      });
      ```
-  3. Inspect ranking distribution:
-     ```ts
-     await client.callTool({ name: "get_local_grid_results", arguments: { projectId: "proj_123", searchId: grid.structuredContent?.id } });
-     ```
 
 ### Playbook 6J: Audit Follow-Through & Granular Issue Inspection (`/audits`)
-- **UI Route**: `/p/:projectId/audits/:auditId`
-- **MCP Tools**: `get_audit_status`, `list_audit_pages`, `get_audit_page`, `list_audit_issues`, `get_audit_issue`
+- **UI Route**: `/p/:projectId/audit?auditId=:auditId`
+- **MCP Tools**: `get_audit_status`, `get_audit_issues`, `get_audit_pages`
 - **Workflow**:
-  1. Inspect running or completed crawl progress:
+  1. Inspect running or completed crawl progress (status object wrapped in structuredContent.status):
      ```ts
-     const status = await client.callTool({ name: "get_audit_status", arguments: { projectId: "proj_123", auditId: "aud_123" } });
-     console.log(`Audit phase: ${status.structuredContent?.currentPhase}, crawled: ${status.structuredContent?.pagesCrawled}`);
+     const statusRes = await client.callTool({ name: "get_audit_status", arguments: { projectId: "proj_123", auditId: "aud_123" } });
+     const status = statusRes.structuredContent?.status;
+     console.log(`Audit phase: ${status?.currentPhase}, crawled: ${status?.pagesCrawled}`);
      ```
   2. Query issues filtered by severity:
      ```ts
      const issues = await client.callTool({
-       name: "list_audit_issues",
+       name: "get_audit_issues",
        arguments: { projectId: "proj_123", auditId: "aud_123", severity: "critical", limit: 50 }
      });
      ```
-  3. Inspect specific page details and internal links:
+  3. Query crawled pages:
      ```ts
-     const page = await client.callTool({ name: "get_audit_page", arguments: { projectId: "proj_123", auditId: "aud_123", pageId: "page_123" } });
+     const pages = await client.callTool({
+       name: "get_audit_pages",
+       arguments: { projectId: "proj_123", auditId: "aud_123", limit: 50 }
+     });
      ```
 
 ---
