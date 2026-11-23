@@ -106,10 +106,16 @@ interface TargetProject {
   id: string;
   name: string;
   domain: string;
-  lastAudited?: string;
+  lastAuditedEpoch?: number | null;
 }
 
 async function main() {
+  const rawArgs = process.argv.slice(2);
+  if (rawArgs.includes("--remote") && rawArgs.includes("--local")) {
+    console.error("[ERROR] Conflicting flags: cannot specify both --remote and --local.");
+    process.exit(1);
+  }
+
   const args = parseArgs({
     options: {
       limit: { type: "string", short: "l" },
@@ -125,15 +131,27 @@ async function main() {
     allowPositionals: true,
   });
 
-  const maxPages = parseInt(args.values["max-pages"] || "500", 10);
-  const concurrency = Math.max(1, parseInt(args.values.concurrency || "2", 10) || 2);
-  let limit: number | undefined;
-  if (args.values.limit) {
-    if (!/^[1-9][0-9]*$/.test(args.values.limit)) {
-      console.error("[ERROR] Invalid --limit value. Must be a positive integer.");
+  let maxPages = 500;
+  if (args.values["max-pages"] !== undefined) {
+    const raw = String(args.values["max-pages"]);
+    const num = Number(raw);
+    if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(num) || num < 1 || num > 10000) {
+      console.error("[ERROR] Invalid --max-pages value. Must be a safe positive integer between 1 and 10000.");
       process.exit(1);
     }
-    limit = parseInt(args.values.limit, 10);
+    maxPages = num;
+  }
+
+  const concurrency = Math.max(1, parseInt(args.values.concurrency || "2", 10) || 2);
+  let limit: number | undefined;
+  if (args.values.limit !== undefined) {
+    const raw = String(args.values.limit);
+    const num = Number(raw);
+    if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(num)) {
+      console.error("[ERROR] Invalid --limit value. Must be a safe positive integer.");
+      process.exit(1);
+    }
+    limit = num;
   }
   const targetDomainFilter = args.values.domain?.toLowerCase().trim();
   const isAll = !!args.values.all;
@@ -155,16 +173,16 @@ async function main() {
   console.log(`Max Pages Per Site: ${maxPages} (Full Depth Crawl)`);
   if (targetDomainFilter) console.log(`Target Domain Filter: ${targetDomainFilter}`);
 
-  // Query enrolled projects in shared-workspace
+  // Query enrolled projects in shared-workspace with normalized UTC epoch (Sol F4)
   const sql = `
-    SELECT p.id, p.name, p.domain, max(a.started_at) as last_audited
+    SELECT p.id, p.name, p.domain, MAX(unixepoch(a.started_at)) AS last_audited_epoch
     FROM projects p
     LEFT JOIN audits a ON p.id = a.project_id
     WHERE p.organization_id = 'shared-workspace'
       AND p.domain IS NOT NULL
       AND p.archived_at IS NULL
     GROUP BY p.id, p.name, p.domain
-    ORDER BY last_audited ASC, p.created_at ASC;
+    ORDER BY last_audited_epoch ASC NULLS FIRST, p.created_at ASC;
   `;
 
   const rows = runD1Query(sql, isRemote);
@@ -174,7 +192,7 @@ async function main() {
     id: r.id,
     name: r.name,
     domain: r.domain,
-    lastAudited: r.last_audited,
+    lastAuditedEpoch: typeof r.last_audited_epoch === "number" ? r.last_audited_epoch : null,
   }));
 
   if (targetDomainFilter) {
@@ -189,8 +207,10 @@ async function main() {
 
   const shouldSkipRecent = args.values["no-skip-recent"] ? false : !!args.values["skip-recent"];
   if (shouldSkipRecent && !targetDomainFilter) {
-    const tenDaysAgoMs = Date.now() - 10 * 24 * 60 * 60 * 1000;
-    candidates = candidates.filter((c) => !c.lastAudited || new Date(c.lastAudited).getTime() < tenDaysAgoMs);
+    const tenDaysAgoEpoch = Math.floor((Date.now() - 10 * 24 * 60 * 60 * 1000) / 1000);
+    candidates = candidates.filter(
+      (c) => c.lastAuditedEpoch === null || c.lastAuditedEpoch === undefined || c.lastAuditedEpoch < tenDaysAgoEpoch,
+    );
   }
 
   if (limit) {
@@ -304,10 +324,11 @@ async function main() {
         });
       } else {
         console.error(`[ERROR] Failed to start workflow for ${project.domain}`);
-        runD1Query(
-          `UPDATE audits SET status = 'failed', error_code = 'DISPATCH_ERROR' WHERE id = '${auditId}';`,
-          isRemote,
-        );
+        const failSql = `UPDATE audits SET status = 'failed', error_code = 'DISPATCH_ERROR', completed_at = datetime('now') WHERE id = '${auditId}' AND status = 'running' RETURNING id;`;
+        const failedRows = runD1Query(failSql, isRemote);
+        if (!failedRows || failedRows.length === 0) {
+          console.warn(`[WARN] Dispatch error update for ${auditId} updated 0 rows (audit already terminal).`);
+        }
         failedCount++;
       }
     }

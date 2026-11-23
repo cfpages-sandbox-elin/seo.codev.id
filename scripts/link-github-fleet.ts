@@ -77,7 +77,10 @@ function runD1Query(query: string, isRemote: boolean): any[] {
 function executeD1Sql(sqlContent: string, isRemote: boolean) {
   const flag = isRemote ? "--remote" : "--local";
   const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
-  const tempFile = resolve(`scratch/temp_link_${Date.now()}.sql`);
+  const scratchDir = resolve("scratch");
+  if (!fs.existsSync(scratchDir)) fs.mkdirSync(scratchDir, { recursive: true });
+  const randomSuffix = crypto.randomBytes(8).toString("hex");
+  const tempFile = resolve(`scratch/temp_link_${Date.now()}_${randomSuffix}.sql`);
   writeFileSync(tempFile, sqlContent, "utf8");
   try {
     const cmd = `npx wrangler d1 execute ${dbName} ${flag} --file "${tempFile}"`;
@@ -300,7 +303,7 @@ export async function linkFleet(options: {
        SELECT '${p.id}', '${orgId}', '${escapedName}', '${escapedDomain}', 2360, 'id', CURRENT_TIMESTAMP
        WHERE NOT EXISTS (
          SELECT 1 FROM projects
-         WHERE organization_id = '${orgId}' AND lower(domain) = '${escapedDomain}' AND archived_at IS NULL
+         WHERE organization_id = '${orgId}' AND lower(trim(domain)) = '${escapedDomain}' AND archived_at IS NULL
        );`
     );
   }
@@ -331,42 +334,62 @@ export async function linkFleet(options: {
   }
 
   if (sqlStatements.length <= 1) {
-    if (unmappedCount > 0) {
-      console.error(`[ERROR] ${unmappedCount} fleet roster members remain unmapped.`);
-      process.exitCode = 1;
-      return;
+    if (!isDryRun) {
+      const updatedMembers = runD1Query(
+        `SELECT count(*) as unmapped_count FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}' AND project_id IS NULL;`,
+        isRemote,
+      );
+      if (!updatedMembers || updatedMembers.length === 0 || typeof updatedMembers[0]?.unmapped_count !== "number") {
+        throw new Error(`Verification query failed to return a valid count for roster ${approvedRoster.id}.`);
+      }
+      const unmapped = updatedMembers[0].unmapped_count;
+      if (unmapped > 0) {
+        throw new Error(`${unmapped} fleet roster members remain unmapped in approved roster ${approvedRoster.id}.`);
+      }
+      console.log(`Live verification: 100% of fleet roster members in ${approvedRoster.id} are mapped to verified D1 projects! Zero updates required.`);
+    } else {
+      if (unmappedCount > 0) {
+        console.error(`[ERROR] ${unmappedCount} fleet roster members remain unmapped.`);
+        process.exitCode = 1;
+        return;
+      }
+      console.log(`Dry run preview: All portfolio projects and fleet roster members are 100% mapped! Zero updates required.`);
     }
-    console.log(`All portfolio projects and fleet roster members are 100% mapped! Zero updates required.`);
     return;
   }
 
   console.log(`Executing ${sqlStatements.length - 1} SQL statements against D1...`);
   executeD1Sql(sqlStatements.join("\n"), isRemote);
 
-  // 5. Verification check strictly scoped to current roster
+  // 5. Verification check strictly scoped to current roster (Sol F5)
   const updatedMembers = runD1Query(
     `SELECT count(*) as unmapped_count FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}' AND project_id IS NULL;`,
     isRemote,
   );
   if (!updatedMembers || updatedMembers.length === 0 || typeof updatedMembers[0]?.unmapped_count !== "number") {
-    console.error(`[ERROR] Verification query failed to return a valid count.`);
-    process.exitCode = 1;
-    return;
+    throw new Error(`Verification query failed to return a valid count for roster ${approvedRoster.id}.`);
   }
   const unmapped = updatedMembers[0].unmapped_count;
   console.log(`Verification: Remaining unmapped roster members in ${approvedRoster.id}: ${unmapped}`);
   if (unmapped === 0) {
     console.log(`SUCCESS: 100% of fleet roster members are linked to verified D1 projects!`);
   } else {
-    console.warn(`WARNING: ${unmapped} members remain unmapped.`);
-    process.exitCode = 1;
+    throw new Error(`WARNING: ${unmapped} members remain unmapped after linking run.`);
   }
 }
 
 // CLI execution
 if (process.argv[1] && process.argv[1].includes("link-github-fleet")) {
+  const rawArgs = process.argv.slice(2);
+  const hasRemote = rawArgs.includes("--remote");
+  const hasLocal = rawArgs.includes("--local");
+  if (hasRemote && hasLocal) {
+    console.error("[ERROR] Conflicting flags: cannot specify both --remote and --local.");
+    process.exit(1);
+  }
+
   const { values } = parseArgs({
-    args: process.argv.slice(2),
+    args: rawArgs,
     options: {
       "dry-run": { type: "boolean", default: false },
       remote: { type: "boolean", default: false },
@@ -375,7 +398,7 @@ if (process.argv[1] && process.argv[1].includes("link-github-fleet")) {
     },
   });
 
-  const isRemote = values.remote ? true : values.local ? false : false;
+  const isRemote = hasRemote ? true : false;
   linkFleet({
     dryRun: values["dry-run"],
     remote: isRemote,

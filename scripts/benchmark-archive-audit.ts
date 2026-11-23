@@ -14,6 +14,13 @@ import { resolve } from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { parseArgs } from "node:util";
+import {
+  capBytes,
+  streamToBuffer,
+  verifyGitBlob,
+  parseTarHtmlFiles,
+  decompressGzipStream,
+} from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
 const MANIFEST_PATH = resolve("src/server/features/fleet/data/fleetManifest.json");
@@ -37,64 +44,6 @@ function loadEnv(): Record<string, string> {
 
 const envVars = loadEnv();
 const GITHUB_TOKEN = envVars.GITHUB_TOKEN || process.env.GITHUB_TOKEN;
-
-/**
- * In-memory zero-disk tarball parser for gzipped ustar archives.
- * Bounds entry size to 5MB and extracts regular HTML files under the repository root.
- */
-export function parseTarHtmlFiles(
-  tarBuf: Buffer,
-  maxEntrySize = 5 * 1024 * 1024,
-): Map<string, Buffer> {
-  const htmlMap = new Map<string, Buffer>();
-  let offset = 0;
-
-  while (offset + 512 <= tarBuf.length) {
-    const header = tarBuf.subarray(offset, offset + 512);
-
-    let isAllZero = true;
-    for (let i = 0; i < 512; i++) {
-      if (header[i] !== 0) {
-        isAllZero = false;
-        break;
-      }
-    }
-    if (isAllZero) break;
-
-    const rawName = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "").trim();
-    const rawPrefix = header.subarray(345, 500).toString("utf8").replace(/\0.*$/, "").trim();
-    const fullName = rawPrefix ? `${rawPrefix}/${rawName}` : rawName;
-
-    const slashIdx = fullName.indexOf("/");
-    const relPath = slashIdx !== -1 ? fullName.slice(slashIdx + 1) : fullName;
-
-    const sizeStr = header.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim();
-    const size = parseInt(sizeStr, 8);
-
-    const typeFlag = header[156];
-    const isRegularFile = typeFlag === 0 || typeFlag === 48; // ASCII '0' = 48
-
-    const contentStart = offset + 512;
-    const contentEnd = contentStart + (isNaN(size) ? 0 : size);
-
-    if (
-      isRegularFile &&
-      !isNaN(size) &&
-      size <= maxEntrySize &&
-      (relPath.endsWith(".html") || relPath.endsWith(".htm"))
-    ) {
-      if (contentEnd <= tarBuf.length) {
-        const contentBuf = Buffer.from(tarBuf.subarray(contentStart, contentEnd));
-        htmlMap.set(relPath, contentBuf);
-      }
-    }
-
-    const paddedSize = Math.ceil(size / 512) * 512;
-    offset += 512 + (isNaN(paddedSize) ? 512 : paddedSize);
-  }
-
-  return htmlMap;
-}
 
 export async function runBenchmark(repoName: string) {
   const ownerRepoRegex = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
@@ -146,21 +95,28 @@ export async function runBenchmark(repoName: string) {
     const slice = htmlBlobs.slice(i, i + CONCURRENCY);
     await Promise.all(
       slice.map(async (file: any) => {
-        const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${file.path}`;
+        const rawPath = file.path.split("/").map(encodeURIComponent).join("/");
+        const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${rawPath}`;
         try {
           const res = await fetch(rawUrl, {
             headers: {
-              ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
+              ...(GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {}),
               "User-Agent": "OpenSEO-Benchmark-Lane1",
             },
+            signal: AbortSignal.timeout(60000),
           });
           if (res.ok) {
             const arrayBuf = await res.arrayBuffer();
             const buf = Buffer.from(arrayBuf);
+            verifyGitBlob(buf, file.sha);
             lane1TotalBytes += buf.length;
             lane1Results.set(file.path, buf);
+          } else {
+            throw new Error(`HTTP ${res.status} fetching ${file.path}`);
           }
-        } catch {}
+        } catch (err: any) {
+          throw new Error(`Lane 1 failed to acquire or verify blob ${file.path}: ${err?.message || err}`);
+        }
       }),
     );
   }
@@ -183,27 +139,44 @@ export async function runBenchmark(repoName: string) {
   const archiveUrl = `https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}`;
   const archiveRes = await fetch(archiveUrl, {
     headers: {
-      ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
+      ...(GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {}),
       "User-Agent": "OpenSEO-Benchmark",
+      "Accept-Encoding": "identity",
     },
+    signal: AbortSignal.timeout(60000),
   });
   if (!archiveRes.ok) {
     throw new Error(`Failed to download archive: ${archiveRes.status} ${archiveRes.statusText}`);
   }
-  const archiveArrayBuf = await archiveRes.arrayBuffer();
+  const contentLength = archiveRes.headers.get("content-length");
+  if (contentLength && parseInt(contentLength, 10) > 100 * 1024 * 1024) {
+    throw new Error(`Archive exceeds 100MB bound (${contentLength} bytes)`);
+  }
+  if (!archiveRes.body) {
+    throw new Error("Empty archive response body");
+  }
   const tDownload_lane2 = performance.now();
 
-  const tarballBuffer = Buffer.from(archiveArrayBuf);
-  const archiveWireBytes = tarballBuffer.length;
-  if (archiveWireBytes > 100 * 1024 * 1024) {
-    throw new Error(`Archive wire payload exceeds safe 100MB bound (${archiveWireBytes} bytes)`);
-  }
-  const decompressed = zlib.gunzipSync(tarballBuffer, { maxOutputLength: 250 * 1024 * 1024 });
+  const tarStream = archiveRes.body
+    .pipeThrough(capBytes(100 * 1024 * 1024, "compressed archive"))
+    .pipeThrough(decompressGzipStream())
+    .pipeThrough(capBytes(250 * 1024 * 1024, "expanded archive"));
+  const decompressed = await streamToBuffer(tarStream);
+  const archiveWireBytes = decompressed.length;
   const tDecompress_lane2 = performance.now();
 
   const lane2Results = parseTarHtmlFiles(decompressed);
   const t1_lane2 = performance.now();
   const memEnd2 = process.memoryUsage().rss;
+
+  // Cryptographically verify every file in Lane 2 against its expected Git blob ID (Sol P1 - F2)
+  for (const file of htmlBlobs) {
+    const buf = lane2Results.get(file.path);
+    if (!buf) {
+      throw new Error(`Lane 2 archive missing candidate file: ${file.path}`);
+    }
+    verifyGitBlob(buf, file.sha);
+  }
 
   const downloadDurationMs = Math.round(tDownload_lane2 - t0_lane2);
   const decompressDurationMs = Math.round(tDecompress_lane2 - tDownload_lane2);
@@ -225,18 +198,11 @@ export async function runBenchmark(repoName: string) {
 
   // Sol P1-02: Cryptographic byte parity assertion over raw binary buffers before text decoding:
   let matchedFiles = 0;
-  let mismatchedContent = 0;
   for (const file of htmlBlobs) {
     const buf1 = lane1Results.get(file.path);
     const buf2 = lane2Results.get(file.path);
-    if (buf1 !== undefined && buf2 !== undefined) {
-      const d1 = crypto.createHash("sha256").update(buf1).digest("hex");
-      const d2 = crypto.createHash("sha256").update(buf2).digest("hex");
-      if (d1 === d2) {
-        matchedFiles++;
-      } else {
-        mismatchedContent++;
-      }
+    if (buf1 && buf2 && buf1.equals(buf2)) {
+      matchedFiles++;
     }
   }
 
@@ -245,18 +211,11 @@ export async function runBenchmark(repoName: string) {
     htmlBlobs.length > 0 &&
     lane1Results.size === htmlBlobs.length &&
     lane2Results.size === htmlBlobs.length &&
-    htmlBlobs.every((b: any) => {
-      const left = lane1Results.get(b.path);
-      const right = lane2Results.get(b.path);
-      if (left === undefined || right === undefined) return false;
-      const d1 = crypto.createHash("sha256").update(left).digest("hex");
-      const d2 = crypto.createHash("sha256").update(right).digest("hex");
-      return d1 === d2;
-    });
+    matchedFiles === htmlBlobs.length;
 
   if (!parity) {
     throw new Error(
-      `PARITY FAILURE: Candidate set mismatch (Tree: ${htmlBlobs.length}, Lane 1: ${lane1Results.size}, Lane 2: ${lane2Results.size}, Matched: ${matchedFiles}, Mismatches: ${mismatchedContent})`
+      `PARITY FAILURE: Candidate set mismatch (Tree: ${htmlBlobs.length}, Lane 1: ${lane1Results.size}, Lane 2: ${lane2Results.size}, Matched: ${matchedFiles})`
     );
   }
 

@@ -13,6 +13,7 @@ import fs, { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import Papa from "papaparse";
 import { parseArgs } from "node:util";
+import { isValidCanonicalHostname } from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
 
@@ -270,9 +271,9 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
 
   const isRemote = !values.local;
 
-  if (values.domain && typeof values.domain === "string") {
-    const trimmedDomain = values.domain.toLowerCase().trim();
-    if (!/^[a-z0-9][a-z0-9-]{0,61}[a-z0-9](?:\.[a-z0-9-]{2,})+$/i.test(trimmedDomain)) {
+  if (values.domain !== undefined) {
+    const trimmedDomain = String(values.domain).toLowerCase().trim();
+    if (!isValidCanonicalHostname(trimmedDomain)) {
       console.error(`[ERROR] Invalid domain format: '${values.domain}'. Must be a canonical hostname.`);
       process.exit(1);
     }

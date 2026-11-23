@@ -92,6 +92,8 @@ async function main() {
     FROM audits a
     JOIN projects p ON a.project_id = p.id
     WHERE a.status = 'completed'
+      AND p.organization_id = 'shared-workspace'
+      AND p.archived_at IS NULL
     ORDER BY a.completed_at DESC LIMIT 10;
   `);
   console.log("\nRecent completed audits (sample 10):");
@@ -105,6 +107,8 @@ async function main() {
     FROM audits a
     JOIN projects p ON a.project_id = p.id
     WHERE a.status = 'failed'
+      AND p.organization_id = 'shared-workspace'
+      AND p.archived_at IS NULL
     ORDER BY a.started_at DESC LIMIT 10;
   `);
   console.log("\nRecent failed audits (sample 10):");

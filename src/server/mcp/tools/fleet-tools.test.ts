@@ -99,5 +99,28 @@ describe("Fleet MCP Tools", () => {
       expect(data.argv).toContain("--concurrency");
       expect(data.argv).toContain("3");
     });
+
+    it("rejects caller outside shared-workspace organization (Sol F6)", async () => {
+      const foreignContext = makeToolContext({ organizationId: "foreign_org" });
+      await expect(
+        runFleetAuditTool.handler({ mode: "repository_direct" }, foreignContext),
+      ).rejects.toThrow(/shared-workspace/);
+    });
+
+    it("rejects unauthenticated caller without organizationId (Sol F6)", async () => {
+      const anonContext = makeToolContext({ organizationId: undefined });
+      await expect(
+        runFleetAuditTool.handler({ mode: "repository_direct" }, anonContext),
+      ).rejects.toThrow(/shared-workspace/);
+    });
+
+    it("validates canonical hostnames including single-letter labels like a.id (Sol F6)", () => {
+      const schema = runFleetAuditTool.config.inputSchema;
+      expect(schema.domain.safeParse("a.id").success).toBe(true);
+      expect(schema.domain.safeParse("toiletcubicle.co.id").success).toBe(true);
+      expect(schema.domain.safeParse("-invalid.com").success).toBe(false);
+      expect(schema.domain.safeParse("invalid-.com").success).toBe(false);
+      expect(schema.domain.safeParse("a".repeat(255) + ".com").success).toBe(false);
+    });
   });
 });

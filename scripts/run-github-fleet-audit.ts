@@ -14,6 +14,13 @@ import { resolve } from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { parseArgs } from "node:util";
+import {
+  capBytes,
+  streamToBuffer,
+  verifyGitBlob,
+  parseTarHtmlFiles,
+  decompressGzipStream,
+} from "./github-archive-utils";
 import { analyzeHtml } from "../src/server/lib/audit/page-analyzer";
 import { runPageReporters, type DetectedIssue } from "../src/server/lib/audit/issues/page-reporters";
 import type { CrawledPageResult } from "../src/server/lib/audit/types";
@@ -176,64 +183,6 @@ const normalizeRoute = (urlOrPath: string): string => {
   return `${host}${path}`;
 };
 
-/**
- * In-memory zero-disk tarball parser for gzipped ustar archives (FLEET-GH-02).
- * Bounds entry size to 5MB and extracts regular HTML files under the repository root into raw Buffers.
- */
-function parseTarHtmlFiles(
-  tarBuf: Buffer,
-  maxEntrySize = 5 * 1024 * 1024,
-): Map<string, Buffer> {
-  const htmlMap = new Map<string, Buffer>();
-  let offset = 0;
-
-  while (offset + 512 <= tarBuf.length) {
-    const header = tarBuf.subarray(offset, offset + 512);
-
-    let isAllZero = true;
-    for (let i = 0; i < 512; i++) {
-      if (header[i] !== 0) {
-        isAllZero = false;
-        break;
-      }
-    }
-    if (isAllZero) break;
-
-    const rawName = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "").trim();
-    const rawPrefix = header.subarray(345, 500).toString("utf8").replace(/\0.*$/, "").trim();
-    const fullName = rawPrefix ? `${rawPrefix}/${rawName}` : rawName;
-
-    const slashIdx = fullName.indexOf("/");
-    const relPath = slashIdx !== -1 ? fullName.slice(slashIdx + 1) : fullName;
-
-    const sizeStr = header.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim();
-    const size = parseInt(sizeStr, 8);
-
-    const typeFlag = header[156];
-    const isRegularFile = typeFlag === 0 || typeFlag === 48;
-
-    const contentStart = offset + 512;
-    const contentEnd = contentStart + (isNaN(size) ? 0 : size);
-
-    if (
-      isRegularFile &&
-      !isNaN(size) &&
-      size <= maxEntrySize &&
-      (relPath.endsWith(".html") || relPath.endsWith(".htm"))
-    ) {
-      if (contentEnd <= tarBuf.length) {
-        const content = Buffer.from(tarBuf.subarray(contentStart, contentEnd));
-        htmlMap.set(relPath, content);
-      }
-    }
-
-    const paddedSize = Math.ceil(size / 512) * 512;
-    offset += 512 + (isNaN(paddedSize) ? 512 : paddedSize);
-  }
-
-  return htmlMap;
-}
-
 async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchive = false, isRemote = true): Promise<boolean> {
   const { domain, repoName, projectId } = mapping;
   console.log(`\n======================================================`);
@@ -265,7 +214,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     const parsedTree = JSON.parse(treeJson);
     if (parsedTree.truncated) {
       isTreeTruncated = true;
-      throw new Error(`Git tree for ${repoName} is truncated by GitHub (exceeds limit); recursive subtree enumeration required`);
+      throw new Error(`DISCOVERY_TRUNCATED: Git tree for ${repoName} is truncated by GitHub (exceeds limit); recursive subtree enumeration required`);
     }
     treeItems = parsedTree.tree || [];
   } catch (err: any) {
@@ -325,30 +274,31 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     return `https://${domain}${pathname}`;
   };
 
-  // Build bidirectional alias-to-canonical route map to eliminate false orphan reports (Sol P1-03)
+  // Build bidirectional alias-to-canonical route map to eliminate false orphan reports (Sol P1-03, F3)
   const aliasToCanonicalUrl = new Map<string, string>();
   for (const file of htmlFiles) {
+    const encoded = file.path.split("/").map(encodeURIComponent).join("/");
     const canonical = pathToUrl(file.path);
     const normCanonical = normalizeRoute(canonical);
     aliasToCanonicalUrl.set(normCanonical, canonical);
 
     // Direct path aliases (/docs/index.html -> /docs/)
-    aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${file.path}`), canonical);
-    aliasToCanonicalUrl.set(normalizeRoute(`/${file.path}`), canonical);
+    aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${encoded}`), canonical);
+    aliasToCanonicalUrl.set(normalizeRoute(`/${encoded}`), canonical);
 
     if (file.path === "index.html" || file.path === "index.htm") {
       aliasToCanonicalUrl.set(normalizeRoute(domain), canonical);
       aliasToCanonicalUrl.set(normalizeRoute("/"), canonical);
-    } else if (file.path.endsWith("/index.html")) {
-      const dirSlug = file.path.slice(0, -11);
+    } else if (/(?:^|\/)index\.html?$/i.test(encoded)) {
+      const dirSlug = encoded.replace(/(?:^|\/)index\.html?$/i, "");
       aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${dirSlug}`), canonical);
       aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}`), canonical);
       aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}/`), canonical);
-    } else if (file.path.endsWith("/index.htm")) {
-      const dirSlug = file.path.slice(0, -10);
-      aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${dirSlug}`), canonical);
-      aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}`), canonical);
-      aliasToCanonicalUrl.set(normalizeRoute(`/${dirSlug}/`), canonical);
+    } else {
+      // Extensionless non-index pages (Sol F3) e.g. /about.html -> /about
+      const extensionless = encoded.replace(/\.html?$/i, "");
+      aliasToCanonicalUrl.set(normalizeRoute(`https://${domain}/${extensionless}`), canonical);
+      aliasToCanonicalUrl.set(normalizeRoute(`/${extensionless}`), canonical);
     }
   }
 
@@ -366,20 +316,27 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
       const tarUrl = `https://codeload.github.com/${repoName}/legacy.tar.gz/${commitSha}`;
       const res = await fetch(tarUrl, {
         headers: {
-          ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
+          ...(GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {}),
           "User-Agent": "OpenSEO-Audit",
+          "Accept-Encoding": "identity",
         },
         signal: AbortSignal.timeout(60000),
       });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status} fetching archive from codeload`);
       }
-      const arrayBuf = await res.arrayBuffer();
-      const tarBuf = Buffer.from(arrayBuf);
-      if (tarBuf.length > 100 * 1024 * 1024) {
-        throw new Error(`Archive exceeds 100MB bound (${tarBuf.length} bytes)`);
+      const contentLength = res.headers.get("content-length");
+      if (contentLength && parseInt(contentLength, 10) > 100 * 1024 * 1024) {
+        throw new Error(`Archive exceeds 100MB bound (${contentLength} bytes)`);
       }
-      const decompressed = zlib.gunzipSync(tarBuf, { maxOutputLength: 250 * 1024 * 1024 });
+      if (!res.body) {
+        throw new Error("Empty archive response body");
+      }
+      const tarStream = res.body
+        .pipeThrough(capBytes(100 * 1024 * 1024, "compressed archive"))
+        .pipeThrough(decompressGzipStream())
+        .pipeThrough(capBytes(250 * 1024 * 1024, "expanded archive"));
+      const decompressed = await streamToBuffer(tarStream);
       archiveHtmlMap = parseTarHtmlFiles(decompressed);
       console.log(`[ARCHIVE] Extracted ${archiveHtmlMap.size} HTML files from archive in memory.`);
     } catch (err: any) {
@@ -403,9 +360,10 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
             const rawUrl = `https://raw.githubusercontent.com/${repoName}/${commitSha}/${encodedPath}`;
             const res = await fetch(rawUrl, {
               headers: {
-                ...(GITHUB_TOKEN ? { Authorization: `token ${GITHUB_TOKEN}` } : {}),
+                ...(GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {}),
                 "User-Agent": "OpenSEO-GitHub-Audit-Engine",
               },
+              signal: AbortSignal.timeout(60000),
             });
 
             if (!res.ok) {
@@ -419,15 +377,8 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
 
           if (!bytes) return;
 
-          // Cryptographic Git Blob Identity Verification (Sol P1 - F1)
-          const algorithm = file.sha.length === 64 ? "sha256" : "sha1";
-          const blobId = crypto.createHash(algorithm)
-            .update("blob " + bytes.length + "\0")
-            .update(bytes)
-            .digest("hex");
-          if (blobId !== file.sha) {
-            throw new Error(`Git blob identity mismatch for ${file.path}: expected ${file.sha}, got ${blobId}`);
-          }
+          // Cryptographic Git Blob Identity Verification (Sol P1 - F1/F2)
+          verifyGitBlob(bytes, file.sha);
 
           const html = bytes.toString("utf8");
           const analysis = analyzeHtml(html, pageUrl, 200, 50);
@@ -669,16 +620,19 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
         const grade = score >= 90 ? "A" : score >= 80 ? "B" : score >= 70 ? "C" : score >= 60 ? "D" : "F";
         const coverage = Math.round((processedCount / Math.max(1, htmlFiles.length)) * 100);
 
+        const runStatus = isComplete ? "completed" : "partial";
+        const itemStatus = isComplete ? "completed" : (processedCount > 0 ? "partial" : "failed");
+
         const diagnosticSql = [
           `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-           VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', '${isComplete ? "completed" : "failed"}', 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, datetime('now'), datetime('now'));`,
+           VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', '${runStatus}', 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, datetime('now'), datetime('now'));`,
           `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-           VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${isComplete ? "completed" : "partial"}', 1, datetime('now'), datetime('now'));`,
+           VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${itemStatus}', 1, datetime('now'), datetime('now'));`,
           `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-           VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', ${score}, NULL, ${score}, NULL, NULL, NULL, datetime('now'));`
+           VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, datetime('now'));`
         ];
         executeD1SqlStatements(diagnosticSql, isRemote);
-        console.log(`[DIAGNOSTIC] Recorded fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%)`);
+        console.log(`[DIAGNOSTIC] Recorded fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%, status: ${itemStatus})`);
       }
     } catch (diagErr: any) {
       console.error(`[ERROR] Diagnostic fleet series linking failed:`, diagErr?.message || diagErr);
@@ -688,22 +642,26 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     return isComplete;
   } catch (d1Err: any) {
     console.error(`[ERROR] D1 persistence failed for ${domain}:`, d1Err?.message || d1Err);
-    // Mark audit as failed on error
+    // Mark audit as failed on error with observable CAS verification (Sol F9)
     try {
-      const fallbackRows = runD1Query(
-        `UPDATE audits
+      const fallbackSql = `UPDATE audits
          SET status = 'failed',
              error_code = 'CHUNK_WRITE_FAILED',
              current_phase = 'failed',
              completed_at = datetime('now')
          WHERE id = '${auditId}' AND status = 'running'
-         RETURNING id;`,
-        isRemote,
-      );
+         RETURNING id;`;
+      const fallbackRows = runD1Query(fallbackSql, isRemote);
       if (!fallbackRows || fallbackRows.length === 0) {
-        console.warn(`[WARN] Fallback failure CAS updated 0 rows for ${auditId} (already finalized or missing).`);
+        console.warn(`[WARN] Fallback failure CAS updated 0 rows for ${auditId} on ${isRemote ? "open-seo-db-selfhost" : "DB"} (already finalized or missing).`);
+      } else if (fallbackRows.length > 1 || fallbackRows[0].id !== auditId) {
+        throw new Error(`Unexpected fallback CAS result for ${auditId}: updated ${fallbackRows.length} rows`);
+      } else {
+        console.log(`[FALLBACK] Finalized audit ${auditId} status as 'failed' (error_code: CHUNK_WRITE_FAILED) on ${isRemote ? "open-seo-db-selfhost" : "DB"}`);
       }
-    } catch {}
+    } catch (fallbackErr: any) {
+      console.error(`[CRITICAL] Fallback failure CAS execution error for audit ${auditId} on ${isRemote ? "open-seo-db-selfhost" : "DB"}:`, fallbackErr?.message || fallbackErr);
+    }
     return false;
   }
 }

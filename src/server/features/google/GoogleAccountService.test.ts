@@ -72,7 +72,9 @@ beforeAll(async () => {
 
 afterAll(() => {
   client.close();
-  rmSync(directory, { recursive: true });
+  try {
+    rmSync(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  } catch {}
 });
 beforeEach(async () => {
   await client.executeMultiple(

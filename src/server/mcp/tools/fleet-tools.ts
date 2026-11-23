@@ -251,6 +251,7 @@ const runFleetAuditInputSchema = {
   domain: z
     .string()
     .trim()
+    .max(253, "Must be at most 253 characters")
     .regex(CANONICAL_DOMAIN_REGEX, "Must be a valid canonical hostname (e.g. 'toiletcubicle.co.id')")
     .optional()
     .describe("Optional target domain to audit (e.g. 'toiletcubicle.co.id'). If omitted, runs fleet runner across eligible domains."),
@@ -303,9 +304,9 @@ export const runFleetAuditTool = {
     },
   },
   handler: async (args: RunFleetAuditArgs, context: ToolContext) => {
-    const orgId = context.auth?.organizationId || "shared-workspace";
-    if (orgId !== "shared-workspace") {
-      throw new Error(`Fleet runners are currently constrained to the 'shared-workspace' organization; caller organization '${orgId}' is not supported.`);
+    const orgId = context.auth?.organizationId;
+    if (!orgId || orgId !== "shared-workspace") {
+      throw new Error(`Fleet runners are currently constrained to the 'shared-workspace' organization; caller organization '${orgId ?? "unauthenticated"}' is not supported.`);
     }
 
     const mode = args.mode ?? "repository_direct";
