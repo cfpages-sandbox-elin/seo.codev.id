@@ -139,7 +139,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
   ```powershell
   node --import tsx --input-type=module -e 'import {hashCanonicalRosterPlan} from "./scripts/import-fleet-roster.ts"; import {FLEET_MANIFEST_MEMBERS} from "./src/server/features/fleet/data/fleetManifest.ts"; console.log(hashCanonicalRosterPlan("shared-workspace", FLEET_MANIFEST_MEMBERS))'
   ```
-- Fleet linking (`link-github-fleet.ts`) operates against either `--local` (local D1 `DB`) or default `--remote` (`open-seo-db-selfhost`), scoped via `--org-id` (default `shared-workspace`). It requires an existing effective approved roster in D1 (`approved_at IS NOT NULL AND julianday(approved_at) <= julianday('now')`). Always preview mutations with `--dry-run` before applying live. (Note: legacy `generate-fleet-linking-sql.ts` is retired).
+- Fleet linking (`link-github-fleet.ts`) defaults to local D1 (`DB`); pass `--remote` for remote production D1 (`open-seo-db-selfhost`), scoped via `--org-id` (default `shared-workspace`). It requires an existing effective approved roster in D1 (`approved_at IS NOT NULL AND julianday(approved_at) <= julianday('now')`). Always preview mutations with `--dry-run` before applying live. (Note: legacy `generate-fleet-linking-sql.ts` is retired).
 
 For fresh **local development** (`localhost:3000` / `wrangler dev`):
 ```powershell
@@ -173,7 +173,7 @@ pnpm exec tsx scripts/link-github-fleet.ts --remote
 Direct audit accepts exactly one execution scope (`--domain <canonical-host>`, `--limit <n>`, or `--all`). By default, bulk audit admits properties from the approved fleet roster; pass `--workspace` to audit wider inventory projects.
 - **Max Pages Parameter (`--max-pages <n>`)**: Allowed range 1–10,000, default 10,000. Setting a cap below the total eligible pages yields incomplete source coverage.
 - **Audit Reuse vs. Repair**: When auditing without `--force`, completed source audits with valid diagnostic triples (`fleet_runs`, `fleet_run_items`, `fleet_snapshots`) bound to the effective roster version are reused; if diagnostic rows are missing for an approved roster member, a targeted diagnostic repair occurs without re-crawling Git. Workspace audits outside the approved roster bypass diagnostic repair requirements.
-- **Archive Benchmark (`benchmark-archive-audit.ts`)**: Supports `--domain <host>` (manifest-backed lookup), `--repo <owner/repo>`, and `--root <path>` (publish root, defaults to manifest or `.`), with default target `cfpages-adistyputriharli/Concrete.co.id`. Measures true cryptographic candidate parity, selective blob vs. tarball response body bytes, and peak RSS.
+- **Archive Benchmark (`benchmark-archive-audit.ts`)**: Supports `--domain <host>` (manifest-backed lookup), `--repo <owner/repo>`, and `--root <path>` (publish root, defaults to manifest or `.`), with default target `cfpages-adistyputriharli/Concrete.co.id`. Measures true cryptographic candidate parity, selective blob vs. tarball response body bytes, and memory delta (end-minus-start RSS).
 - D1 target defaults to `--remote` (`open-seo-db-selfhost`); pass `--local` for local D1 (`DB`).
 ```powershell
 # Audit a single property by exact domain directly from its GitHub repository (Selective Blob Lane)
@@ -370,12 +370,16 @@ try {
 - **UI Route**: `/p/:projectId/rank-tracking`
 - **MCP Tools**: `create_rank_tracker`, `add_rank_tracking_keywords`, `estimate_rank_tracker_cost`, `run_rank_tracker`, `get_rank_tracker`
 - **Workflow**:
-  1. Create tracker (project ID must be a valid UUID; capture returned `trackerId`):
+  1. Create tracker (obtain `projectId` from `list_projects`; capture returned `trackerId`):
      ```ts
+     // Resolve active project ID from list_projects
+     const projectsRes = await client.callTool({ name: "list_projects", arguments: {} });
+     const projectId = projectsRes.structuredContent?.projects?.[0]?.id || "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b";
+
      const createRes = await client.callTool({
        name: "create_rank_tracker",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId,
          domain: "kaca.co.id",
          locationCode: 2360,
          languageCode: "id"
@@ -389,7 +393,7 @@ try {
      const estResult = await client.callTool({
        name: "estimate_rank_tracker_cost",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId,
          trackerId,
          additionalKeywords: ["kaca tempered surabaya", "partisi kaca"]
        }
@@ -404,7 +408,7 @@ try {
      await client.callTool({
        name: "add_rank_tracking_keywords",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId,
          trackerId,
          keywords: ["kaca tempered surabaya", "partisi kaca"],
          ...(scheduledCredits ? { maxEstimatedScheduledCheckCredits: scheduledCredits } : {})
@@ -416,7 +420,7 @@ try {
      await client.callTool({
        name: "run_rank_tracker",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId,
          trackerId,
          maxCostCredits: costCredits
        }
@@ -427,7 +431,7 @@ try {
      await client.callTool({
        name: "get_rank_tracker",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId,
          trackerId
        }
      });
@@ -442,7 +446,7 @@ try {
      const estimate = await client.callTool({
        name: "estimate_ai_visibility_cost",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          patch: {
            engines: ["chatgpt", "perplexity"],
            prompts: [{ text: "kontraktor kaca terbaik surabaya" }]
@@ -461,7 +465,7 @@ try {
      await client.callTool({
        name: "save_ai_visibility_tracker",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          engines: ["chatgpt", "perplexity"],
          prompts: [{ text: "kontraktor kaca terbaik surabaya" }]
        }
@@ -472,7 +476,7 @@ try {
      const schedRes = await client.callTool({
        name: "set_ai_visibility_schedule",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          enabled: true,
          scheduleInterval: "weekly",
          scheduleTime: { weekday: 1, hour: 9, minute: 0, timeZone: "Asia/Jakarta" }
@@ -484,7 +488,7 @@ try {
        await client.callTool({
          name: "get_ai_visibility_run",
          arguments: {
-           projectId: "00000000-0000-0000-0000-000000000001",
+           projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
            runId: baselineRun.id
          }
        });
@@ -495,7 +499,7 @@ try {
      await client.callTool({
        name: "run_ai_visibility_check",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          maxCostUsd: runNowUsd
        }
      });
@@ -506,38 +510,38 @@ try {
 - **MCP Tools**: `get_search_console_performance`, `inspect_urls`
 - **Prerequisite**: Google OAuth connected in project settings with GSC property bound (`sc-domain:kaca.co.id`).
 - **Workflow**:
-  1. Query metrics: `get_search_console_performance({ projectId: "00000000-0000-0000-0000-000000000001", startDate: "2026-10-01", endDate: "2026-11-20", dimensions: ["query", "page"] })`.
-  2. Inspect index status: `inspect_urls({ projectId: "00000000-0000-0000-0000-000000000001", urls: ["https://kaca.co.id/produk/"] })`.
+  1. Query metrics: `get_search_console_performance({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", startDate: "2026-10-01", endDate: "2026-11-20", dimensions: ["query", "page"] })`.
+  2. Inspect index status: `inspect_urls({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", urls: ["https://kaca.co.id/produk/"] })`.
 
 ### Playbook 6D: Google Analytics 4 Organic Overview (`/ga4-overview`)
 - **UI Route**: `/p/:projectId/settings/integrations#google-analytics`
 - **MCP Tools**: `get_google_analytics_organic_overview`
 - **Prerequisite**: GA4 property ID bound (`properties/<id>`).
 - **Workflow**:
-  1. Fetch organic acquisition and engagement: `get_google_analytics_organic_overview({ projectId: "00000000-0000-0000-0000-000000000001", startDate: "2026-10-01", endDate: "2026-11-20" })`.
+  1. Fetch organic acquisition and engagement: `get_google_analytics_organic_overview({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", startDate: "2026-10-01", endDate: "2026-11-20" })`.
 
 ### Playbook 6E: Backlinks & Domain Intelligence (`/domain`, `/backlinks`)
 - **UI Route**: `/p/:projectId/domain` and `/p/:projectId/backlinks`
 - **MCP Tools**: `get_backlinks_overview`, `get_backlinks_profile`
 - **Workflow**:
-  1. Overview: `get_backlinks_overview({ projectId: "00000000-0000-0000-0000-000000000001", target: "kaca.co.id" })`.
-  2. Detailed referring domains and anchors: `get_backlinks_profile({ projectId: "00000000-0000-0000-0000-000000000001", target: "kaca.co.id", pageSize: 50, page: 1 })`.
+  1. Overview: `get_backlinks_overview({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", target: "kaca.co.id" })`.
+  2. Detailed referring domains and anchors: `get_backlinks_profile({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", target: "kaca.co.id", pageSize: 50, page: 1 })`.
 
 ### Playbook 6F: Executive SEO Reports & Sharing (`/reports`)
 - **UI Route**: `/p/:projectId/reports`
 - **MCP Tools**: `list_report_templates`, `list_reports`, `save_report`, `get_report`, `set_report_sharing`
 - **Workflow**:
   1. List available report templates: `list_report_templates({})`.
-  2. List existing reports: `list_reports({ projectId: "00000000-0000-0000-0000-000000000001" })`.
-  3. Save complete audit report: `save_report({ projectId: "00000000-0000-0000-0000-000000000001", title: "Q4 2026 Technical Audit", summary: "Executive technical audit summary for Q4", html: "<!DOCTYPE html><html><head><title>Q4 Audit</title></head><body><h1>Audit Report</h1></body></html>" })`.
-  4. Read back report: `get_report({ projectId: "00000000-0000-0000-0000-000000000001", reportId: "00000000-0000-0000-0000-000000000002" })`.
+  2. List existing reports: `list_reports({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b" })`.
+  3. Save complete audit report: `save_report({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", title: "Q4 2026 Technical Audit", summary: "Executive technical audit summary for Q4", html: "<!DOCTYPE html><html><head><title>Q4 Audit</title></head><body><h1>Audit Report</h1></body></html>" })`.
+  4. Read back report: `get_report({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", reportId: "c3d6e5f2-8e4a-4f0c-9d2b-6a7b8c9d0e1f" })`.
   5. (Hosted Only) Operator-Authorized Public Sharing:
      Explicit operator confirmation is required prior to public disclosure:
      ```ts
      // Enable public sharing
-     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "00000000-0000-0000-0000-000000000001", reportId: "00000000-0000-0000-0000-000000000002", public: true } });
+     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", reportId: "c3d6e5f2-8e4a-4f0c-9d2b-6a7b8c9d0e1f", public: true } });
      // Revoke public sharing
-     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "00000000-0000-0000-0000-000000000001", reportId: "00000000-0000-0000-0000-000000000002", public: false } });
+     await client.callTool({ name: "set_report_sharing", arguments: { projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", reportId: "c3d6e5f2-8e4a-4f0c-9d2b-6a7b8c9d0e1f", public: false } });
      ```
 
 ### Playbook 6G: Project Setup & Brand Onboarding (`/projects`, `/settings`)
@@ -603,7 +607,7 @@ try {
      const res = await client.callTool({
        name: "research_keywords",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          seeds: [{ seed: "cubicle toilet surabaya", locationCode: 2360, languageCode: "id" }],
          resultLimit: 150
        }
@@ -614,7 +618,7 @@ try {
      const serp = await client.callTool({
        name: "get_serp_results",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          queries: [{ keyword: "cubicle toilet surabaya", locationCode: 2360, languageCode: "id" }]
        }
      });
@@ -624,7 +628,7 @@ try {
      await client.callTool({
        name: "save_keywords",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          keywords: ["cubicle toilet surabaya", "partisi toilet phenolic"]
        }
      });
@@ -639,7 +643,7 @@ try {
      const businesses = await client.callTool({
        name: "search_local_businesses",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          query: "Toilet Cubicle Surabaya",
          near: { latitude: -7.2575, longitude: 112.7521, radiusKm: 10 }
        }
@@ -650,7 +654,7 @@ try {
      const grid = await client.callTool({
        name: "get_local_rank_grid",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          keyword: "partisi toilet",
          target: { name: "Toilet Cubicle Surabaya" },
          center: { latitude: -7.2575, longitude: 112.7521 },
@@ -662,15 +666,15 @@ try {
 
 ### Playbook 6J: Audit Follow-Through & Granular Issue Inspection (`/audit`)
 - **UI Route**: `/p/:projectId/audit?auditId=:auditId`
-- **MCP Tools**: `get_audit_status`, `get_audit_issues`, `get_audit_pages`
+- **MCP Tools**: `get_audit_status`, `get_audit_issues`, `get_audit_pages`, `list_site_audits`, `delete_site_audit`
 - **Workflow**:
   1. Inspect running or completed crawl progress (status object wrapped in structuredContent.status):
      ```ts
      const statusRes = await client.callTool({
        name: "get_audit_status",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
-         auditId: "00000000-0000-0000-0000-000000000003"
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
+         auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a"
        }
      });
      const status = statusRes.structuredContent?.status;
@@ -681,8 +685,8 @@ try {
      const issues = await client.callTool({
        name: "get_audit_issues",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
-         auditId: "00000000-0000-0000-0000-000000000003",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
+         auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a",
          severity: "critical",
          limit: 50
        }
@@ -693,9 +697,29 @@ try {
      const pages = await client.callTool({
        name: "get_audit_pages",
        arguments: {
-         projectId: "00000000-0000-0000-0000-000000000001",
-         auditId: "00000000-0000-0000-0000-000000000003",
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
+         auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a",
          limit: 50
+       }
+     });
+     ```
+  4. List project audits newest first (uses no credits):
+     ```ts
+     const auditList = await client.callTool({
+       name: "list_site_audits",
+       arguments: {
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b"
+       }
+     });
+     ```
+  5. Delete audit and release capacity:
+     ```ts
+     // Requires owner or admin authorization. If the audit is running, terminates the associated Cloudflare Workflow instance before deletion.
+     await client.callTool({
+       name: "delete_site_audit",
+       arguments: {
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
+         auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a"
        }
      });
      ```

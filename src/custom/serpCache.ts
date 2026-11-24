@@ -8,7 +8,10 @@
  */
 
 import type { DataforseoApiCallCost } from "@/server/lib/dataforseo/envelope";
-import { serpSnapshotItemSchema, type SerpLiveItem } from "@/server/lib/dataforseo/serp";
+import {
+  serpSnapshotItemSchema,
+  type SerpLiveItem,
+} from "@/server/lib/dataforseo/serp";
 import { z } from "zod";
 
 export interface SerpCacheParams {
@@ -27,12 +30,12 @@ export const CACHED_SERP_BILLING: DataforseoApiCallCost = {
 };
 
 /** Default cache time: 24 hours (86,400 seconds) */
-export const SERP_CACHE_TTL_SECONDS = 86_400;
+const SERP_CACHE_TTL_SECONDS = 86_400;
 
 /**
  * Computes a deterministic cache key for a SERP query.
  */
-export async function buildSerpCacheKey(
+async function buildSerpCacheKey(
   params: SerpCacheParams,
 ): Promise<string | null> {
   try {

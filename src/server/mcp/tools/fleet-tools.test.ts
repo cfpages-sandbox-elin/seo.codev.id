@@ -53,7 +53,9 @@ describe("Fleet MCP Tools", () => {
         toolContext,
       );
 
-      const data = getFleetIssuesTool.config.outputSchema.parse(result.structuredContent);
+      const data = getFleetIssuesTool.config.outputSchema.parse(
+        result.structuredContent,
+      );
       expect(data).toBeDefined();
       expect(data.totalIssues).toBe(2);
       expect(data.severityBreakdown.critical).toBe(1);
@@ -66,6 +68,21 @@ describe("Fleet MCP Tools", () => {
       expect(data.issues[1].source).toBe("repository");
       expect(data.issues[1].auditId).toBe("audit_2");
     });
+
+    it.each(["all", "both", "edge", "repository"] as const)(
+      "executes get_fleet_issues handler with source filter '%s' without SQL or projection error",
+      async (source) => {
+        const result = await getFleetIssuesTool.handler(
+          { limit: 10, source },
+          toolContext,
+        );
+        expect(result.structuredContent).toBeDefined();
+        const data = getFleetIssuesTool.config.outputSchema.parse(
+          result.structuredContent,
+        );
+        expect(data.totalIssues).toBe(2);
+      },
+    );
 
     it("validates canonical domain input in get_fleet_issues schema (Sol P2-08)", () => {
       const schema = getFleetIssuesTool.config.inputSchema;
@@ -102,7 +119,9 @@ describe("Fleet MCP Tools", () => {
         toolContext,
       );
 
-      const data = runFleetAuditTool.config.outputSchema.parse(result.structuredContent);
+      const data = runFleetAuditTool.config.outputSchema.parse(
+        result.structuredContent,
+      );
       expect(data.status).toBe("planned");
       expect(data.planId).toBeDefined();
       expect(data.planId).toMatch(/^plan_/);
@@ -117,7 +136,9 @@ describe("Fleet MCP Tools", () => {
         "--max-pages",
         "500",
       ]);
-      expect(data.executionCommand).toContain("run-github-fleet-audit.ts --domain kaca.co.id --max-pages 500");
+      expect(data.executionCommand).toContain(
+        "run-github-fleet-audit.ts --domain kaca.co.id --max-pages 500",
+      );
     });
 
     it("generates execution command for edge workflow mode", async () => {
@@ -126,7 +147,9 @@ describe("Fleet MCP Tools", () => {
         toolContext,
       );
 
-      const data = runFleetAuditTool.config.outputSchema.parse(result.structuredContent);
+      const data = runFleetAuditTool.config.outputSchema.parse(
+        result.structuredContent,
+      );
       expect(data.status).toBe("planned");
       expect(data.planId).toBeDefined();
       expect(data.mode).toBe("edge_workflow");
@@ -141,7 +164,10 @@ describe("Fleet MCP Tools", () => {
     it("rejects caller outside shared-workspace organization (Sol F6)", async () => {
       const foreignContext = makeToolContext({ organizationId: "foreign_org" });
       await expect(
-        runFleetAuditTool.handler({ mode: "repository_direct" }, foreignContext),
+        runFleetAuditTool.handler(
+          { mode: "repository_direct" },
+          foreignContext,
+        ),
       ).rejects.toThrow(/shared-workspace/);
     });
 
@@ -158,7 +184,9 @@ describe("Fleet MCP Tools", () => {
       expect(schema.domain.safeParse("toiletcubicle.co.id").success).toBe(true);
       expect(schema.domain.safeParse("-invalid.com").success).toBe(false);
       expect(schema.domain.safeParse("invalid-.com").success).toBe(false);
-      expect(schema.domain.safeParse("a".repeat(255) + ".com").success).toBe(false);
+      expect(schema.domain.safeParse("a".repeat(255) + ".com").success).toBe(
+        false,
+      );
     });
   });
 });

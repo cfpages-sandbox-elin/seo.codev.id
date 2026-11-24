@@ -11,7 +11,7 @@
  *     error is copied into the row before Workflows retention deletes it.
  */
 import { env } from "cloudflare:workers";
-import { and, eq, lt } from "drizzle-orm";
+import { and, eq, lt, or, isNull, notLike } from "drizzle-orm";
 import { db } from "@/db";
 import { audits, projects } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
@@ -50,6 +50,9 @@ export async function reconcileRunningAudit(
   audit: RunningAudit,
 ): Promise<AuditErrorInfo | null> {
   if (!audit.workflowInstanceId) return null;
+  // Sol P1-05: Repository runner audits (workflow_instance_id LIKE 'github-audit-%') are executed out-of-band by the CLI runner,
+  // not by Cloudflare Workflows. Do not query Cloudflare Workflows for them.
+  if (audit.workflowInstanceId.startsWith("github-audit-")) return null;
 
   let errorInfo: AuditErrorInfo | null = null;
   try {
@@ -149,6 +152,10 @@ async function getStaleRunningAudits(cutoff: Date, limit: number) {
     where: and(
       eq(audits.status, "running"),
       lt(audits.startedAt, startedBefore),
+      or(
+        isNull(audits.workflowInstanceId),
+        notLike(audits.workflowInstanceId, "github-audit-%"),
+      ),
     ),
     orderBy: audits.startedAt,
     columns: {

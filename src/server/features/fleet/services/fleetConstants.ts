@@ -3,9 +3,9 @@ import { sort } from "remeda";
 export const FRESHNESS_WINDOW_MS = 10 * 86_400_000; // 10 days in milliseconds
 export const COMPARABLE_BASELINE_WINDOW_MS = 21 * 86_400_000; // 21 days in milliseconds
 
-export type FleetOfficialGrade = "A" | "B" | "C" | "D" | "F";
+type FleetOfficialGrade = "A" | "B" | "C" | "D" | "F";
 
-export const RUBRIC_V1_WEIGHTS = {
+const RUBRIC_V1_WEIGHTS = {
   technical: 35,
   mobilePerf: 15,
   schema: 10,
@@ -37,9 +37,9 @@ export function calculateMedian(scores: number[]): number | null {
   return Math.round(mean * 10) / 10;
 }
 
-export type Fraction = { n: bigint; d: bigint };
+type Fraction = { n: bigint; d: bigint };
 
-export function fraction(n: bigint, d: bigint): Fraction {
+function fraction(n: bigint, d: bigint): Fraction {
   if (d <= 0n) throw new RangeError("Expected a positive denominator");
   let a = n < 0n ? -n : n;
   let b = d;
@@ -47,22 +47,13 @@ export function fraction(n: bigint, d: bigint): Fraction {
   return { n: n / a, d: d / a };
 }
 
-export const addFractions = (a: Fraction, b: Fraction): Fraction =>
+const addFractions = (a: Fraction, b: Fraction): Fraction =>
   fraction(a.n * b.d + b.n * a.d, a.d * b.d);
 
-export const subtractFractions = (a: Fraction, b: Fraction): Fraction =>
-  fraction(a.n * b.d - b.n * a.d, a.d * b.d);
-
-export const multiplyFractions = (a: Fraction, b: Fraction): Fraction =>
+const multiplyFractions = (a: Fraction, b: Fraction): Fraction =>
   fraction(a.n * b.n, a.d * b.d);
 
-export const compareFractions = (a: Fraction, b: Fraction): bigint =>
-  a.n * b.d - b.n * a.d;
-
-export const capFraction = (value: Fraction, limit: Fraction): Fraction =>
-  compareFractions(value, limit) > 0n ? limit : value;
-
-export function numberToFraction(val: number): Fraction {
+function numberToFraction(val: number): Fraction {
   if (Number.isInteger(val)) {
     return { n: BigInt(val), d: 1n };
   }
@@ -166,4 +157,3 @@ export function computeCanonicalRubricV1Score(pillars: {
 
   return { numerator, exactScore, flooredScore, grade };
 }
-

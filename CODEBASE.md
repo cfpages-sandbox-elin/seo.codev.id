@@ -581,6 +581,23 @@ Remediated all findings from Engineer Sol's Round 5 and Round 6 reviews ([REPORT
   - Findings: 0 P0 blockers, 8 P1 findings (F01–F08), 5 P2 findings (F09–F13).
   - Clear architectural roadmap established to break through the $\ge 8.0$ threshold on all vectors in Round 12.
 
+### Round 12 & Round 13 Fleet Hardening Remediation Ledger (2026-11-24)
+
+- **Round 12 Review Valuation** ([REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-12-2026-11-24.md](file:///C:/Users/THINKPAD/OneDrive/MD/REPORT/REPORT-SOL-OPENSEO-FLEET-HARDENING-ROUND-12-2026-11-24.md)):
+  - Vector 1 (Architecture & Ingestion Integrity): **6.6 / 10.0**
+  - Vector 2 (Operational Accuracy & Skill Fidelity): **7.5 / 10.0** (▲ +0.3)
+  - Vector 3 (Shipped Fleet Tooling): **6.5 / 10.0**
+  - Vector 4 (Resilience, CAS, and D1 Parity): **5.5 / 10.0**
+  - Findings: 0 P0 blockers, 6 P1 findings (P1-01 through P1-06), 9 P2 findings.
+- **Round 13 Hardened Remediations Landed**:
+  - **P1-01 (Source Audit Reservation & Attempt Isolation)**: In `scripts/run-github-fleet-audit.ts`, check for active running audit for project before analysis; generate fresh attempt UUID v4 (`crypto.randomUUID()`) and reserve parent row with `status = 'running'` before any fetch/analysis; removed redundant post-analysis `INSERT ... ON CONFLICT DO UPDATE SET status = 'running'` that previously reopened completed audits on force runs; strict CAS finalization with child count assertions and failure fallback.
+  - **P1-02 (Roster Project Mapping Validation & Fail-Closed Admission)**: In `scripts/run-github-fleet-audit.ts`, joined `projects p ON p.id = m.project_id AND p.organization_id = v.organization_id AND p.archived_at IS NULL AND lower(trim(p.domain)) = lower(trim(m.canonical_host))` during candidate selection; verified `projectIdByDomain.get(host) === r.project_id`, failing closed on stale, unmapped, or mismatched projects.
+  - **P1-03 (Diagnostic Triple Scoped Verification & Strict Completed Reuse)**: In `scripts/run-github-fleet-audit.ts`, scoped `verifyDiagnosticTriple` subquery strictly to `fri.audit_id = '${auditId}' AND fri.member_id = '${memberId}' AND fr.roster_version_id = '${rosterId}' AND fri.primary_series_key = 'diagnostic'`, preventing historical triples from earlier roster versions from failing verification; required `r.status = 'completed' AND fri.status = 'completed'` in `completedAudits` reuse query.
+  - **P1-04 (MCP `get_fleet_issues` SQL Column Aliasing Fix)**: In `src/server/mcp/tools/fleet-tools.ts`, fixed `completedTimeFor(alias)` helper so that single subqueries bind `a2.completed_at`, while `both`/`all` subqueries explicitly bind `a_edge.completed_at` and `a_repo.completed_at` with zero unbound `a2` references; added unit tests in `fleet-tools.test.ts` covering all four source values.
+  - **P1-05 (Edge Watchdog & Reconciler Excluding Repository Audits)**: In `src/server/features/audit/services/auditReconciler.ts`, added immediate return for audits where `workflowInstanceId.startsWith("github-audit-")`, preventing Cloudflare Workflows watchdog from marking CLI repository audits as failed; excluded `github-audit-%` from `getStaleRunningAudits` query; added regression oracle test suite in `auditReconciler.test.ts`.
+  - **P1-06 (Parity Gate & HTML Base Analysis)**: In `src/server/lib/audit/page-analyzer.ts` and `page-analyzer.test.ts`, extracted `baseHref` in Cheerio reference implementation and resolved links against `effectiveBaseUrl`, bringing all 26 parity tests to 100% green; resolved empty base href handling; fixed Knip unused exports and types across the fleet codebase; formatted modified files with Prettier.
+  - **P2-05 & P2-06 (Skill Playbook Synchronization)**: In `.agents/skills/openseo-ops/SKILL.md` (and mirrored to OneDrive hub and user `.agents`), clarified that `link-github-fleet.ts` defaults to local D1 (`DB`), corrected RSS metric label to memory delta, used valid RFC 4122 v4 UUIDs across synthetic examples, and documented `list_site_audits` and `delete_site_audit` cleanup flows with exact audit ID, owner/admin authorization requirement, and running-workflow stop semantics.
+
 
 
 

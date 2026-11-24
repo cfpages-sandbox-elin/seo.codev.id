@@ -3,21 +3,13 @@ import type { RawFleetSnapshot } from "../repositories/FleetRepository";
 import type { SnapshotAttemptOverlay } from "./fleetObservations";
 import {
   FRESHNESS_WINDOW_MS,
-  COMPARABLE_BASELINE_WINDOW_MS,
   parseUtcTimestampMs,
   measuredPercent,
 } from "./fleetConstants";
 
-export {
-  FRESHNESS_WINDOW_MS,
-  COMPARABLE_BASELINE_WINDOW_MS,
-  parseUtcTimestampMs,
-  measuredPercent,
-};
-
 // PRD §3: Essential critical incidents eligible for 59/F score cap.
 // Note: Security challenges / provider blocking alone are excluded from essential caps (Sol R16 F02).
-export const ESSENTIAL_INCIDENT_CODES = new Set([
+const ESSENTIAL_INCIDENT_CODES = new Set([
   "dns_failure",
   "tls_invalid",
   "tcp_timeout",

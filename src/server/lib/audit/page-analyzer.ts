@@ -66,12 +66,11 @@ export function analyzeHtml(
   let effectiveBaseUrl = pageUrl;
 
   const updateEffectiveBase = (rawHref: string | undefined) => {
-    if (baseHref !== null || !rawHref) return;
+    if (baseHref !== null || rawHref === undefined) return;
     const trimmed = rawHref.trim();
-    if (!trimmed) return;
     baseHref = trimmed;
     try {
-      effectiveBaseUrl = new URL(trimmed, pageUrl).href;
+      effectiveBaseUrl = trimmed ? new URL(trimmed, pageUrl).href : pageUrl;
     } catch {
       effectiveBaseUrl = pageUrl;
     }

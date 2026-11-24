@@ -47,6 +47,18 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
   const bodyText = bodyClone.text().replace(/\s+/g, " ").trim();
   const wordCount = bodyText ? bodyText.split(/\s+/).length : 0;
 
+  const baseTag = $("base[href]").first();
+  const rawBase = baseTag.attr("href");
+  const baseHref = rawBase !== undefined ? rawBase.trim() : null;
+  let effectiveBaseUrl = pageUrl;
+  if (baseHref !== null) {
+    try {
+      effectiveBaseUrl = baseHref ? new URL(baseHref, pageUrl).href : pageUrl;
+    } catch {
+      effectiveBaseUrl = pageUrl;
+    }
+  }
+
   const images: Array<{ src: string | null; alt: string | null }> = [];
   $("img").each((_, el) => {
     images.push({
@@ -60,7 +72,7 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
     const href = $(el).attr("href");
     if (!href) return;
     if (/^(javascript:|mailto:|tel:|#)/.test(href)) return;
-    const resolved = normalizeUrl(href, pageUrl);
+    const resolved = normalizeUrl(href, effectiveBaseUrl);
     if (!resolved) return;
     if (linksByTarget.has(resolved)) return;
     const anchor = $(el).text().replace(/\s+/g, " ").trim().slice(0, 200);
@@ -92,6 +104,7 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
     title,
     metaDescription,
     canonical,
+    baseHref,
     robotsMeta,
     ogTitle,
     ogDescription,
@@ -206,6 +219,26 @@ describe("analyzeHtml parity with the DOM reference", () => {
       </p>
       <ul><li>four</li><li>five</li></ul>
     </body>`);
+  });
+
+  it("matches on documents with base href resolving relative links", () => {
+    expectParity(`<html><head>
+      <base href="https://example.com/subfolder/">
+      <title>Base Test</title>
+    </head><body>
+      <a href="page.html">Sub link</a>
+      <a href="/absolute.html">Absolute link</a>
+    </body></html>`);
+  });
+
+  it("matches with empty first base href preserving page url", () => {
+    expectParity(`<html><head>
+      <base href="">
+      <base href="https://other.com/">
+      <title>Empty Base Test</title>
+    </head><body>
+      <a href="page.html">Local link</a>
+    </body></html>`);
   });
 });
 

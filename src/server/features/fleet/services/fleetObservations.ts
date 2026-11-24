@@ -14,7 +14,7 @@ export interface SnapshotAttemptOverlay extends RawFleetSnapshot {
   rubricVersion?: string | null;
 }
 
-export interface AdmittedObservation {
+interface AdmittedObservation {
   snap: SnapshotAttemptOverlay;
   observedAtMs: number;
   parent: {

@@ -18,13 +18,6 @@ import {
   measuredPercent,
   gradeFor,
   calculateMedian,
-  RUBRIC_V1_WEIGHTS,
-  type FleetOfficialGrade,
-  fraction,
-  addFractions,
-  multiplyFractions,
-  numberToFraction,
-  type Fraction,
   computeCanonicalRubricV1Score,
 } from "./fleetConstants";
 
@@ -35,13 +28,6 @@ export {
   measuredPercent,
   gradeFor,
   calculateMedian,
-  RUBRIC_V1_WEIGHTS,
-  type FleetOfficialGrade,
-  fraction,
-  addFractions,
-  multiplyFractions,
-  numberToFraction,
-  type Fraction,
   computeCanonicalRubricV1Score,
 } from "./fleetConstants";
 
@@ -49,7 +35,6 @@ export {
   parseIncidentConfirmation,
   computeProvisionalRange,
   computeVerifiedComparisonKey,
-  isValidVerifiedComparabilityKey,
   type ProvisionalRange,
 } from "./fleetEvidence";
 
