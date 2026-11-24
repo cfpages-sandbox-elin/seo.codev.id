@@ -30,6 +30,9 @@ import {
   isValidRepoSlug,
   discoverGitHubTree,
   resolveGitHubHead,
+  fetchGitHubTree,
+  type GitHubHeadDescriptor,
+  sqlText,
   selectEffectiveRosterVersion,
   executeD1SqlBatches,
   acquireVerifiedBlob,
@@ -337,13 +340,35 @@ export function findMatchingCompletedAudit(
   };
 }
 
+function bareHost(host: string): string {
+  return host.toLowerCase().trim().replace(/^www\./, "");
+}
+
+function isAdmissibleInternalLink(
+  targetUrl: string,
+  canonicalHost: string,
+): boolean {
+  try {
+    const target = new URL(targetUrl);
+    const defaultWebPort =
+      (target.protocol === "http:" || target.protocol === "https:") &&
+      target.port === "";
+    return (
+      defaultWebPort &&
+      bareHost(target.hostname) === bareHost(canonicalHost)
+    );
+  } catch {
+    return false;
+  }
+}
+
 async function auditRepository(
   mapping: RepoMapping,
+  head: GitHubHeadDescriptor,
+  treeItems: GitTreeItem[],
   maxPages = 10000,
   useArchive = false,
   isRemote = true,
-  isForce = false,
-  headInfo?: { branch: string; commitSha: string; tree?: GitTreeItem[] } | null,
 ): Promise<boolean> {
   const { domain, repoName, projectId } = mapping;
   if (!projectId) {
@@ -355,53 +380,12 @@ async function auditRepository(
   console.log(`Auditing ${domain} directly from GitHub repo ${repoName}`);
   console.log(`======================================================`);
 
-  // 1. Resolve default branch and immutable commit SHA via shell-free discovery (Sol P1-04, A5)
-  let defaultBranch = headInfo?.branch ?? "main";
-  let commitSha = headInfo?.commitSha ?? "";
-  let treeItems: GitTreeItem[] = headInfo?.tree ?? [];
+  const defaultBranch = head.branch;
+  const commitSha = head.commitSha;
   const isTreeTruncated = false;
-
-  try {
-    if (!commitSha || treeItems.length === 0) {
-      const discovered = discoverGitHubTree(repoName);
-      defaultBranch = discovered.defaultBranch;
-      commitSha = discovered.commitSha;
-      treeItems = discovered.tree;
-    }
-    console.log(
-      `Pinned commit: ${commitSha.slice(0, 10)} (branch: ${defaultBranch})`,
-    );
-
-    if (!isForce) {
-      const normalizedRoot = mapping.publishRoot ?? ".";
-      const existingMatch = findMatchingCompletedAudit(
-        projectId,
-        repoName,
-        normalizedRoot,
-        commitSha,
-        null,
-        isRemote,
-      );
-      if (existingMatch) {
-        if (existingMatch.hasDiagnostic) {
-          console.log(
-            `[REUSED] Project ${domain} already has a verified completed audit for commit ${commitSha.slice(0, 10)}. Use --force to re-audit.`,
-          );
-          return true;
-        } else {
-          console.log(
-            `[NEEDS REPAIR] Existing audit ${existingMatch.id} for ${domain} at commit ${commitSha.slice(0, 10)} lacks verified diagnostic snapshot. Proceeding to repair...`,
-          );
-        }
-      }
-    }
-  } catch (err: any) {
-    console.error(
-      `Failed to fetch git tree for ${repoName}:`,
-      err?.message || err,
-    );
-    return false;
-  }
+  console.log(
+    `Pinned commit: ${commitSha.slice(0, 10)} (branch: ${defaultBranch}, tree: ${head.treeSha.slice(0, 10)})`,
+  );
 
   // 2. Build comprehensive unified route index with collision detection & served identity admission (Sol F01, F02)
   const publishRoot = mapping.publishRoot ?? ".";
@@ -578,22 +562,13 @@ async function auditRepository(
     aliasToCanonicalUrl.set(normalizeRoute(`/${encoded}`), pageUrl);
   }
 
-  // Handle force restart or stale recovery (> 2 hours old without completion) strictly for repository-lane audits
-  if (isForce) {
-    executeD1SqlStatements(
-      [
-        `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'force_restarted', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%';`,
-      ],
-      isRemote,
-    );
-  } else {
-    executeD1SqlStatements(
-      [
-        `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2;`,
-      ],
-      isRemote,
-    );
-  }
+  // Handle stale recovery (> 2 hours old without completion) strictly for repository-lane audits (Sol R3)
+  executeD1SqlStatements(
+    [
+      `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2;`,
+    ],
+    isRemote,
+  );
 
   // Sol P1-01, P2-07: Generate unique attempt ID (v4 UUID) and reserve row before acquiring blobs or archive
   const auditId = crypto.randomUUID();
@@ -602,14 +577,16 @@ async function auditRepository(
 
   const configJson = JSON.stringify({
     source: "github_repository_direct",
+    configVersion: 2,
     repoName,
     branch: defaultBranch,
     commitSha,
+    treeSha: head.treeSha,
     publishRoot: mapping.publishRoot ?? ".",
     maxPages,
     totalFiles: htmlFiles.length,
     treeTruncated: isTreeTruncated,
-  }).replace(/'/g, "''");
+  });
 
   // Reserve audit attempt in D1 conditionally — fails atomically if an active running repository audit already exists
   executeD1SqlStatements(
@@ -621,7 +598,7 @@ async function auditRepository(
     )
     SELECT
       '${auditId}', '${projectId}', 'system', 'https://${domain}',
-      'github-audit-${auditId}', '${configJson}', 'running', 0,
+      'github-audit-${auditId}', ${sqlText(configJson)}, 'running', 0,
       ${htmlFiles.length}, 0, 'analyzing', '${startedAtIso}'
     WHERE NOT EXISTS (
       SELECT 1 FROM audits
@@ -752,12 +729,16 @@ async function auditRepository(
               (img) => !img.alt || img.alt.trim() === "",
             ).length,
             images: analysis.images,
-            links: analysis.links,
+            links: analysis.links.map((l) => ({
+              ...l,
+              isInternal: isAdmissibleInternalLink(l.targetUrl, domain),
+            })),
             hreflangTags: analysis.hreflangTags,
             hasStructuredData: analysis.hasStructuredData,
             isIndexable: !analysis.robotsMeta
               ?.toLowerCase()
               .includes("noindex"),
+            javascriptShell: analysis.javascriptShell,
             crawlDepth: 0,
             inSitemap: false,
           };
@@ -770,67 +751,47 @@ async function auditRepository(
           );
           detectedIssues.push(...issues);
 
-          // Check internal links using unified route owner index and apex/www equivalence (Sol F02)
-          let effectiveBaseUrl = new URL(pageUrl);
-          const baseMatch = html.match(/<base\s+[^>]*href=["']([^"']+)["']/i);
-          if (baseMatch && baseMatch[1]) {
-            try {
-              effectiveBaseUrl = new URL(baseMatch[1].trim(), effectiveBaseUrl);
-            } catch {}
-          }
-
-          for (const link of analysis.links) {
-            if (link.targetUrl) {
+          // Check internal links using unified route owner index and apex/www equivalence (Sol F02, A3)
+          for (const link of pageResult.links) {
+            if (link.targetUrl && link.isInternal) {
               try {
                 const target = new URL(link.targetUrl);
-                const targetHost = target.hostname
-                  .toLowerCase()
-                  .replace(/^www\./, "");
-                const domainHost = domain.toLowerCase().replace(/^www\./, "");
-                const isInternal =
-                  targetHost === domainHost &&
-                  (target.port === "" ||
-                    target.port === "80" ||
-                    target.port === "443");
-
-                if (isInternal) {
-                  const normTarget = normalizeRoute(
-                    `https://${domain}${target.pathname}`,
-                  );
-                  const res = resolveRoute(normTarget);
-                  if (res.kind === "known") {
-                    const owner = res.owner;
-                    if (owner.kind === "page") {
-                      if (owner.pageUrl !== pageUrl) {
-                        inboundLinkCounts.set(
-                          owner.pageUrl,
-                          (inboundLinkCounts.get(owner.pageUrl) || 0) + 1,
-                        );
-                      }
+                const normTarget = normalizeRoute(
+                  `https://${domain}${target.pathname}`,
+                );
+                const res = resolveRoute(normTarget);
+                if (res.kind === "known") {
+                  const owner = res.owner;
+                  if (owner.kind === "page") {
+                    if (owner.pageUrl !== pageUrl) {
+                      inboundLinkCounts.set(
+                        owner.pageUrl,
+                        (inboundLinkCounts.get(owner.pageUrl) || 0) + 1,
+                      );
                     }
-                  } else if (res.kind === "ambiguous") {
-                    // Credit inbound edge to possible candidates so neither is falsely orphaned
-                    for (const cand of res.candidates) {
-                      if (cand.kind === "page" && cand.pageUrl !== pageUrl) {
-                        inboundLinkCounts.set(
-                          cand.pageUrl,
-                          (inboundLinkCounts.get(cand.pageUrl) || 0) + 1,
-                        );
-                      }
-                    }
-                  } else if (
-                    !isTreeTruncated &&
-                    candidateFiles.length === htmlFiles.length
-                  ) {
-                    // Internal dead link confirmed only when tree is complete
-                    detectedIssues.push({
-                      issueType: "broken-internal-link",
-                      pageId,
-                      pageUrl,
-                      dedupeKey: link.targetUrl,
-                      details: { targetUrl: link.targetUrl },
-                    });
                   }
+                } else if (res.kind === "ambiguous") {
+                  // Credit inbound edge to possible candidates so neither is falsely orphaned
+                  for (const cand of res.candidates) {
+                    if (cand.kind === "page" && cand.pageUrl !== pageUrl) {
+                      inboundLinkCounts.set(
+                        cand.pageUrl,
+                        (inboundLinkCounts.get(cand.pageUrl) || 0) + 1,
+                      );
+                    }
+                  }
+                } else if (
+                  !isTreeTruncated &&
+                  candidateFiles.length === htmlFiles.length
+                ) {
+                  // Internal dead link confirmed only when tree is complete
+                  detectedIssues.push({
+                    issueType: "broken-internal-link",
+                    pageId,
+                    pageUrl,
+                    dedupeKey: link.targetUrl,
+                    details: { targetUrl: link.targetUrl },
+                  });
                 }
               } catch {}
             }
@@ -939,8 +900,6 @@ async function auditRepository(
         ogImageBytes: number;
       },
     ): string {
-      const esc = (val: string | null | undefined) =>
-        val ? `'${val.replace(/'/g, "''")}'` : "NULL";
       const title = boundUtf8Bytes(p.title, limits.titleBytes, 500);
       const metaDesc = boundUtf8Bytes(p.metaDescription, limits.descBytes, 1000);
       const canonical = limits.canonicalBytes > 0
@@ -962,11 +921,11 @@ async function auditRepository(
           external_link_count, has_structured_data, is_indexable, crawl_depth, in_sitemap, response_time_ms
         )
         SELECT
-          '${p.id}', '${targetAuditId}', '${p.url.replace(/'/g, "''")}', NULL, '${p.fetchClass}',
-          ${esc(title)}, ${esc(metaDesc)}, ${esc(canonical)}, ${esc(robots)},
-          ${esc(ogTitle)}, ${esc(ogDesc)}, ${esc(ogImage)},
+          '${p.id}', '${targetAuditId}', ${sqlText(p.url)}, NULL, ${sqlText(p.fetchClass)},
+          ${sqlText(title)}, ${sqlText(metaDesc)}, ${sqlText(canonical)}, ${sqlText(robots)},
+          ${sqlText(ogTitle)}, ${sqlText(ogDesc)}, ${sqlText(ogImage)},
           ${p.h1Count}, ${p.h2Count}, ${p.h3Count}, ${p.h4Count}, ${p.h5Count}, ${p.h6Count},
-          ${p.wordCount}, ${esc(p.contentHash)}, ${p.imagesTotal}, ${p.imagesMissingAlt},
+          ${p.wordCount}, ${sqlText(p.contentHash)}, ${p.imagesTotal}, ${p.imagesMissingAlt},
           ${p.links.filter((l) => l.isInternal).length}, ${p.links.filter((l) => !l.isInternal).length},
           ${p.hasStructuredData ? 1 : 0}, ${p.isIndexable ? 1 : 0}, NULL, 0, NULL
         WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${targetAuditId}' AND status = 'running')
@@ -1054,16 +1013,13 @@ async function auditRepository(
       );
       const severity = getIssueDescriptor(issue.issueType)?.severity || "info";
       const boundedDetails = boundIssueDetails(issue.details, 3499);
-      const detailsSql = boundedDetails
-        ? `'${boundedDetails.replace(/'/g, "''")}'`
-        : "NULL";
       issueSqlLines.push(`
         INSERT INTO audit_issues (
           id, audit_id, issue_type, severity, page_id, page_url, details_json
         )
         SELECT
-          '${issueId}', '${auditId}', '${issue.issueType}', '${severity}', ${issue.pageId ? `'${issue.pageId}'` : "NULL"},
-          '${issue.pageUrl.replace(/'/g, "''")}', ${detailsSql}
+          '${issueId}', '${auditId}', ${sqlText(issue.issueType)}, ${sqlText(severity)}, ${issue.pageId ? `'${issue.pageId}'` : "NULL"},
+          ${sqlText(issue.pageUrl)}, ${sqlText(boundedDetails)}
         WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${auditId}' AND status = 'running')
           AND (${issue.pageId ? `EXISTS (SELECT 1 FROM audit_pages WHERE id = '${issue.pageId}' AND audit_id = '${auditId}')` : "1=1"})
         ON CONFLICT(id) DO NOTHING;
@@ -1516,7 +1472,8 @@ type FleetAction =
   | {
       kind: "audit";
       mapping: RepoMapping;
-      headInfo?: { branch: string; commitSha: string; tree?: GitTreeItem[] } | null;
+      head: GitHubHeadDescriptor;
+      tree: GitTreeItem[];
     };
 
 async function main() {
@@ -1715,22 +1672,13 @@ async function main() {
       process.exit(1);
     }
 
-    let headInfo: { branch: string; commitSha: string } | null = null;
-    try {
-      headInfo = resolveGitHubHead(repoMeta.repoName);
-    } catch (e: any) {
-      console.warn(
-        `Could not resolve git head for ${repoMeta.repoName}:`,
-        e?.message,
-      );
-    }
-
-    const matchingAudit = headInfo
+    const head = resolveGitHubHead(repoMeta.repoName);
+    const matchingAudit = !force
       ? findMatchingCompletedAudit(
           projId,
           repoMeta.repoName,
           repoMeta.publishRoot ?? ".",
-          headInfo.commitSha,
+          head.commitSha,
           effectiveRoster?.id ?? null,
           isRemote,
         )
@@ -1747,19 +1695,24 @@ async function main() {
         });
       } else {
         console.log(
-          `[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit matching ${repoMeta.repoName} at commit ${headInfo?.commitSha.slice(0, 10)}. Use --force to re-audit.`,
+          `[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit matching ${repoMeta.repoName} at commit ${head.commitSha.slice(0, 10)}. Use --force to re-audit.`,
         );
         return;
       }
     } else {
+      const discovered = fetchGitHubTree(head);
       plannedActions.push({
         kind: "audit",
         mapping: { ...repoMeta, projectId: projId },
-        headInfo,
+        head,
+        tree: discovered.tree,
       });
     }
   } else {
     for (const [dom, m] of repoMappings.entries()) {
+      if (limit !== undefined && plannedActions.length >= limit) {
+        break;
+      }
       const approvedMember = approvedMembersByHost.get(dom);
       const isEligible = isWorkspace || approvedHosts.has(dom);
       const projId =
@@ -1767,42 +1720,42 @@ async function main() {
           ? approvedMember.projectId
           : projectIdByDomain.get(dom);
       if (projId && isEligible) {
-        let headInfo: { branch: string; commitSha: string } | null = null;
-        if (!force) {
-          try {
-            headInfo = resolveGitHubHead(m.repoName);
-          } catch {}
-        }
+        try {
+          const head = resolveGitHubHead(m.repoName);
+          const matchingAudit = !force
+            ? findMatchingCompletedAudit(
+                projId,
+                m.repoName,
+                m.publishRoot ?? ".",
+                head.commitSha,
+                effectiveRoster?.id ?? null,
+                isRemote,
+              )
+            : null;
 
-        const matchingAudit = headInfo
-          ? findMatchingCompletedAudit(
-              projId,
-              m.repoName,
-              m.publishRoot ?? ".",
-              headInfo.commitSha,
-              effectiveRoster?.id ?? null,
-              isRemote,
-            )
-          : null;
-
-        if (!force && matchingAudit) {
-          const isRosterMember = approvedHosts.has(dom);
-          if (isRosterMember && !matchingAudit.hasDiagnostic) {
-            plannedActions.push({
-              kind: "repair",
-              domain: dom,
-              projectId: projId,
-              auditId: matchingAudit.id,
-            });
+          if (!force && matchingAudit) {
+            const isRosterMember = approvedHosts.has(dom);
+            if (isRosterMember && !matchingAudit.hasDiagnostic) {
+              plannedActions.push({
+                kind: "repair",
+                domain: dom,
+                projectId: projId,
+                auditId: matchingAudit.id,
+              });
+            } else {
+              continue; // Reused
+            }
           } else {
-            continue; // Reused
+            const discovered = fetchGitHubTree(head);
+            plannedActions.push({
+              kind: "audit",
+              mapping: { ...m, projectId: projId },
+              head,
+              tree: discovered.tree,
+            });
           }
-        } else {
-          plannedActions.push({
-            kind: "audit",
-            mapping: { ...m, projectId: projId },
-            headInfo,
-          });
+        } catch (e: any) {
+          console.warn(`[DISCOVERY SKIP] Skipping ${dom} (${m.repoName}): ${e?.message}`);
         }
       }
     }
@@ -1846,11 +1799,11 @@ async function main() {
       try {
         const ok = await auditRepository(
           c,
+          action.head,
+          action.tree,
           maxPages,
           !!args.values.archive,
           isRemote,
-          force,
-          action.headInfo,
         );
         if (ok) successCount++;
         else failCount++;

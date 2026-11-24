@@ -98,8 +98,8 @@ async function completeAudit(
     pagesCrawled: number;
     pagesTotal: number;
   },
-) {
-  await db
+): Promise<{ kind: "committed"; id: string } | { kind: "conflict" }> {
+  const [committed] = await db
     .update(audits)
     .set({
       status: "completed",
@@ -113,7 +113,12 @@ async function completeAudit(
         eq(audits.workflowInstanceId, workflowInstanceId),
         eq(audits.status, "running"),
       ),
-    );
+    )
+    .returning({ id: audits.id });
+
+  return committed
+    ? { kind: "committed", id: committed.id }
+    : { kind: "conflict" };
 }
 
 async function failAudit(

@@ -56,6 +56,7 @@ export function hashCanonicalRosterPlan(
       siteIntent: m.siteIntent,
       platform: m.platform,
       repoName: m.repoName ?? null,
+      publishRoot: m.publishRoot ?? ".",
       enrollmentState: "active",
     })),
   };
@@ -173,6 +174,7 @@ export async function importApprovedRoster(
           siteIntent: member.siteIntent,
           platform: member.platform,
           repoName: member.repoName ?? null,
+          publishRoot: member.publishRoot ?? ".",
           enrollmentState: "active",
           aliasesJson: "[]",
         });

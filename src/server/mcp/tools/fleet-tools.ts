@@ -114,8 +114,11 @@ export const getFleetIssuesTool = {
     const isPg = getDatabaseProvider() === "postgres";
     const completedTimeFor = (alias: string) =>
       isPg
-        ? sql.raw(`${alias}.completed_at::timestamp AT TIME ZONE 'UTC'`)
+        ? sql.raw(`${alias}.completed_at::timestamptz`)
         : sql.raw(`julianday(${alias}.completed_at)`);
+
+    const repoAuditSubquery = (alias: string) =>
+      sql`(SELECT ${sql.raw(alias)}.id FROM audits ${sql.raw(alias)} WHERE ${sql.raw(alias)}.project_id = ${projects.id} AND ${sql.raw(alias)}.status = 'completed' AND ${sql.raw(alias)}.workflow_instance_id LIKE 'github-audit-%' AND EXISTS (SELECT 1 FROM fleet_roster_members m JOIN fleet_run_items fri ON fri.audit_id = ${sql.raw(alias)}.id AND fri.member_id = m.id AND fri.project_id = ${projects.id} AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = ${projects.organizationId} AND fr.status = 'completed' JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = ${projects.id} AND fs.canonical_host = m.canonical_host AND fs.series_key = 'diagnostic' WHERE m.project_id = ${projects.id} AND m.canonical_host = ${projects.domain} AND m.enrollment_state = 'active') ORDER BY ${completedTimeFor(alias)} DESC NULLS LAST, ${sql.raw(alias)}.id DESC LIMIT 1)`;
 
     let auditSelectorCondition;
     if (source === "edge") {
@@ -124,12 +127,9 @@ export const getFleetIssuesTool = {
         sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' AND (a2.workflow_instance_id NOT LIKE 'github-audit-%' OR a2.workflow_instance_id IS NULL) ORDER BY ${completedTimeFor("a2")} DESC NULLS LAST, a2.id DESC LIMIT 1)`,
       );
     } else if (source === "repository") {
-      auditSelectorCondition = eq(
-        audits.id,
-        sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' AND a2.workflow_instance_id LIKE 'github-audit-%' AND EXISTS (SELECT 1 FROM fleet_snapshots fs JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed' WHERE fri.audit_id = a2.id AND fs.series_key = 'diagnostic') ORDER BY ${completedTimeFor("a2")} DESC NULLS LAST, a2.id DESC LIMIT 1)`,
-      );
+      auditSelectorCondition = eq(audits.id, repoAuditSubquery("a2"));
     } else {
-      auditSelectorCondition = sql`(${audits.id} = (SELECT a_edge.id FROM audits a_edge WHERE a_edge.project_id = ${projects.id} AND a_edge.status = 'completed' AND (a_edge.workflow_instance_id NOT LIKE 'github-audit-%' OR a_edge.workflow_instance_id IS NULL) ORDER BY ${completedTimeFor("a_edge")} DESC NULLS LAST, a_edge.id DESC LIMIT 1) OR ${audits.id} = (SELECT a_repo.id FROM audits a_repo WHERE a_repo.project_id = ${projects.id} AND a_repo.status = 'completed' AND a_repo.workflow_instance_id LIKE 'github-audit-%' AND EXISTS (SELECT 1 FROM fleet_snapshots fs JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed' WHERE fri.audit_id = a_repo.id AND fs.series_key = 'diagnostic') ORDER BY ${completedTimeFor("a_repo")} DESC NULLS LAST, a_repo.id DESC LIMIT 1))`;
+      auditSelectorCondition = sql`(${audits.id} = (SELECT a_edge.id FROM audits a_edge WHERE a_edge.project_id = ${projects.id} AND a_edge.status = 'completed' AND (a_edge.workflow_instance_id NOT LIKE 'github-audit-%' OR a_edge.workflow_instance_id IS NULL) ORDER BY ${completedTimeFor("a_edge")} DESC NULLS LAST, a_edge.id DESC LIMIT 1) OR ${audits.id} = ${repoAuditSubquery("a_repo")})`;
     }
 
     const conditions = [

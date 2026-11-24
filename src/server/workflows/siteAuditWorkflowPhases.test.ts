@@ -40,7 +40,9 @@ vi.mock("@/server/features/audit/repositories/AuditRepository", () => ({
     hasPagesForAudit: vi.fn().mockResolvedValue(true),
     insertIssues: vi.fn(),
     countPagesByFetchClass: vi.fn().mockResolvedValue(0),
-    completeAudit: vi.fn(),
+    completeAudit: vi
+      .fn()
+      .mockResolvedValue({ kind: "committed", id: "audit-1" }),
   },
 }));
 vi.mock("@/server/features/audit/AuditScratchpad", () => ({
@@ -62,10 +64,8 @@ vi.mock("@/server/workflows/siteAuditWorkflowCrawl", () => ({
 }));
 vi.mock("@/server/workflows/pgStep", () => ({ pgStep: pgStepMock }));
 
-import {
-  runAuditPhases,
-  runLighthousePhase,
-} from "@/server/workflows/siteAuditWorkflowPhases";
+import { runAuditPhases } from "@/server/workflows/siteAuditWorkflowPhases";
+import { runLighthousePhase } from "@/server/workflows/siteAuditWorkflowLighthouse";
 import { AuditRepository } from "@/server/features/audit/repositories/AuditRepository";
 import { getAuditScratchpad } from "@/server/features/audit/AuditScratchpad";
 import { runCrawlPhase } from "@/server/workflows/siteAuditWorkflowCrawl";

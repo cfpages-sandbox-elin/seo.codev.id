@@ -1,15 +1,15 @@
-import { and, eq, isNotNull, isNull } from "drizzle-orm";
+import { and, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import {
   projects,
-  fleetRosterVersions,
   fleetRosterMembers,
 } from "@/db/schema";
 import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { FLEET_MANIFEST_MEMBERS } from "@/server/features/fleet/data/fleetManifest";
+import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
 
 const CANONICAL_DOMAIN_REGEX =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
@@ -132,38 +132,7 @@ export const runFleetAuditTool = {
     }
 
     if (mode === "repository_direct") {
-      const rawRows = await db
-        .select({
-          id: fleetRosterVersions.id,
-          approvedAt: fleetRosterVersions.approvedAt,
-          domainCount: fleetRosterVersions.domainCount,
-        })
-        .from(fleetRosterVersions)
-        .where(
-          and(
-            eq(fleetRosterVersions.organizationId, orgId),
-            isNotNull(fleetRosterVersions.approvedAt),
-          ),
-        )
-        .limit(100);
-
-      const rosterRows = Array.isArray(rawRows) ? rawRows : [];
-      const nowMs = Date.now();
-      const validVersions = rosterRows.filter((v) => {
-        if (!v.approvedAt) return false;
-        const t = new Date(v.approvedAt).getTime();
-        return Number.isFinite(t) && t <= nowMs;
-      });
-
-      validVersions.sort((a, b) => {
-        const tA = new Date(a.approvedAt).getTime();
-        const tB = new Date(b.approvedAt).getTime();
-        const diff = tB - tA;
-        if (diff !== 0) return diff;
-        return b.id.localeCompare(a.id);
-      });
-
-      const effectiveRoster = validVersions[0] ?? null;
+      const effectiveRoster = await FleetRepository.getApprovedRoster(orgId);
       if (!effectiveRoster) {
         throw new Error(
           `No effective approved fleet roster found for repository_direct mode in organization '${orgId}'. An approved roster version with approvedAt <= now is required.`,

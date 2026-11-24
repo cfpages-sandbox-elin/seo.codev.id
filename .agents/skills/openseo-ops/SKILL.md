@@ -294,6 +294,15 @@ pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --json
 pnpm exec tsx scripts/fleet-issues.ts --csv fleet-issues.csv
 ```
 
+#### Shipped Sovereign Skill Remediation Routing Map (`src/server/lib/audit/issue-routing.ts`)
+| Issue Category / Type | Sovereign Skill Route | Operational Remediation Protocol |
+|---|---|---|
+| `canonical-mismatch`, `orphan-page`, `broken-internal-link` (page targets) | `/internal-linking` | Update internal link graph, add contextual breadcrumbs, resolve dead internal routes with live indexable URLs. |
+| Broken assets (CSS, JS, fonts), asset-like internal links | `/static-site-css-repair` | Verify static export assets, repair relative paths, fix missing CSS stylesheets and scripts. |
+| `missing-title`, `missing-meta-description`, `missing-h1`, `thin-content` | `/unslop-seo` | Strip AI writing fluff, inject 40-word direct answers, write unique high-density titles/meta descriptions. |
+| `slow-page`, `poor-lcp`, `poor-cls`, `high-tbt`, `crawl-rate-limited` | `/web-perf` | Optimize asset delivery, reduce bundle sizes, eliminate render-blocking resources. |
+| `broken-external-link`, `redirect-3xx`, `server-error-5xx`, default | `/seo-audit` | Replace or prune dead third-party outbound links, resolve origin HTTP 5xx responses. |
+
 ### Playbook 2D: Programmatic Fleet Operations via MCP
 ```typescript
 // Query fleet aggregated issues with skill routing (evaluates latest completed audit per active project, partitioned by source)
@@ -331,12 +340,18 @@ console.log("Execution argv:", auditPlan.structuredContent?.argv);
 pnpm exec tsx scripts/fleet-status.ts
 pnpm exec tsx scripts/fleet-status.ts --local
 
-# Reconcile local manifest and external inventory mappings against workspace projects and completed audit IDs queried via remote D1
-# Note: check-fleet-repos.ts queries remote D1 projects and audits directly; it makes ZERO live GitHub API calls.
-pnpm exec tsx scripts/check-fleet-repos.ts
+# Reconcile enrolled roster members against active projects and completed audit IDs via remote D1
+# check-fleet-repos.ts queries remote D1 projects and audits directly; it makes ZERO live GitHub API calls.
+pnpm exec tsx scripts/check-fleet-repos.ts --remote
+
+# Local D1 coverage check (human-readable)
+pnpm exec tsx scripts/check-fleet-repos.ts --local
+
+# Local D1 coverage check as JSON
+pnpm exec tsx scripts/check-fleet-repos.ts --local --json
 ```
 > [!NOTE]
-> The coverage panel considers the latest attempt per active workspace project with a domain. The overall audit totals and recent audit samples include active workspace projects. A fresh partial status can result from a partial attempt or insufficient evidence for an official grade; an interval is rendered only when reconciled evidence satisfies 80% <= coverage < 100% and bounds agree with earned mass (otherwise displayed as `—`). Full point scores require 100% evidence coverage. Status badge freshness (10-day TTL) and historical trend comparability (21-day window) operate independently of interval display eligibility.
+> The coverage report denominator evaluates enrolled active members of the effective approved roster version (`m.version_id = effectiveRoster.id AND m.enrollment_state = 'active'`). Properties in `exempt` or `parked` states remain in roster records but are excluded from active audit requirements, while `excluded` properties are kept outside the dashboard population entirely. A partial status can result from a partial attempt or insufficient evidence for an official grade; an interval is rendered only when reconciled evidence satisfies 80% <= coverage < 100% and bounds agree with earned mass (otherwise displayed as `—`). Full point scores require exactly 100% qualified evidence coverage. Status badge freshness (10-day TTL) and historical trend comparability (21-day window) operate independently of interval display eligibility.
 
 ### Playbook 3: Monitoring Workspace Audit Execution in Remote D1
 To inspect real-time crawler progress and audit state using workspace-scoped predicates:
@@ -396,7 +411,12 @@ try {
 ```
 
 > [!NOTE]
-> For origin service-to-service authentication, the worker verifier requires a signed `Cf-Access-Jwt-Assertion` header containing valid `sub` and `email` identity claims. For public client connections through Cloudflare Access edge, pass the authenticated session via the `Cookie: CF_Authorization=<token>` header. For local offline development and testing, the Vite web application runs on port `3001` (default), while the auxiliary audit worker and local MCP endpoint run under Wrangler dev on port `8787` (`http://127.0.0.1:8787/mcp`) with `AUTH_MODE=local_noauth` (zero Access headers required). Both bind to shared local D1 state in `.wrangler/state/v3/d1`.
+> **Authentication & Local Topology**:
+> - **Public Client Edge Access**: Pass authenticated Google SSO session via `Cookie: CF_Authorization=<token>` header to `https://seo.codev.id/mcp`.
+> - **Service-to-Service Origin Auth**: Pass a signed `Cf-Access-Jwt-Assertion` header containing valid `sub` and `email` identity claims.
+> - **Local Offline Development**:
+>   - **App UI & MCP Listener**: Start Vite app listener on port `3001` (`pnpm exec vite dev --port 3001`). The MCP endpoint is at `http://127.0.0.1:3001/mcp` with `AUTH_MODE=local_noauth` (zero Access headers required).
+>   - **Auxiliary Audit Worker**: Start auxiliary worker in a separate terminal on port `8787` (`pnpm exec wrangler dev --config wrangler.audit.jsonc --local --port 8787`). Reserved strictly for Cloudflare Workflows orchestration; its `fetch()` handler returns 404 and does NOT serve MCP traffic. Both processes bind to shared local D1 state in `.wrangler/state/v3/d1`.
 
 ---
 
@@ -731,7 +751,7 @@ try {
      const status = statusRes.structuredContent?.status;
      console.log(`Audit phase: ${status?.currentPhase}, crawled: ${status?.pagesCrawled}`);
      ```
-  2. Query issues filtered by severity:
+  2. Query issues filtered by severity or issue type (default limit 200, capped at 1,000; omitting `auditId` defaults to most recent completed audit):
      ```ts
      const issues = await client.callTool({
        name: "get_audit_issues",
@@ -739,18 +759,22 @@ try {
          projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a",
          severity: "critical",
-         limit: 50
+         issueType: "broken-internal-link",
+         limit: 200
        }
      });
      ```
-  3. Query crawled pages:
+  3. Query crawled pages (default limit 100, capped at 1,000; filterable by search substring, fetchClass, and statusCode):
      ```ts
      const pages = await client.callTool({
        name: "get_audit_pages",
        arguments: {
          projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a",
-         limit: 50
+         search: "/category",
+         fetchClass: "ok",
+         statusCode: 200,
+         limit: 100
        }
      });
      ```
@@ -768,6 +792,15 @@ try {
      // Requires owner or admin authorization. If the audit is running, terminates the associated Cloudflare Workflow instance before deletion.
      await client.callTool({
        name: "delete_site_audit",
+       arguments: {
+         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
+         auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a"
+       }
+     });
+     ```
+
+> [!NOTE]
+> **Crawler Access Credentials**: When a project requires authentication or custom request headers, configure crawler credentials via `save_crawler_credential`. Calling `start_site_audit` with `crawlerCredentialId` attaches the credential to the crawl, causing the crawler to replay authorization tokens automatically. The edge fleet CLI (`run-fleet-audits.ts`) passes `access: null` by default.
        arguments: {
          projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a"

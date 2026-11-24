@@ -50,9 +50,30 @@ export async function reconcileRunningAudit(
   audit: RunningAudit,
 ): Promise<AuditErrorInfo | null> {
   if (!audit.workflowInstanceId) return null;
-  // Sol P1-05: Repository runner audits (workflow_instance_id LIKE 'github-audit-%') are executed out-of-band by the CLI runner,
-  // not by Cloudflare Workflows. Do not query Cloudflare Workflows for them.
-  if (audit.workflowInstanceId.startsWith("github-audit-")) return null;
+  // Sol P1-05, R3: Repository runner audits (workflow_instance_id LIKE 'github-audit-%') are executed out-of-band by the CLI runner.
+  // If running longer than 2 hours, reclaim the abandoned reservation without querying Cloudflare Workflows.
+  if (audit.workflowInstanceId.startsWith("github-audit-")) {
+    const startedAtMs = new Date(audit.startedAt).getTime();
+    const GITHUB_AUDIT_TTL_MS = 2 * 60 * 60 * 1000;
+    if (Date.now() - startedAtMs > GITHUB_AUDIT_TTL_MS) {
+      const errorInfo: AuditErrorInfo = {
+        errorCode: "runner_timeout",
+        errorDetail:
+          "GitHub repository audit exceeded max run duration (2h) and was reclaimed.",
+      };
+      await AuditRepository.failAudit(
+        audit.id,
+        audit.workflowInstanceId,
+        {
+          errorCode: errorInfo.errorCode,
+          errorDetail: errorInfo.errorDetail,
+          failedPhase: audit.currentPhase ?? "analyzing",
+        },
+      );
+      return errorInfo;
+    }
+    return null;
+  }
 
   let errorInfo: AuditErrorInfo | null = null;
   try {

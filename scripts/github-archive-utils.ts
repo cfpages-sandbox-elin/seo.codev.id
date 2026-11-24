@@ -118,10 +118,20 @@ export interface DiscoveredGitTree {
  * Enforces literal argument arrays, URL segment encoding, commit SHA validation,
  * and fail-closed tree truncation checks.
  */
+export type GitHubHeadDescriptor = Readonly<{
+  repoName: string;
+  branch: string;
+  commitSha: string;
+  treeSha: string;
+}>;
+
+/**
+ * Resolves the repository default branch, pinned commit SHA, and immutable root tree SHA.
+ */
 export function resolveGitHubHead(
   repoName: string,
   options?: { branch?: string; timeoutMs?: number },
-): { branch: string; commitSha: string } {
+): GitHubHeadDescriptor {
   if (!isValidRepoSlug(repoName)) {
     throw new Error(
       `Invalid GitHub repository slug: "${repoName}". Must match owner/repo pattern.`,
@@ -146,7 +156,7 @@ export function resolveGitHubHead(
     branch = String(repoJson.default_branch || "main");
   }
 
-  // 2. Fetch pinned commit SHA for branch
+  // 2. Fetch pinned commit SHA and tree SHA for branch
   const commitRaw = execFileSync(
     ghExe,
     ["api", `${base}/commits/${encodeURIComponent(branch)}`],
@@ -158,32 +168,34 @@ export function resolveGitHubHead(
     },
   );
   const commitJson = JSON.parse(commitRaw);
-  const commitSha = commitJson.sha;
+  const commitSha = String(commitJson.sha || "");
   if (!/^[a-f0-9]{40}$/i.test(commitSha)) {
     throw new Error(`Invalid commit SHA returned by GitHub: ${commitSha}`);
   }
+  const treeSha = String(commitJson.commit?.tree?.sha || "");
+  if (!/^[a-f0-9]{40}$/i.test(treeSha)) {
+    throw new Error(`Invalid tree SHA returned by GitHub: ${treeSha}`);
+  }
 
-  return { branch, commitSha };
+  return { repoName, branch, commitSha, treeSha };
 }
 
 /**
- * Discover the repository default branch, pinned commit SHA, and recursive git tree.
+ * Fetch recursive git tree using immutable tree SHA from Head descriptor (Sol A1, Round 17).
  */
-export function discoverGitHubTree(
-  repoName: string,
-  options?: { branch?: string; timeoutMs?: number },
+export function fetchGitHubTree(
+  head: GitHubHeadDescriptor,
+  options?: { timeoutMs?: number },
 ): DiscoveredGitTree {
-  const { branch, commitSha } = resolveGitHubHead(repoName, options);
-
-  const [owner, repo] = repoName.split("/");
+  const [owner, repo] = head.repoName.split("/");
   const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   const ghExe = process.platform === "win32" ? "gh.exe" : "gh";
   const timeoutMs = options?.timeoutMs ?? 30_000;
 
-  // 3. Fetch recursive git tree for commit
+  // Fetch recursive git tree for commit by immutable tree SHA
   const treeRaw = execFileSync(
     ghExe,
-    ["api", `${base}/git/trees/${encodeURIComponent(commitSha)}?recursive=1`],
+    ["api", `${base}/git/trees/${encodeURIComponent(head.treeSha)}?recursive=1`],
     {
       encoding: "utf8",
       timeout: Math.max(timeoutMs, 60_000),
@@ -195,15 +207,31 @@ export function discoverGitHubTree(
   const treeJson = JSON.parse(treeRaw);
   if (treeJson.truncated) {
     throw new Error(
-      `DISCOVERY_TRUNCATED: Git tree for ${repoName} is truncated by GitHub (exceeds limit); recursive subtree enumeration required`,
+      `DISCOVERY_TRUNCATED: Git tree for ${head.repoName} is truncated by GitHub (exceeds limit); recursive subtree enumeration required`,
+    );
+  }
+  if (treeJson.sha && treeJson.sha.toLowerCase() !== head.treeSha.toLowerCase()) {
+    throw new Error(
+      `TREE_SHA_MISMATCH: Expected root tree SHA ${head.treeSha} but received ${treeJson.sha}`,
     );
   }
 
   return {
-    defaultBranch: branch,
-    commitSha,
+    defaultBranch: head.branch,
+    commitSha: head.commitSha,
     tree: treeJson.tree || [],
   };
+}
+
+/**
+ * Discover the repository default branch, pinned commit SHA, and recursive git tree.
+ */
+export function discoverGitHubTree(
+  repoName: string,
+  options?: { branch?: string; timeoutMs?: number },
+): DiscoveredGitTree {
+  const head = resolveGitHubHead(repoName, options);
+  return fetchGitHubTree(head, options);
 }
 
 /**
@@ -306,6 +334,18 @@ function windowsCommandUpperBound(argv: string[]) {
   // Quoting can at most double each character, plus surrounding quotes.
   const words = [process.execPath, ...argv];
   return words.reduce((size, word) => size + 2 * word.length + 2, words.length);
+}
+
+/**
+ * Literal Hex SQL Text Encoder (Sol R1, Round 17).
+ * Encodes strings into SQLite blob literals CAST(X'...' AS TEXT) to prevent
+ * Wrangler CLI local command trimmers from stripping keywords or failing on SQL syntax.
+ */
+export function sqlText(value: string | null | undefined): string {
+  if (value === null || value === undefined) {
+    return "NULL";
+  }
+  return "CAST(X'" + Buffer.from(value, "utf8").toString("hex") + "' AS TEXT)";
 }
 
 /**

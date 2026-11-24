@@ -38,6 +38,7 @@ const sampleMember: RawFleetMember = {
   siteIntent: "commercial",
   platform: "wordpress_static",
   repoName: "tukang-co-id",
+  publishRoot: ".",
   enrollmentState: "active",
   aliasesJson: "[]",
   createdAt: "2026-11-01T00:00:00.000Z",

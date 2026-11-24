@@ -6,7 +6,7 @@
  */
 import manifestData from "./fleetManifest.json";
 
-interface FleetManifestMember {
+export interface FleetManifestMember {
   canonicalHost: string;
   category: string;
   categoryEmoji: string;
@@ -14,12 +14,27 @@ interface FleetManifestMember {
   siteIntent: "commercial" | "lead_gen" | "brand" | "utility";
   platform: "wordpress_static" | "astro" | "react_spa" | "custom";
   repoName?: string;
+  publishRoot?: string;
+  clusterSlug?: string;
+}
+
+interface RawManifestMember {
+  canonicalHost: string;
+  category: string;
+  categoryEmoji: string;
+  tier?: string;
+  siteIntent?: string;
+  platform?: string;
+  repoName?: string;
+  publishRoot?: string;
   clusterSlug?: string;
 }
 
 export const FLEET_MANIFEST_VERSION = "2026-11-22-v1";
 
-export const FLEET_MANIFEST_MEMBERS: FleetManifestMember[] = manifestData.map(
+export const FLEET_MANIFEST_MEMBERS: FleetManifestMember[] = (
+  manifestData as RawManifestMember[]
+).map(
   (m): FleetManifestMember => ({
     canonicalHost: m.canonicalHost,
     category: m.category,
@@ -42,6 +57,7 @@ export const FLEET_MANIFEST_MEMBERS: FleetManifestMember[] = manifestData.map(
         ? m.platform
         : "custom",
     repoName: m.repoName,
+    publishRoot: m.publishRoot || ".",
     clusterSlug: m.clusterSlug,
   }),
 );

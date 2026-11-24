@@ -77,11 +77,14 @@ export function checkFleetCoverage(options?: {
     };
   }
 
-  // 2. Fetch members of the effective roster version
+  // 2. Fetch members of the effective roster version joined with active same-organization projects
   const members = runD1Query(
-    `SELECT rm.id, rm.canonical_host, rm.project_id, rm.repo_name, p.domain, p.name
+    `SELECT rm.id, rm.canonical_host, rm.project_id, rm.repo_name, rm.publish_root, p.domain, p.name
      FROM fleet_roster_members rm
-     LEFT JOIN projects p ON p.id = rm.project_id AND p.organization_id = 'shared-workspace' AND p.archived_at IS NULL
+     LEFT JOIN projects p ON p.id = rm.project_id
+                         AND p.organization_id = 'shared-workspace'
+                         AND p.archived_at IS NULL
+                         AND lower(trim(p.domain)) = lower(trim(rm.canonical_host))
      WHERE rm.version_id = '${effectiveRoster.id}';`,
     isRemote,
   ) as RosterMemberRow[];
@@ -127,35 +130,57 @@ export function checkFleetCoverage(options?: {
     } catch {}
   }
 
-  // 4. Query completed edge audits
+  // 4. Query completed edge audits bound to active roster members (Sol T1, Round 17)
   const edgeAudits = runD1Query(
-    "SELECT DISTINCT project_id FROM audits WHERE status = 'completed' AND (workflow_instance_id NOT LIKE 'github-audit-%' OR workflow_instance_id IS NULL) AND project_id IS NOT NULL;",
+    `SELECT DISTINCT rm.id AS member_id
+     FROM fleet_roster_members rm
+     JOIN projects p ON p.id = rm.project_id
+                    AND p.organization_id = 'shared-workspace'
+                    AND p.archived_at IS NULL
+                    AND lower(trim(p.domain)) = lower(trim(rm.canonical_host))
+     JOIN audits a ON a.project_id = p.id
+                  AND a.status = 'completed'
+                  AND (a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL)
+     WHERE rm.version_id = '${effectiveRoster.id}';`,
     isRemote,
   );
-  const edgeAuditedProjectIds = new Set(
-    edgeAudits.map((a: any) => a.project_id),
+  const edgeAuditedMemberIds = new Set(
+    edgeAudits.map((a: any) => a.member_id),
   );
 
-  // 5. Query qualified repository audits (Sol A3 / T1: requires verified diagnostic triple)
+  // 5. Query qualified repository audits bound to active roster members with verified diagnostic lineage (Sol T1, Round 17)
   const repoAudits = runD1Query(
-    `SELECT DISTINCT a.project_id
-     FROM audits a
-     WHERE a.status = 'completed'
-       AND a.workflow_instance_id LIKE 'github-audit-%'
-       AND a.project_id IS NOT NULL
-       AND EXISTS (
-         SELECT 1 FROM fleet_snapshots fs
-         JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed'
-         JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed'
-         WHERE fri.audit_id = a.id AND fs.series_key = 'diagnostic'
-       );`,
+    `SELECT DISTINCT rm.id AS member_id
+     FROM fleet_roster_members rm
+     JOIN projects p ON p.id = rm.project_id
+                    AND p.organization_id = 'shared-workspace'
+                    AND p.archived_at IS NULL
+                    AND lower(trim(p.domain)) = lower(trim(rm.canonical_host))
+     JOIN audits a ON a.project_id = p.id
+                  AND a.status = 'completed'
+                  AND a.workflow_instance_id LIKE 'github-audit-%'
+     JOIN fleet_run_items i ON i.audit_id = a.id
+                           AND i.member_id = rm.id
+                           AND i.project_id = p.id
+                           AND i.primary_series_key = 'diagnostic'
+                           AND i.status = 'completed'
+     JOIN fleet_runs r ON r.id = i.run_id
+                      AND r.roster_version_id = rm.version_id
+                      AND r.organization_id = p.organization_id
+                      AND r.status = 'completed'
+     JOIN fleet_snapshots s ON s.run_item_id = i.id
+                           AND s.member_id = rm.id
+                           AND s.project_id = p.id
+                           AND s.canonical_host = rm.canonical_host
+                           AND s.series_key = 'diagnostic'
+     WHERE rm.version_id = '${effectiveRoster.id}';`,
     isRemote,
   );
-  const repoQualifiedProjectIds = new Set(
-    repoAudits.map((a: any) => a.project_id),
+  const repoQualifiedMemberIds = new Set(
+    repoAudits.map((a: any) => a.member_id),
   );
 
-  // 6. Aggregate metrics across roster members
+  // 6. Aggregate metrics across roster members keyed by member id
   let mapped = 0;
   let unmapped = 0;
   let edgeCompleted = 0;
@@ -171,9 +196,8 @@ export function checkFleetCoverage(options?: {
   for (const m of members) {
     const dom = m.canonical_host.toLowerCase().trim();
     const effectiveRepo = m.repo_name || repoByDomain.get(dom);
-    const projId = m.project_id;
-
     const hasRepo = Boolean(effectiveRepo);
+
     if (hasRepo) {
       mapped++;
     } else {
@@ -181,10 +205,8 @@ export function checkFleetCoverage(options?: {
       unmappedList.push({ domain: dom, id: m.id });
     }
 
-    const isEdgeAudited = Boolean(projId && edgeAuditedProjectIds.has(projId));
-    const isRepoQualified = Boolean(
-      projId && repoQualifiedProjectIds.has(projId),
-    );
+    const isEdgeAudited = edgeAuditedMemberIds.has(m.id);
+    const isRepoQualified = repoQualifiedMemberIds.has(m.id);
 
     if (isEdgeAudited) edgeCompleted++;
     if (isRepoQualified) repoQualified++;
@@ -200,7 +222,7 @@ export function checkFleetCoverage(options?: {
       unauditedList.push({
         domain: dom,
         repo: effectiveRepo,
-        id: projId || m.id,
+        id: m.id,
       });
     }
   }

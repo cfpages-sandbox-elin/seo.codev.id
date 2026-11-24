@@ -7,11 +7,21 @@ vi.mock("cloudflare:workers", () => ({ env: {} }));
 const toolContext = makeToolContext({ organizationId: "shared-workspace" });
 
 vi.mock("@/db", () => {
-  const dummyChain = {
+  const dummyChain: Record<string, unknown> = {
     innerJoin: () => dummyChain,
     leftJoin: () => dummyChain,
     where: () => dummyChain,
     orderBy: () => dummyChain,
+    // oxlint-disable-next-line eslint-plugin-unicorn/no-thenable
+    then: (resolve: (val: unknown) => void) => {
+      resolve([
+        {
+          id: "roster_v1",
+          approvedAt: "2026-11-20T00:00:00Z",
+          domainCount: 1,
+        },
+      ]);
+    },
     limit: (count?: number) => {
       if (count === 2) {
         return [{ id: "proj_1", domain: "kaca.co.id" }];

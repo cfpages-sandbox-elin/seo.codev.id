@@ -12,6 +12,8 @@ const AUDIT_ERROR_CODES = [
   // A workflow step exceeded its timeout (typically a site that hangs
   // connections or a stalled DB write).
   "step_timeout",
+  // The out-of-band repository runner or process exceeded its run TTL.
+  "runner_timeout",
   // The Worker isolate was killed for exceeding its 128MB memory limit.
   "oom",
   // The Worker isolate was killed for exceeding its CPU time limit.

@@ -80,6 +80,7 @@ export const fleetRosterMembers = pgTable(
       .notNull()
       .default("wordpress_static"),
     repoName: text("repo_name"),
+    publishRoot: text("publish_root").notNull().default("."),
     enrollmentState: text("enrollment_state", { enum: fleetEnrollmentStates })
       .notNull()
       .default("active"),
