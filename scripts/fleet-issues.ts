@@ -118,17 +118,23 @@ export async function getAggregatedFleetIssues(options: {
     );
   }
   if (options.issueType) {
+    const raw = options.issueType.trim();
+    const hyphenated = raw.toLowerCase().replace(/_/g, "-");
+    const underscored = raw.toLowerCase().replace(/-/g, "_");
     whereClauses.push(
-      `i.issue_type = '${options.issueType.trim().replace(/'/g, "''")}'`,
+      `(i.issue_type = '${raw.replace(/'/g, "''")}' OR i.issue_type = '${hyphenated.replace(/'/g, "''")}' OR i.issue_type = '${underscored.replace(/'/g, "''")}')`,
     );
   }
 
-  // Sol F09: Partition by lane or filter by source lane before ranking
+  // Sol F09, A3: Partition by lane or filter by source lane before ranking; qualify repository evidence with diagnostic triple
+  const repoDiagnosticProof =
+    "EXISTS (SELECT 1 FROM fleet_snapshots fs JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed' WHERE fs.audit_id = a.id AND fs.series_key = 'diagnostic')";
+
   const sourceFilterCondition =
     sourceMode === "edge"
       ? "AND (a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL)"
       : sourceMode === "repository"
-        ? "AND a.workflow_instance_id LIKE 'github-audit-%'"
+        ? `AND a.workflow_instance_id LIKE 'github-audit-%' AND ${repoDiagnosticProof}`
         : "";
 
   const partitionClause =
@@ -149,6 +155,10 @@ export async function getAggregatedFleetIssues(options: {
       WHERE a.status = 'completed'
         AND p.organization_id = 'shared-workspace'
         AND p.archived_at IS NULL
+        AND (
+          a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL
+          OR ${repoDiagnosticProof}
+        )
         ${sourceFilterCondition}
     )
     SELECT 

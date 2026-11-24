@@ -4,6 +4,7 @@ import {
   integer,
   real,
   index,
+  uniqueIndex,
 } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { PAGE_FETCH_CLASSES } from "@/shared/audit-fetch-class";
@@ -53,6 +54,12 @@ export const audits = sqliteTable(
   (table) => [
     index("audits_project_id_idx").on(table.projectId),
     index("audits_started_by_user_id_idx").on(table.startedByUserId),
+    uniqueIndex("audits_project_running_idx")
+      .on(table.projectId)
+      .where(sql`status = 'running'`),
+    index("audits_running_keyset_idx")
+      .on(table.startedAt, table.id)
+      .where(sql`status = 'running'`),
   ],
 );
 
@@ -176,3 +183,12 @@ export const auditLighthouseResults = sqliteTable(
     index("audit_lighthouse_results_page_id_idx").on(table.pageId),
   ],
 );
+
+// Watchdog cursor for deterministic keyset pagination across Worker isolate lifecycles
+export const watchdogCursor = sqliteTable("watchdog_cursor", {
+  id: text("id").primaryKey(),
+  startedAt: text("started_at"),
+  auditId: text("audit_id"),
+  revision: integer("revision").notNull().default(1),
+  updatedAt: text("updated_at").default(sql`(current_timestamp)`),
+});

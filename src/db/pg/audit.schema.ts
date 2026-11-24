@@ -6,6 +6,7 @@ import {
   pgTable,
   real,
   text,
+  uniqueIndex,
 } from "drizzle-orm/pg-core";
 import { PAGE_FETCH_CLASSES } from "@/shared/audit-fetch-class";
 import { projects } from "./app.schema";
@@ -58,6 +59,12 @@ export const audits = pgTable(
   (table) => [
     index("audits_project_id_idx").on(table.projectId),
     index("audits_started_by_user_id_idx").on(table.startedByUserId),
+    uniqueIndex("audits_project_running_idx")
+      .on(table.projectId)
+      .where(sql`status = 'running'`),
+    index("audits_running_keyset_idx")
+      .on(table.startedAt, table.id)
+      .where(sql`status = 'running'`),
   ],
 );
 
@@ -175,3 +182,12 @@ export const auditLighthouseResults = pgTable(
     index("audit_lighthouse_results_page_id_idx").on(table.pageId),
   ],
 );
+
+// Watchdog cursor for deterministic keyset pagination across Worker isolate lifecycles
+export const watchdogCursor = pgTable("watchdog_cursor", {
+  id: text("id").primaryKey(),
+  startedAt: text("started_at"),
+  auditId: text("audit_id"),
+  revision: integer("revision").notNull().default(1),
+  updatedAt: timestampColumn("updated_at").default(isoNow),
+});

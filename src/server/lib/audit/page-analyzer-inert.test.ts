@@ -79,4 +79,19 @@ describe("page-analyzer inert and edge case parsing", () => {
       "https://example.com/real-link",
     ]);
   });
+
+  it("handles whitespace in noscript close tag and resolves live base, h1, and anchor (Sol R3 oracle 1)", () => {
+    const html = `<noscript><style></noscript ><base href="/real/"><h1>Live</h1><a href="next">Next</a>`;
+    const res = analyzeHtml(html, "https://example.com/dir/", 200, 0);
+    expect(res.baseHref).toBe("/real/");
+    expect(res.h1s).toEqual(["Live"]);
+    expect(res.links[0]?.targetUrl).toBe("https://example.com/real/next");
+  });
+
+  it("handles comment containing noscript without swallowing live content (Sol R3 oracle 2)", () => {
+    const html = `<!-- <noscript> --><h1>Live</h1><noscript>Inert</noscript><a href="next">Next</a>`;
+    const res = analyzeHtml(html, "https://example.com/dir/", 200, 0);
+    expect(res.h1s).toEqual(["Live"]);
+    expect(res.links[0]?.targetUrl).toBe("https://example.com/dir/next");
+  });
 });

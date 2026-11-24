@@ -84,6 +84,18 @@ function resolveHttpUrl(
  * - <base> inside inert <template> or <noscript> is ignored.
  * - Non-HTTP(S) base schemes (e.g. data:, javascript:) are rejected, falling back to document URL.
  */
+/**
+ * WHATWG raw-text handling: when scripting is enabled, <noscript> contents are treated as inert text.
+ * Strips <noscript>...</noscript> (including whitespace in close tag </noscript >) while strictly
+ * preserving HTML comments so that <!-- <noscript> --> doesn't swallow real content.
+ */
+function sanitizeNoscript(rawHtml: string): string {
+  return rawHtml.replace(
+    /(<!--[\s\S]*?-->)|(<noscript\b[^>]*>[\s\S]*?<\/noscript\s*>)/gi,
+    (match) => (match.startsWith("<!--") ? match : ""),
+  );
+}
+
 function getDocumentEffectiveBase(
   html: string,
   pageUrl: string,
@@ -94,10 +106,7 @@ function getDocumentEffectiveBase(
   let inNoscript = 0;
   let inSvg = 0;
 
-  // WHATWG raw-text handling: when scripting is enabled, <noscript> contents are treated as inert text.
-  // Stripping <noscript>...</noscript> prevents malformed nested tags (like <noscript><style></noscript>)
-  // from leaving htmlparser2 in an unclosed raw-text state.
-  const cleanHtml = html.replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, "");
+  const cleanHtml = sanitizeNoscript(html);
 
   const parser = new Parser(
     {
@@ -334,11 +343,9 @@ export function analyzeHtml(
       onclosetag(name) {
         if (NON_CONTENT_TAGS.has(name) && suppressDepth > 0) {
           suppressDepth -= 1;
-          return;
         }
         if (name === "noscript" && noscriptDepth > 0) {
           noscriptDepth -= 1;
-          return;
         }
         if (noscriptDepth > 0 || suppressDepth > 0) return;
         if (name === "title" && titleDepth > 0) {
@@ -357,10 +364,7 @@ export function analyzeHtml(
     // Defaults (non-XML mode): lowercased tag/attribute names, decoded
     // entities — matching what the DOM-based implementation saw.
   );
-  const cleanHtml = html.replace(
-    /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
-    "",
-  );
+  const cleanHtml = sanitizeNoscript(html);
   parser.write(cleanHtml);
   parser.end();
 

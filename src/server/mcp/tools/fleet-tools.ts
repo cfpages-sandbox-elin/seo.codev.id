@@ -126,10 +126,10 @@ export const getFleetIssuesTool = {
     } else if (source === "repository") {
       auditSelectorCondition = eq(
         audits.id,
-        sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' AND a2.workflow_instance_id LIKE 'github-audit-%' ORDER BY ${completedTimeFor("a2")} DESC NULLS LAST, a2.id DESC LIMIT 1)`,
+        sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' AND a2.workflow_instance_id LIKE 'github-audit-%' AND EXISTS (SELECT 1 FROM fleet_snapshots fs JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed' WHERE fs.audit_id = a2.id AND fs.series_key = 'diagnostic') ORDER BY ${completedTimeFor("a2")} DESC NULLS LAST, a2.id DESC LIMIT 1)`,
       );
     } else {
-      auditSelectorCondition = sql`(${audits.id} = (SELECT a_edge.id FROM audits a_edge WHERE a_edge.project_id = ${projects.id} AND a_edge.status = 'completed' AND (a_edge.workflow_instance_id NOT LIKE 'github-audit-%' OR a_edge.workflow_instance_id IS NULL) ORDER BY ${completedTimeFor("a_edge")} DESC NULLS LAST, a_edge.id DESC LIMIT 1) OR ${audits.id} = (SELECT a_repo.id FROM audits a_repo WHERE a_repo.project_id = ${projects.id} AND a_repo.status = 'completed' AND a_repo.workflow_instance_id LIKE 'github-audit-%' ORDER BY ${completedTimeFor("a_repo")} DESC NULLS LAST, a_repo.id DESC LIMIT 1))`;
+      auditSelectorCondition = sql`(${audits.id} = (SELECT a_edge.id FROM audits a_edge WHERE a_edge.project_id = ${projects.id} AND a_edge.status = 'completed' AND (a_edge.workflow_instance_id NOT LIKE 'github-audit-%' OR a_edge.workflow_instance_id IS NULL) ORDER BY ${completedTimeFor("a_edge")} DESC NULLS LAST, a_edge.id DESC LIMIT 1) OR ${audits.id} = (SELECT a_repo.id FROM audits a_repo WHERE a_repo.project_id = ${projects.id} AND a_repo.status = 'completed' AND a_repo.workflow_instance_id LIKE 'github-audit-%' AND EXISTS (SELECT 1 FROM fleet_snapshots fs JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed' WHERE fs.audit_id = a_repo.id AND fs.series_key = 'diagnostic') ORDER BY ${completedTimeFor("a_repo")} DESC NULLS LAST, a_repo.id DESC LIMIT 1))`;
     }
 
     const conditions = [

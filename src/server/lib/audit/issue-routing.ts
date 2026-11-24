@@ -105,7 +105,16 @@ export function routeIssueToSkill(
     };
   }
 
-  // 3. Broken link classes (broken-link, broken-internal-link, broken-external-link)
+  // 3. Broken external links (Sol T4)
+  if (code.includes("broken-external-link")) {
+    return {
+      skill: "seo-audit",
+      action:
+        "Update or replace broken external links or verify third-party target URL status.",
+    };
+  }
+
+  // 4. Broken link classes (broken-link, broken-internal-link)
   if (hasAny(code, BROKEN_LINK_PATTERNS)) {
     if (isStaticAsset) {
       return {

@@ -264,12 +264,86 @@ function boundIssueDetails(details: any, maxBytes = 3499): string | null {
   return null;
 }
 
+export interface CompletedAuditMatch {
+  id: string;
+  hasDiagnostic: boolean;
+}
+
+export function findMatchingCompletedAudit(
+  projectId: string,
+  repoName: string,
+  publishRoot: string,
+  commitSha: string,
+  effectiveRosterId: string | null,
+  isRemote = true,
+): CompletedAuditMatch | null {
+  const normalizedRoot = publishRoot || ".";
+  const rows = runD1Query(
+    `SELECT a.id, a.config,
+            (
+              SELECT COUNT(*)
+              FROM fleet_runs r
+              JOIN fleet_run_items fri ON fri.run_id = r.id
+              JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
+              JOIN fleet_roster_members rm ON fri.member_id = rm.id
+              WHERE fri.audit_id = a.id
+                AND fri.primary_series_key = 'diagnostic'
+                AND fs.series_key = 'diagnostic'
+                AND r.status = 'completed'
+                AND fri.status = 'completed'
+                AND fri.project_id = a.project_id
+                AND fs.project_id = a.project_id
+                AND fs.member_id = fri.member_id
+                AND rm.project_id = a.project_id
+                AND fs.canonical_host = rm.canonical_host
+                AND r.organization_id = 'shared-workspace'
+                ${effectiveRosterId ? `AND r.roster_version_id = '${effectiveRosterId}' AND rm.version_id = '${effectiveRosterId}'` : ""}
+            ) AS has_verified_triple
+     FROM audits a
+     WHERE a.project_id = '${projectId}'
+       AND a.status = 'completed'
+       AND a.workflow_instance_id LIKE 'github-audit-%'
+       AND a.pages_total > 0
+       AND a.pages_crawled >= a.pages_total
+       AND json_extract(a.config, '$.source') = 'github_repository_direct'
+       AND json_extract(a.config, '$.commitSha') = '${commitSha}'
+       AND json_extract(a.config, '$.repoName') = '${repoName}'
+       AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = '${normalizedRoot}'
+     ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
+     LIMIT 1;`,
+    isRemote,
+  );
+
+  if (rows.length === 0) return null;
+  const row = rows[0];
+
+  try {
+    const cfg = JSON.parse(row.config);
+    if (
+      cfg.source !== "github_repository_direct" ||
+      cfg.repoName !== repoName ||
+      (cfg.publishRoot ?? ".") !== normalizedRoot ||
+      cfg.commitSha !== commitSha
+    ) {
+      return null;
+    }
+  } catch {
+    return null;
+  }
+
+  return {
+    id: row.id,
+    hasDiagnostic: Number(row.has_verified_triple ?? 0) === 1,
+  };
+}
+
 async function auditRepository(
   mapping: RepoMapping,
   maxPages = 10000,
   useArchive = false,
   isRemote = true,
   isForce = false,
+  headInfo?: { branch: string; commitSha: string; tree?: GitTreeItem[] } | null,
 ): Promise<boolean> {
   const { domain, repoName, projectId } = mapping;
   if (!projectId) {
@@ -281,45 +355,43 @@ async function auditRepository(
   console.log(`Auditing ${domain} directly from GitHub repo ${repoName}`);
   console.log(`======================================================`);
 
-  // 1. Resolve default branch and immutable commit SHA via shell-free discovery (Sol P1-04)
-  let defaultBranch = "main";
-  let commitSha = "";
-  let treeItems: GitTreeItem[] = [];
+  // 1. Resolve default branch and immutable commit SHA via shell-free discovery (Sol P1-04, A5)
+  let defaultBranch = headInfo?.branch ?? "main";
+  let commitSha = headInfo?.commitSha ?? "";
+  let treeItems: GitTreeItem[] = headInfo?.tree ?? [];
   const isTreeTruncated = false;
 
   try {
-    const discovered = discoverGitHubTree(repoName);
-    defaultBranch = discovered.defaultBranch;
-    commitSha = discovered.commitSha;
-    treeItems = discovered.tree;
+    if (!commitSha || treeItems.length === 0) {
+      const discovered = discoverGitHubTree(repoName);
+      defaultBranch = discovered.defaultBranch;
+      commitSha = discovered.commitSha;
+      treeItems = discovered.tree;
+    }
     console.log(
       `Pinned commit: ${commitSha.slice(0, 10)} (branch: ${defaultBranch})`,
     );
 
     if (!isForce) {
       const normalizedRoot = mapping.publishRoot ?? ".";
-      const existingSameCommit = runD1Query(
-        `SELECT id, config FROM audits WHERE project_id = '${projectId}' AND status = 'completed' AND workflow_instance_id LIKE 'github-audit-%' AND json_extract(config, '$.source') = 'github_repository_direct' AND json_extract(config, '$.commitSha') = '${commitSha}' AND json_extract(config, '$.repoName') = '${repoName}' AND coalesce(json_extract(config, '$.publishRoot'), '.') = '${normalizedRoot}' AND pages_total > 0 AND pages_crawled >= pages_total LIMIT 1;`,
+      const existingMatch = findMatchingCompletedAudit(
+        projectId,
+        repoName,
+        normalizedRoot,
+        commitSha,
+        null,
         isRemote,
       );
-      if (existingSameCommit.length > 0) {
-        let isMatch = false;
-        try {
-          const cfg = JSON.parse(existingSameCommit[0].config);
-          if (
-            cfg.source === "github_repository_direct" &&
-            cfg.repoName === repoName &&
-            (cfg.publishRoot ?? ".") === normalizedRoot &&
-            cfg.commitSha === commitSha
-          ) {
-            isMatch = true;
-          }
-        } catch {}
-        if (isMatch) {
+      if (existingMatch) {
+        if (existingMatch.hasDiagnostic) {
           console.log(
-            `[REUSED] Project ${domain} already has a completed audit for commit ${commitSha.slice(0, 10)}. Use --force to re-audit.`,
+            `[REUSED] Project ${domain} already has a verified completed audit for commit ${commitSha.slice(0, 10)}. Use --force to re-audit.`,
           );
           return true;
+        } else {
+          console.log(
+            `[NEEDS REPAIR] Existing audit ${existingMatch.id} for ${domain} at commit ${commitSha.slice(0, 10)} lacks verified diagnostic snapshot. Proceeding to repair...`,
+          );
         }
       }
     }
@@ -833,21 +905,55 @@ async function auditRepository(
       `[STAGE 1] Ingesting child evidence into reserved audit ${auditId}...`,
     );
 
-    const boundText = (
+    const boundUtf8Bytes = (
       s: string | null | undefined,
-      maxChars: number,
+      maxBytes: number,
+      maxChars?: number,
     ): string | null => {
       if (!s) return null;
-      const trimmed = s.trim();
-      return trimmed.length <= maxChars ? trimmed : trimmed.slice(0, maxChars);
+      let trimmed = s.trim();
+      if (!trimmed) return null;
+      if (maxChars && trimmed.length > maxChars) {
+        trimmed = trimmed.slice(0, maxChars);
+      }
+      if (Buffer.byteLength(trimmed, "utf8") <= maxBytes) {
+        return trimmed;
+      }
+      let acc = "";
+      for (const char of trimmed) {
+        if (Buffer.byteLength(acc + char, "utf8") > maxBytes) break;
+        acc += char;
+      }
+      return acc || null;
     };
 
-    // Stage 2: Insert audit pages with guarded parent check and bounded text fields (Sol V1-03, V1-06)
-    const pageSqlLines: string[] = [];
-    for (const p of crawledPages) {
-      const esc = (s: string | null | undefined) =>
-        s ? `'${s.replace(/'/g, "''")}'` : "NULL";
-      pageSqlLines.push(`
+    function buildPageSql(
+      p: CrawledPageResult,
+      targetAuditId: string,
+      limits: {
+        titleBytes: number;
+        descBytes: number;
+        ogTitleBytes: number;
+        ogDescBytes: number;
+        canonicalBytes: number;
+        ogImageBytes: number;
+      },
+    ): string {
+      const esc = (val: string | null | undefined) =>
+        val ? `'${val.replace(/'/g, "''")}'` : "NULL";
+      const title = boundUtf8Bytes(p.title, limits.titleBytes, 500);
+      const metaDesc = boundUtf8Bytes(p.metaDescription, limits.descBytes, 1000);
+      const canonical = limits.canonicalBytes > 0
+        ? boundUtf8Bytes(p.canonicalUrl, limits.canonicalBytes, 2000)
+        : null;
+      const robots = boundUtf8Bytes(p.robotsMeta, 200, 200);
+      const ogTitle = boundUtf8Bytes(p.ogTitle, limits.ogTitleBytes, 500);
+      const ogDesc = boundUtf8Bytes(p.ogDescription, limits.ogDescBytes, 1000);
+      const ogImage = limits.ogImageBytes > 0
+        ? boundUtf8Bytes(p.ogImage, limits.ogImageBytes, 2000)
+        : null;
+
+      return `
         INSERT INTO audit_pages (
           id, audit_id, url, status_code, fetch_class, title, meta_description,
           canonical_url, robots_meta, og_title, og_description, og_image,
@@ -856,22 +962,88 @@ async function auditRepository(
           external_link_count, has_structured_data, is_indexable, crawl_depth, in_sitemap, response_time_ms
         )
         SELECT
-          '${p.id}', '${auditId}', '${p.url.replace(/'/g, "''")}', NULL, '${p.fetchClass}',
-          ${esc(boundText(p.title, 500))}, ${esc(boundText(p.metaDescription, 1000))}, ${esc(boundText(p.canonicalUrl, 2000))}, ${esc(boundText(p.robotsMeta, 200))},
-          ${esc(boundText(p.ogTitle, 500))}, ${esc(boundText(p.ogDescription, 1000))}, ${esc(boundText(p.ogImage, 2000))},
+          '${p.id}', '${targetAuditId}', '${p.url.replace(/'/g, "''")}', NULL, '${p.fetchClass}',
+          ${esc(title)}, ${esc(metaDesc)}, ${esc(canonical)}, ${esc(robots)},
+          ${esc(ogTitle)}, ${esc(ogDesc)}, ${esc(ogImage)},
           ${p.h1Count}, ${p.h2Count}, ${p.h3Count}, ${p.h4Count}, ${p.h5Count}, ${p.h6Count},
           ${p.wordCount}, ${esc(p.contentHash)}, ${p.imagesTotal}, ${p.imagesMissingAlt},
           ${p.links.filter((l) => l.isInternal).length}, ${p.links.filter((l) => !l.isInternal).length},
           ${p.hasStructuredData ? 1 : 0}, ${p.isIndexable ? 1 : 0}, NULL, 0, NULL
-        WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${auditId}' AND status = 'running')
+        WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${targetAuditId}' AND status = 'running')
         ON CONFLICT(id) DO NOTHING;
-      `);
+      `.trim();
+    }
+
+    // Stage 2: Insert audit pages with guarded parent check and bounded serialized byte budget (Sol A2, A4)
+    const pageSqlLines: string[] = [];
+    for (const p of crawledPages) {
+      let limits = {
+        titleBytes: 600,
+        descBytes: 1200,
+        ogTitleBytes: 600,
+        ogDescBytes: 1200,
+        canonicalBytes: 1200,
+        ogImageBytes: 1000,
+      };
+      let stmt = buildPageSql(p, auditId, limits);
+      const MAX_PAGE_SQL_BYTES = 10_000;
+      // If statement or its JSON-serialized envelope exceeds budget, progressively scale down display/optional fields
+      if (
+        Buffer.byteLength(stmt, "utf8") > MAX_PAGE_SQL_BYTES ||
+        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") > MAX_PAGE_SQL_BYTES
+      ) {
+        // Step 1: drop optional ogImage and shrink ogDesc/ogTitle
+        limits = {
+          ...limits,
+          ogImageBytes: 0,
+          ogDescBytes: 400,
+          ogTitleBytes: 300,
+        };
+        stmt = buildPageSql(p, auditId, limits);
+      }
+      if (
+        Buffer.byteLength(stmt, "utf8") > MAX_PAGE_SQL_BYTES ||
+        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") > MAX_PAGE_SQL_BYTES
+      ) {
+        // Step 2: drop optional canonicalUrl and shrink metaDesc/title
+        limits = {
+          ...limits,
+          canonicalBytes: 0,
+          descBytes: 500,
+          titleBytes: 300,
+        };
+        stmt = buildPageSql(p, auditId, limits);
+      }
+      if (
+        Buffer.byteLength(stmt, "utf8") > MAX_PAGE_SQL_BYTES ||
+        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") > MAX_PAGE_SQL_BYTES
+      ) {
+        // Step 3: aggressive clamp to minimal display lengths
+        limits = {
+          titleBytes: 150,
+          descBytes: 200,
+          ogTitleBytes: 100,
+          ogDescBytes: 100,
+          canonicalBytes: 0,
+          ogImageBytes: 0,
+        };
+        stmt = buildPageSql(p, auditId, limits);
+      }
+
+      const finalBytes = Buffer.byteLength(stmt, "utf8");
+      const envelopeBytes = Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8");
+      if (finalBytes > MAX_PAGE_SQL_BYTES || envelopeBytes > 14_999) {
+        throw new Error(
+          `Page SQL statement for ${p.url} exceeds strict serialized budget (${finalBytes} raw bytes, ${envelopeBytes} envelope bytes). Ingestion halted.`,
+        );
+      }
+      pageSqlLines.push(stmt);
     }
     if (pageSqlLines.length > 0) {
       executeD1SqlStatements(pageSqlLines, isRemote);
     }
 
-    // Stage 3: Insert audit issues guarded by parent attempt and page relationship (Sol V1-03, V1-06)
+    // Stage 3: Insert audit issues guarded by parent attempt and page relationship (Sol V1-03, V1-06, A4)
     const issueSqlLines: string[] = [];
     for (const issue of detectedIssues) {
       const issueId = await deterministicAuditRowId(
@@ -881,7 +1053,7 @@ async function auditRepository(
         issue.dedupeKey ?? "",
       );
       const severity = getIssueDescriptor(issue.issueType)?.severity || "info";
-      const boundedDetails = boundIssueDetails(issue.details, 3500);
+      const boundedDetails = boundIssueDetails(issue.details, 3499);
       const detailsSql = boundedDetails
         ? `'${boundedDetails.replace(/'/g, "''")}'`
         : "NULL";
@@ -1341,7 +1513,11 @@ function repairDiagnosticObservation(
 
 type FleetAction =
   | { kind: "repair"; domain: string; projectId: string; auditId: string }
-  | { kind: "audit"; mapping: RepoMapping };
+  | {
+      kind: "audit";
+      mapping: RepoMapping;
+      headInfo?: { branch: string; commitSha: string; tree?: GitTreeItem[] } | null;
+    };
 
 async function main() {
   const args = parseArgs({
@@ -1511,78 +1687,6 @@ async function main() {
     }
   }
 
-  interface CompletedAuditMatch {
-    id: string;
-    hasDiagnostic: boolean;
-  }
-
-  function findMatchingCompletedAudit(
-    projectId: string,
-    repoName: string,
-    publishRoot: string,
-    commitSha: string,
-    effectiveRosterId: string | null,
-    isRemote = true,
-  ): CompletedAuditMatch | null {
-    const normalizedRoot = publishRoot || ".";
-    const rows = runD1Query(
-      `SELECT a.id, a.config,
-              (
-                SELECT COUNT(*)
-                FROM fleet_runs r
-                JOIN fleet_run_items fri ON fri.run_id = r.id
-                JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
-                JOIN fleet_roster_members rm ON fri.member_id = rm.id
-                WHERE fri.audit_id = a.id
-                  AND fri.primary_series_key = 'diagnostic'
-                  AND fs.series_key = 'diagnostic'
-                  AND r.status = 'completed'
-                  AND fri.status = 'completed'
-                  AND fri.project_id = a.project_id
-                  AND fs.project_id = a.project_id
-                  AND fs.member_id = fri.member_id
-                  AND rm.project_id = a.project_id
-                  AND fs.canonical_host = rm.canonical_host
-                  AND r.organization_id = 'shared-workspace'
-                  ${effectiveRosterId ? `AND r.roster_version_id = '${effectiveRosterId}' AND rm.version_id = '${effectiveRosterId}'` : ""}
-              ) AS has_verified_triple
-       FROM audits a
-       WHERE a.project_id = '${projectId}'
-         AND a.status = 'completed'
-         AND a.workflow_instance_id LIKE 'github-audit-%'
-         AND a.pages_total > 0
-         AND a.pages_crawled >= a.pages_total
-         AND json_extract(a.config, '$.source') = 'github_repository_direct'
-         AND json_extract(a.config, '$.commitSha') = '${commitSha}'
-         AND json_extract(a.config, '$.repoName') = '${repoName}'
-         AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = '${normalizedRoot}'
-       ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
-       LIMIT 1;`,
-      isRemote,
-    );
-
-    if (rows.length === 0) return null;
-    const row = rows[0];
-    try {
-      const cfg = JSON.parse(row.config);
-      if (
-        cfg.source !== "github_repository_direct" ||
-        cfg.repoName !== repoName ||
-        (cfg.publishRoot ?? ".") !== normalizedRoot ||
-        cfg.commitSha !== commitSha
-      ) {
-        return null;
-      }
-    } catch {
-      return null;
-    }
-
-    return {
-      id: row.id,
-      hasDiagnostic: Number(row.has_verified_triple ?? 0) === 1,
-    };
-  }
-
   const repoMappings = loadRepoMappings();
   console.log(
     `Loaded ${repoMappings.size} repository mappings from manifest & PROJECTS_GITHUB.md.`,
@@ -1651,6 +1755,7 @@ async function main() {
       plannedActions.push({
         kind: "audit",
         mapping: { ...repoMeta, projectId: projId },
+        headInfo,
       });
     }
   } else {
@@ -1696,6 +1801,7 @@ async function main() {
           plannedActions.push({
             kind: "audit",
             mapping: { ...m, projectId: projId },
+            headInfo,
           });
         }
       }
@@ -1744,6 +1850,7 @@ async function main() {
           !!args.values.archive,
           isRemote,
           force,
+          action.headInfo,
         );
         if (ok) successCount++;
         else failCount++;

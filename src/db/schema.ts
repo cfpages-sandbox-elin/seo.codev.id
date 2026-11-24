@@ -113,6 +113,7 @@ export const {
   auditPages,
   auditIssues,
   auditLighthouseResults,
+  watchdogCursor,
   samSessions,
   user,
   session,

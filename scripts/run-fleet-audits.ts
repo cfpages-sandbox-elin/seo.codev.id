@@ -55,12 +55,14 @@ function runD1Query(query: string, isRemote = true): any[] {
   return executeD1SqlBatches([query], isRemote);
 }
 
+type DispatchOutcome = "accepted" | "definitively_rejected" | "unknown";
+
 function triggerWorkflow(
   workflowName: string,
   id: string,
   params: object,
   isRemote = true,
-): boolean {
+): { outcome: DispatchOutcome; message?: string } {
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const wranglerJs = resolve(repoRoot, "node_modules/wrangler/bin/wrangler.js");
   const paramsStr = JSON.stringify(params);
@@ -83,11 +85,33 @@ function triggerWorkflow(
     timeout: 60_000,
   });
 
-  if (res.status === 0) return true;
+  if (res.status === 0) {
+    return { outcome: "accepted" };
+  }
+
+  const output = ((res.stderr || "") + " " + (res.stdout || "")).toLowerCase();
+  // Sol T2: Treat child timeout or transient connection drop as unknown/ambiguous
+  if (
+    res.error ||
+    res.signal === "SIGTERM" ||
+    output.includes("etimedout") ||
+    output.includes("timeout") ||
+    output.includes("econnreset") ||
+    output.includes("socket hang up")
+  ) {
+    console.warn(
+      `[DISPATCH UNCERTAIN] Wrangler trigger for instance ${id} timed out or aborted: ${res.error?.message || output}. Retaining running status and monitoring for resolution.`,
+    );
+    return {
+      outcome: "unknown",
+      message: res.error?.message || "Trigger response timed out or ambiguous",
+    };
+  }
+
   console.error(
-    `Failed to trigger workflow instance ${id}: ${res.stderr || res.stdout}`,
+    `[DISPATCH REJECTED] Failed to trigger workflow instance ${id}: ${res.stderr || res.stdout}`,
   );
-  return false;
+  return { outcome: "definitively_rejected", message: res.stderr || res.stdout };
 }
 
 interface TargetProject {
@@ -303,11 +327,17 @@ async function main() {
   // Process queue with concurrency window
   const activeAudits = new Map<
     string,
-    { auditId: string; project: TargetProject; startedAt: number }
+    {
+      auditId: string;
+      project: TargetProject;
+      startedAt: number;
+      isAmbiguous?: boolean;
+    }
   >();
   let queueIndex = 0;
   let completedCount = 0;
   let failedCount = 0;
+  let skippedBusyCount = 0;
   let admissionPaused = false;
 
   async function pollActiveAudits() {
@@ -434,6 +464,7 @@ async function main() {
           console.warn(
             `[SKIP] Project ${project.domain} (${project.id}) already has an active running edge audit. Skipping concurrent dispatch.`,
           );
+          skippedBusyCount++;
           continue;
         }
 
@@ -453,16 +484,22 @@ async function main() {
           renderLocks: [],
         };
 
-        const ok = triggerWorkflow(target.workflow, auditId, params, isRemote);
-        if (ok) {
+        const dispatch = triggerWorkflow(
+          target.workflow,
+          auditId,
+          params,
+          isRemote,
+        );
+        if (dispatch.outcome === "accepted" || dispatch.outcome === "unknown") {
           activeAudits.set(auditId, {
             auditId,
             project,
             startedAt: Date.now(),
+            isAmbiguous: dispatch.outcome === "unknown",
           });
         } else {
           console.error(
-            `[ERROR] Failed to start workflow for ${project.domain}`,
+            `[ERROR] Confirmed dispatch rejection for ${project.domain}: ${dispatch.message}`,
           );
           const failSql = `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = 'discovery', error_code = 'DISPATCH_ERROR', completed_at = datetime('now') WHERE id = '${auditId}' AND status = 'running' RETURNING id;`;
           const failedRows = runD1Query(failSql, isRemote);
@@ -491,6 +528,7 @@ async function main() {
   console.log(`Total Candidates: ${candidates.length}`);
   console.log(`Total Completed: ${completedCount}`);
   console.log(`Total Failed: ${failedCount}`);
+  console.log(`Skipped (Reservation Busy): ${skippedBusyCount}`);
   console.log(`Active Remaining: ${activeAudits.size}`);
   console.log(`Undispatched Remaining: ${undispatched.length}`);
   if (failedCount > 0 || activeAudits.size > 0 || undispatched.length > 0) {

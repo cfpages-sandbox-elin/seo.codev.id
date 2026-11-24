@@ -4,8 +4,9 @@
  * audit_pages, audit_issues, and stored Lighthouse results. Link edges live
  * in the per-audit scratchpad Durable Object, not here.
  */
-import { and, count, desc, eq } from "drizzle-orm";
+import { and, count, desc, eq, isNull } from "drizzle-orm";
 import { db } from "@/db";
+import { AppError } from "@/server/lib/errors";
 import {
   audits,
   auditIssues,
@@ -15,12 +16,11 @@ import {
 } from "@/db/schema";
 import { executeInBatches } from "@/db/runBatch";
 import { insertIssues } from "./auditIssueWrites";
-import { deterministicAuditRowId } from "@/server/lib/audit/ids";
+import { insertLighthouseResults } from "./auditLighthouseWrites";
 import type { DetectedIssue } from "@/server/lib/audit/issues/page-reporters";
 import type {
   AuditConfig,
   CrawledPageResult,
-  LighthouseResult,
 } from "@/server/lib/audit/types";
 import type { PageFetchClass } from "@/shared/audit-fetch-class";
 
@@ -34,18 +34,37 @@ async function createAudit(data: {
   pagesTotal: number;
   lighthouseTotal: number;
 }) {
-  await db.insert(audits).values({
-    id: data.id,
-    projectId: data.projectId,
-    startedByUserId: data.startedByUserId,
-    startUrl: data.startUrl,
-    workflowInstanceId: data.workflowInstanceId,
-    config: JSON.stringify(data.config),
-    status: "running",
-    pagesTotal: data.pagesTotal,
-    lighthouseTotal: data.lighthouseTotal,
-    currentPhase: "discovery",
+  const existingRunning = await db.query.audits.findFirst({
+    where: and(
+      eq(audits.projectId, data.projectId),
+      eq(audits.status, "running"),
+    ),
+    columns: { id: true },
   });
+  if (existingRunning) {
+    throw new AppError("AUDIT_ALREADY_RUNNING");
+  }
+
+  const inserted = await db
+    .insert(audits)
+    .values({
+      id: data.id,
+      projectId: data.projectId,
+      startedByUserId: data.startedByUserId,
+      startUrl: data.startUrl,
+      workflowInstanceId: data.workflowInstanceId,
+      config: JSON.stringify(data.config),
+      status: "running",
+      pagesTotal: data.pagesTotal,
+      lighthouseTotal: data.lighthouseTotal,
+      currentPhase: "discovery",
+    })
+    .onConflictDoNothing()
+    .returning({ id: audits.id });
+
+  if (inserted.length === 0) {
+    throw new AppError("AUDIT_ALREADY_RUNNING");
+  }
 }
 
 async function updateAuditProgress(
@@ -99,7 +118,7 @@ async function completeAudit(
 
 async function failAudit(
   auditId: string,
-  workflowInstanceId: string,
+  workflowInstanceId: string | null,
   errorInfo?: {
     errorCode: string;
     errorDetail: string;
@@ -109,6 +128,11 @@ async function failAudit(
   // Only a running audit can transition to failed: the getStatus reconciler
   // races the workflow's own finalize, and without this guard it could flip
   // a just-completed audit to failed.
+  const expectedInstance =
+    workflowInstanceId === null
+      ? isNull(audits.workflowInstanceId)
+      : eq(audits.workflowInstanceId, workflowInstanceId);
+
   const updated = await db
     .update(audits)
     .set({
@@ -124,7 +148,7 @@ async function failAudit(
     .where(
       and(
         eq(audits.id, auditId),
-        eq(audits.workflowInstanceId, workflowInstanceId),
+        expectedInstance,
         eq(audits.status, "running"),
       ),
     )
@@ -201,44 +225,6 @@ async function insertCrawledBatch(
   });
 
   await insertIssues(auditId, issues);
-}
-
-async function insertLighthouseResults(
-  auditId: string,
-  lighthouseResults: LighthouseResult[],
-) {
-  const rows = await Promise.all(
-    lighthouseResults.map(async (result) => ({
-      id: await deterministicAuditRowId(
-        auditId,
-        result.pageId,
-        result.strategy,
-      ),
-      auditId,
-      pageId: result.pageId,
-      strategy: result.strategy,
-      performanceScore: result.performanceScore,
-      accessibilityScore: result.accessibilityScore,
-      bestPracticesScore: result.bestPracticesScore,
-      seoScore: result.seoScore,
-      lcpMs: result.lcpMs,
-      cls: result.cls,
-      inpMs: result.inpMs,
-      ttfbMs: result.ttfbMs,
-      errorMessage: result.errorMessage ?? null,
-      r2Key: result.r2Key ?? null,
-      payloadSizeBytes: result.payloadSizeBytes ?? null,
-    })),
-  );
-  // The persistence step is retryable after its paid provider result has been
-  // checkpointed, so repeated writes must stay idempotent.
-  await executeInBatches(rows, (tx, row) => {
-    const { id: _id, auditId: _auditId, ...dataColumns } = row;
-    return tx.insert(auditLighthouseResults).values(row).onConflictDoUpdate({
-      target: auditLighthouseResults.id,
-      set: dataColumns,
-    });
-  });
 }
 
 async function getAuditForProject(auditId: string, projectId: string) {

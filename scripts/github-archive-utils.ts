@@ -327,12 +327,12 @@ export function executeD1SqlBatches(
   const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
   const flag = isRemote ? "--remote" : "--local";
   const maxStatements = Math.min(
-    10,
-    Math.max(1, options?.maxStatementsPerBatch ?? 10),
+    9,
+    Math.max(1, options?.maxStatementsPerBatch ?? 9),
   );
   const maxBytes = Math.min(
-    15_000,
-    Math.max(100, options?.maxBytesPerBatch ?? 15_000),
+    14_999,
+    Math.max(100, options?.maxBytesPerBatch ?? 14_999),
   );
   const defaultRepoRoot = resolve(
     dirname(fileURLToPath(import.meta.url)),
@@ -353,9 +353,11 @@ export function executeD1SqlBatches(
 
   function fits(stmts: string[]) {
     const command = stmts.join("\n");
+    const serializedEnvelope = JSON.stringify({ sql: command });
     return (
       stmts.length <= maxStatements &&
       Buffer.byteLength(command, "utf8") <= maxBytes &&
+      Buffer.byteLength(serializedEnvelope, "utf8") <= maxBytes &&
       (process.platform !== "win32" ||
         windowsCommandUpperBound([...wranglerArgs, command]) <= 30_000)
     );

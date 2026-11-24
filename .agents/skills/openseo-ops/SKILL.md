@@ -83,12 +83,12 @@ unmapped → exempt → unavailable → terminal partial (fresh_partial or stale
 
 **Interval Display Contract**: Provisional interval $[L, U]$ is a rendering presentation rule displayed if and only if:
 1. Reconciled evidence coverage satisfies $80\% \le C < 100\%$.
-2. Admitted observation evidence provides reconciled upper and lower bounds agreeing with earned mass.
-If observation evidence is missing, contradictory, or fails to reconcile, the score displays as `—` (unavailable/incomplete). Full point scores require $C = 100\%$. Freshness evaluation (10-day TTL window) and unavailable precedence operate independently of interval display eligibility.
+2. Validated earned mass $L$ gives upper bound $U = L + 100 - C$, subject to a confirmed critical incident cap of 59.
+Missing stored endpoints can be derived. Invalid or contradictory evidence displays as `—` (unavailable/incomplete). A partial status can have less than 80% coverage and a stale result may retain a valid interval. Full point scores require exactly $C = 100\%$ qualified evidence. Freshness evaluation (10-day TTL window) and unavailable precedence operate independently of interval display eligibility.
 
-**10-Day Freshness TTL vs. 21-Day Trend Comparability Window**:
-- **10-Day Freshness TTL (`FRESHNESS_TTL_MS = 10 * 86_400_000`)**: Evaluates status badge freshness. Completed audits older than 10 days receive the `stale` badge on `/onsite`.
-- **21-Day Comparability Window (`COMPARABLE_BASELINE_WINDOW_MS = 21 * 86_400_000`)**: Governs historical trend comparability in `fleet_change_verifications` and delta tracking. Two baseline snapshots can only be compared for causal attribution (improvement or regression) if their observation gap is $\le 21$ days. Gaps exceeding 21 days return `null` (baseline expired).
+**10-Day Freshness Window vs. 21-Day Trend Comparability Window**:
+- **10-Day Freshness Window (`FRESHNESS_WINDOW_MS = 10 * 86_400_000`)**: Evaluates status badge freshness. Completed audits older than 10 days receive the `stale` badge on `/onsite`.
+- **21-Day Comparability Window (`COMPARABLE_BASELINE_WINDOW_MS = 21 * 86_400_000`)**: Governs historical trend comparability in `fleet_change_verifications` and delta tracking. Two baseline snapshots can only be compared for causal attribution (improvement or regression) if their observation gap is $\le 21$ days and share the verified comparability key and rubric. Gaps exceeding 21 days return `null` (baseline expired). (Note: change-verification and remediation tables represent schema in the topology; automated causal attribution is not an exposed runner workflow).
 
 **Critical Incident Cap**: Requires qualified confirmation (`parseIncidentConfirmation` in `fleetEvidence.ts`) with essential failure codes (DNS failure, TLS failure, origin connection drops), verified expected intent, independent corroboration probe, and finite confirmation timestamps. Validated incidents cap the maximum score at **59 (F)** with a critical incident badge.
 
@@ -105,8 +105,8 @@ Health scores (0–100) are evaluated across 6 weighted pillars matching source 
 | **AI Search Readiness** | 5% | `score_ai_readiness` | 40-word direct answers, answer-first chunking, factual grounding for GEO/AEO. |
 
 **Series Separation**:
-- `'weekly-baseline'`: Official production fleet score series shown on the `/onsite` dashboard.
-- `'diagnostic'`: Isolated series for host-side GitHub Direct Audits, preserving baseline score integrity without polluting weekly historical trends.
+- `'weekly-baseline'`: Consumed by the `/onsite` dashboard for official fleet score display and weekly trend comparisons. Official weekly baseline grading is published by a dedicated external aggregate grading service (not emitted by local CLI or single-site MCP runs).
+- `'diagnostic'`: Dedicated isolated series for host-side GitHub Direct Audits (`run-github-fleet-audit.ts`), preserving baseline score integrity without polluting weekly historical trends.
 
 ---
 
@@ -122,7 +122,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/index.htm` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set using unified route indexing and domain host equivalence (supporting HTTP/HTTPS and apex/www pairs on default ports 80/443) to detect broken links and orphan pages with zero network calls.
 - **Staged D1 Persistence**:
   1. Inserts parent audit in `running` phase with `github-audit-${auditId}` instance ID via atomic conditional insert that prevents concurrent double-reservation and auto-reclaims stale orphaned runs (> 2h old).
-  2. Ingests pages and issues in bounded $\le 10$-statement chunks ($\le 15,000$ UTF-8 bytes total per batch envelope, strictly respecting Windows CreateProcessW 32,767 character limits). Binds string fields to safe character limits (title 500, metaDescription 1000, canonicalUrl 2000, robotsMeta 200, OG fields 500-2000) and detailsJson to bounded UTF-8 bytes (max 3500) preserving valid structured JSON.
+  2. Ingests pages and issues in bounded $\le 9$-statement chunks ($\le 14,999$ UTF-8 bytes total per serialized batch envelope, strictly respecting Windows CreateProcessW 30,000 character limits). Binds string fields to safe character limits and serialized byte limits ($\le 10,000$ bytes per page statement) and detailsJson to bounded UTF-8 bytes (max 3,499) preserving valid structured JSON.
   3. Guards child writes so that `audit_pages` and `audit_issues` only insert when the parent audit is `status = 'running'`, and validates that issue `page_id` references belong to the same attempt.
   4. Verifies child row count integrity and asserts zero orphaned page references before the final atomic compare-and-set UPDATE with `RETURNING id`.
   5. On count mismatch, invalid child references, or state conflict, throws immediately. Incomplete source acquisition ends with audit status `failed` and an isolated diagnostic item which can be `partial` (they are distinct).
@@ -132,8 +132,8 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 ### Lane 2: Edge HTTP Workflow Crawler (`SiteAuditWorkflow`) — Live Runtime & Fleet Grading Lane
 - **Purpose**: Full live HTTP validation, external third-party crawls, robots.txt enforcement, and real edge TTFB latency measurement. (Note: neither `run-fleet-audits.ts` nor `run_site_audit` publishes official weekly fleet snapshots; official weekly baseline grading is reserved for dedicated aggregate grading publishers).
 - **Control Plane (`SiteAuditWorkflow`):** Cloudflare Workflow managing phase ordering, retries, and failure states on `open-seo-selfhost-audit`.
-- **Data Plane (`AuditScratchpad`):** SQLite-backed Durable Object instance per audit (`idFromName(auditId)`). Manages URL frontier leases in chunks of up to 100 URLs.
-- **Limits, Defaults & Robots Scope**: Edge crawler defaults to 500 pages (max 10,000 for self-hosted instances) and concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`). Respects `robots.txt` disallow rules and hostname boundaries. When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots; if an in-flight audit exceeds 20 minutes (15m + 5m drain), the runner terminates queue drain. JavaScript-rendered crawls up to 1,000 pages (`RENDERED_MAX_AUDIT_PAGES`) via Cloudflare Browser Run.
+- **Data Plane (`AuditScratchpad`):** SQLite-backed Durable Object instance per audit (`idFromName(auditId)`). Manages URL frontier leases in chunks of up to 200 URLs (`CHUNK_SIZE = 200`), with a 90-second soft discovery/crawl cutoff for starting new fetches, and 25-page persistence blocks after initial block.
+- **Limits, Defaults & Robots Scope**: Edge crawler defaults to 500 pages (max 10,000 for self-hosted instances) and concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`). Respects `robots.txt` disallow rules and hostname boundaries. Fleet edge CLI hard-codes `renderJavaScript: false`. JavaScript-rendered crawls up to 1,000 pages (`RENDERED_MAX_AUDIT_PAGES`) via Cloudflare Browser Run require the UI or single-site MCP input. When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots; if an in-flight audit exceeds 20 minutes (15m pause + 5m overdue drain), the runner terminates queue drain.
 
 ---
 
@@ -141,8 +141,12 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 
 ### Playbook 1: Roster Enrollment & Turnkey Linking
 **Prerequisites & Environment Architecture**:
-- **Organization Bootstrap Prerequisite**: The parent organization row (`id = 'shared-workspace'`) must exist in D1 before importing rosters to satisfy foreign key constraints.
-- **Port & State Topology**: Local Vite frontend runs on port `3001` (default), auxiliary audit worker / local Wrangler dev runs on port `8787`, and both bind to shared local D1 state at `.wrangler/state/v3/d1`.
+- **Organization Bootstrap Prerequisite**: The parent organization row (`id = 'shared-workspace'`) must exist in D1 before importing rosters to satisfy foreign key constraints. Note that the normal local delegated authentication session resolves to a per-user personal organization (`user_<id>`); MCP callers without `shared-workspace` will receive an organization constraint error when calling fleet tools. For local fleet development, use the direct local CLI or provision a fixture session with `shared-workspace`.
+- **Three-Role Execution Topology**:
+  - **Role 1 (App HTTP / MCP)**: Vite dev server on port `3001` (`pnpm run dev`) or app Wrangler dev serving UI routes and `/mcp`.
+  - **Role 2 (Auxiliary Audit Worker)**: Auxiliary worker on port `8787` (`pnpm exec wrangler dev --config wrangler.audit.jsonc --local --port 8787`) managing Cloudflare Workflows and the local Workflows control API. Note that the auxiliary worker returns 404 for general HTTP fetches; its sole purpose is workflow execution.
+  - **Role 3 (Direct Host CLI)**: Local and remote CLI execution against D1 via Wrangler (`--local` or `--remote`), sharing the local persistence root at `.wrangler/state/v3/d1`. Note environment precedence: `.env.selfhost` overlays local process environment, with populated values winning over default configuration files. Ambient `gh api` uses ambient GitHub CLI authentication, while the repository runner's raw download fallback inspects `GITHUB_TOKEN` and `GH_TOKEN`.
+- **Cloudflare Access Two-Stage Authentication**: Edge access is governed by the Cloudflare Access session cookie at the public edge boundary, while the worker validates the signed `Cf-Access-Jwt-Assertion` header, mapping verified identity to user records before enforcing organization authorization.
 - **Approval Protocol**: Approval JSON requires canonical schema fields: `organizationId`, `versionTag`, `rosterPlanSha256`, `approvedBy`, and optional `approvedAt` (ISO timestamp).
 - **Importer Semantics**: Importer execution (`import-fleet-roster.ts`) has local-only semantics (runs against local D1 `DB`). To compute the canonical roster plan SHA-256 for the approval file without mutating D1:
   ```powershell
@@ -610,14 +614,25 @@ try {
      if (!projectId) throw new Error("Project creation did not return an ID");
      ```
   3. Extract initial brand profile and save reviewed setup:
-     Note: `research_project_website` bills actual model and search costs against balance and returns top-level fields directly in `structuredContent` (`name`, `domain`, `overview`, `competitors`, `preserveCompetitors`, `suggestedTopics`, `suggestedKeywords`). In `save_project_website_setup`, each topic in `suggestedTopics` requires **exactly 5 prompts** (`length(5)`), and `preserveCompetitors: true` preserves existing competitors in the project context.
+     Note: `research_project_website` bills actual model and search costs against balance and returns top-level fields directly in `structuredContent` (`name`, `domain`, `overview`, `competitors`, `preserveCompetitors`, `suggestedTopics`, `suggestedKeywords`). In `save_project_website_setup`, each topic in `suggestedTopics` requires **exactly 5 prompts** (`length(5)`). Note that `preserveCompetitors` is an output-only research field; the save service preserves existing competitor records automatically. If research fails (`isError: true`), if expected fields are absent, or if topics lack 5 grounded prompts, abort and return to the operator for review rather than inventing fallback records.
      ```ts
      const researchRes = await client.callTool({
        name: "research_project_website",
        arguments: { projectId, website: "https://toiletcubicle.co.id" }
      });
-     const research = researchRes.structuredContent ?? {};
+     if (researchRes.isError || !researchRes.structuredContent) {
+       console.error("Research failed or returned empty; aborting before save.");
+       return;
+     }
+     const research = researchRes.structuredContent;
      const { name, domain, overview, competitors, suggestedTopics, suggestedKeywords } = research;
+
+     // Ensure grounded topics have exactly 5 prompts each
+     const validTopics = (suggestedTopics ?? []).filter((t) => Array.isArray(t.prompts) && t.prompts.length === 5);
+     if (validTopics.length === 0) {
+       console.warn("No valid topics with exactly 5 prompts found; awaiting operator review.");
+       return;
+     }
 
      await client.callTool({
        name: "save_project_website_setup",
@@ -625,23 +640,10 @@ try {
          projectId,
          name: name ?? "Toilet Cubicle Surabaya",
          domain: domain ?? "toiletcubicle.co.id",
-         overview: overview ?? "Surabaya commercial toilet cubicle contractor providing phenolic and glass cubicle installations.",
-         competitors: competitors ?? [
-           { name: "Cubicle ID", domain: "cubicle.id", notes: "Local competitor" }
-         ],
-         suggestedTopics: suggestedTopics ?? [
-           {
-             name: "Cubicle Toilet Surabaya",
-             prompts: [
-               "kontraktor cubicle toilet surabaya",
-               "harga partisi toilet surabaya",
-               "pasang cubicle phenolic surabaya",
-               "distributor toilet cubicle surabaya",
-               "spesialis partisi cubicle surabaya"
-             ]
-           }
-         ],
-         suggestedKeywords: suggestedKeywords ?? ["cubicle toilet surabaya", "partisi toilet surabaya"]
+         overview: overview ?? "Commercial toilet cubicle contractor.",
+         competitors: competitors ?? [],
+         suggestedTopics: validTopics,
+         suggestedKeywords: suggestedKeywords ?? []
        }
      });
      const context = await client.callTool({ name: "get_project_context", arguments: { projectId } });
@@ -783,14 +785,14 @@ OpenSEO exposes 78 registered MCP tools in `src/server/mcp/server.ts`:
 
 | Capability Family | Registered Tools Count | Key Parameters & Strict Bounds | Auth & Credit Model | Workflow & Branching Invariants |
 |---|---|---|---|---|
-| **1. Workspace & Project Management** | 8 tools (`whoami`, `create_project`, `list_projects`, `research_project_website`, `save_project_website_setup`, `get_project_context`, `update_project_context`, `get_domain_overview`) | `projectId` (UUID), `domain` (canonical hostname $\le 253$ chars), `locationCode` (int > 0), `languageCode` (2–10 chars), `suggestedTopics` (max 5 topics, each with exactly 5 prompts), `suggestedKeywords` (max 15 keywords, $\le 5$ words each), `preserveCompetitors` (boolean). | Free D1 operations, except `research_project_website` which bills actual model/search credits against balance. Requires project-level authentication. | Onboarding branch: `create_project` $\rightarrow$ `research_project_website` $\rightarrow$ review draft $\rightarrow$ `save_project_website_setup`. First 3 topics seed weekly AI tracking starting ~1 week later. |
+| **1. Workspace & Project Management** | 8 tools (`whoami`, `create_project`, `list_projects`, `research_project_website`, `save_project_website_setup`, `get_project_context`, `update_project_context`, `get_domain_overview`) | `projectId` (UUID), `domain` (canonical hostname $\le 253$ chars), `locationCode` (int > 0), `languageCode` (2–10 chars), `suggestedTopics` (max 5 topics, each with exactly 5 prompts), `suggestedKeywords` (max 15 keywords, $\le 5$ words each). | Free D1 operations, except `research_project_website` which bills actual model/search credits against balance. Requires project-level authentication. | Onboarding branch: `create_project` $\rightarrow$ `research_project_website` $\rightarrow$ review draft $\rightarrow$ `save_project_website_setup`. First 3 topics seed weekly AI tracking starting ~1 week later. |
 | **2. Keyword, Domain & SERP Research** | 10 tools (`list_saved_keywords`, `remove_saved_keywords`, `research_keywords`, `save_keywords`, `get_domain_keyword_suggestions`, `get_serp_results`, `search_serp_locations`, `get_ranked_keywords`, `find_serp_competitors`, `get_keyword_metrics`) | `seeds` (1–5 items), `resultLimit` (150, 300, 500), `queries` array, `locationCode`, `languageCode`. | Billed via DataForSEO balance. Read-only queries check credit balance before dispatch. | Seed discovery $\rightarrow$ SERP competition check $\rightarrow$ filter by intent/volume $\rightarrow$ `save_keywords`. |
-| **3. AI Visibility & Prompts** | 15 tools (`get_ai_visibility_tracker`, `save_ai_visibility_tracker`, `estimate_ai_visibility_cost`, `run_ai_visibility_check`, `get_ai_visibility_run`, `explore_prompt`, `generate_ai_visibility_prompts`, `research_ai_visibility_prompts`, `complete_ai_research_setup`, `set_ai_visibility_schedule`, `get_ai_visibility_results`, `get_ai_visibility_answer`, `get_ai_visibility_sources`, `get_ai_visibility_trend`, `export_ai_visibility_data`) | `engines` (`["chatgpt", "perplexity", "gemini"]`), `prompts` array ($\le 500$ chars), `scheduleInterval` (`"weekly"` / `"monthly"`), `scheduleTime` (`{ weekday, hour, minute, timeZone }`), `maxCostUsd` (quote ceiling). | Per-query and recurring scheduled billing. Requires operator quote approval before enabling schedules. | Estimation (`estimate_ai_visibility_cost`) $\rightarrow$ confirmation $\rightarrow$ `save_ai_visibility_tracker` $\rightarrow$ `set_ai_visibility_schedule` (creates initial baseline run) $\rightarrow$ inspect results via `get_ai_visibility_run`. |
+| **3. AI Visibility & Prompts** | 15 tools (`get_ai_visibility_tracker`, `save_ai_visibility_tracker`, `estimate_ai_visibility_cost`, `run_ai_visibility_check`, `get_ai_visibility_run`, `explore_prompt`, `generate_ai_visibility_prompts`, `research_ai_visibility_prompts`, `complete_ai_research_setup`, `set_ai_visibility_schedule`, `get_ai_visibility_results`, `get_ai_visibility_answer`, `get_ai_visibility_sources`, `get_ai_visibility_trend`, `export_ai_visibility_data`) | `engines` (`["chatgpt", "perplexity", "gemini", "claude", "google_ai_overview"]`), `prompts` array ($\le 2000$ chars, max 100 prompts per patch), `scheduleInterval` (`"daily"` / `"weekly"` / `"monthly"`), `scheduleTime` (`{ weekday, hour, minute, timeZone }`), `maxCostUsd` (quote ceiling). | Per-query and recurring scheduled billing. Requires operator quote approval before enabling schedules. | Estimation (`estimate_ai_visibility_cost`) $\rightarrow$ confirmation $\rightarrow$ `save_ai_visibility_tracker` $\rightarrow$ `set_ai_visibility_schedule` (creates initial baseline run) $\rightarrow$ inspect results via `get_ai_visibility_run`. |
 | **4. Rank Tracking Maintenance** | 7 tools (`create_rank_tracker`, `add_rank_tracking_keywords`, `estimate_rank_tracker_cost`, `run_rank_tracker`, `get_rank_tracker`, `remove_rank_tracking_keywords`, `pin_rank_tracking_keywords`) | `domain`, `locationCode` (int), `languageCode` (str), `keywords` array, `maxCostCredits`, `maxEstimatedScheduledCheckCredits`. | DataForSEO credits. Quote envelope in `structuredContent` separates one-off live run from recurring scheduled estimates. | Create tracker $\rightarrow$ estimate cost $\rightarrow$ enroll keywords $\rightarrow$ optional manual `run_rank_tracker` $\rightarrow$ poll positions via `get_rank_tracker`. |
-| **5. Local SEO & Google Business Profile** | 8 tools (`search_local_businesses`, `get_local_serp_results`, `get_google_business_questions`, `get_business_profile`, `get_business_reviews`, `get_business_updates`, `list_business_categories`, `get_local_rank_grid`) | `near` (`{ latitude, longitude, radiusKm }`), `gridSize` ($3 \times 3$ to $7 \times 7$), `spacingKm` ($1-10$ km), `query`, `cid`, `placeId`. | Geo-grid searches bill per grid node. Repeating identical grid arguments within 1 hour resumes without re-billing. | Search GBP entities $\rightarrow$ obtain placeId/CID $\rightarrow$ dispatch `get_local_rank_grid` $\rightarrow$ analyze rank heatmaps across map points. |
-| **6. GA4, Search Console & Search Opportunities** | 12 tools (`get_google_analytics_organic_overview`, `get_google_analytics_organic_landing_pages`, `get_google_analytics_page_performance`, `get_google_analytics_key_events`, `get_search_opportunities`, `get_google_analytics_traffic_acquisition`, `get_google_analytics_measurement_health`, `get_google_analytics_ecommerce_performance`, `get_google_analytics_site_search`, `get_google_analytics_audience_breakdown`, `get_search_console_performance`, `inspect_urls`) | `startDate`, `endDate` (`YYYY-MM-DD`), `dimensions` array (`query`, `page`, `country`, `device`), `urls` array. | Free (uses connected OAuth integration tokens for GSC and GA4). Bound to project settings. | Validate connection health $\rightarrow$ query acquisition trends $\rightarrow$ cross-reference impressions with conversions via `get_search_opportunities`. |
+| **5. Local SEO & Google Business Profile** | 8 tools (`search_local_businesses`, `get_local_serp_results`, `get_google_business_questions`, `get_business_profile`, `get_business_reviews`, `get_business_updates`, `list_business_categories`, `get_local_rank_grid`) | `near` (`{ latitude, longitude, radiusKm }`), `gridSize` ($3 \times 3$ and $5 \times 5$), `spacingKm` ($0.25-10$ km), device default mobile, zoom range 4–18, `query`, `cid`, `placeId`. | Geo-grid searches bill per grid node. Repeating identical grid arguments within 1 hour resumes without re-billing. | Search GBP entities $\rightarrow$ obtain placeId/CID $\rightarrow$ dispatch `get_local_rank_grid` $\rightarrow$ analyze rank heatmaps across map points. |
+| **6. GA4, Search Console & Search Opportunities** | 12 tools (`get_google_analytics_organic_overview`, `get_google_analytics_organic_landing_pages`, `get_google_analytics_page_performance`, `get_google_analytics_key_events`, `get_search_opportunities`, `get_google_analytics_traffic_acquisition`, `get_google_analytics_measurement_health`, `get_google_analytics_ecommerce_performance`, `get_google_analytics_site_search`, `get_google_analytics_audience_breakdown`, `get_search_console_performance`, `inspect_urls`) | `startDate`, `endDate` (`YYYY-MM-DD`), `dimensions` array (`query`, `page`, `country`, `device`, `new/returning`), `urls` array. | Free (uses connected OAuth integration tokens for GSC and GA4). Bound to project settings. | Validate connection health $\rightarrow$ query acquisition trends $\rightarrow$ cross-reference impressions with conversions via `get_search_opportunities`. |
 | **7. Audit Follow-Through & Fleet Operations** | 8 tools (`run_site_audit`, `list_site_audits`, `delete_site_audit`, `get_audit_status`, `get_audit_issues`, `get_audit_pages`, `get_fleet_issues`, `run_fleet_audit`) | `run_site_audit`: `maxPages` (default 50, edge), `renderJavaScript` (bool), `runLighthouse` (bool). `get_fleet_issues`: `source` (`all`, `edge`, `repository`, `both`), `severity` (`critical`, `warning`, `info`), `limit` (1–200, default 50). `run_fleet_audit`: exactly one selector required (`domain`, `limit` 1–100, or `all: true`), `mode` (`repository_direct` default, `edge_workflow`), `maxPages` (10–10,000, default 2000), `concurrency` (1–5, default 2). | Free D1 edge operations (free tier isolate boundary). Fleet tools constrained to `shared-workspace`. | Single project: `run_site_audit` $\rightarrow$ poll `get_audit_status` $\rightarrow$ triage `get_audit_issues`. Fleet planning: `run_fleet_audit` (emits executable CLI) $\rightarrow$ host execution $\rightarrow$ triage via `get_fleet_issues` with sovereign skill routing. |
-| **8. Reports, Templates & Backlinks** | 10 tools (`list_report_templates`, `save_report_template`, `delete_report_template`, `list_reports`, `save_report`, `get_report`, `delete_report`, `set_report_sharing`, `get_backlinks_overview`, `get_backlinks_profile`) | `projectId` (UUID, required for `list_report_templates`), `templateId`, `reportId`, `title`, `summary`, `html`, `public` (bool), `pageSize` (1–100), `page` (int). | Reports and templates are free D1 operations. Backlinks bill DataForSEO credits. | Template workflow: `list_report_templates` $\rightarrow$ generate HTML report following brief $\rightarrow$ `save_report` $\rightarrow$ optional operator-confirmed `set_report_sharing`. |
+| **8. Reports, Templates & Backlinks** | 10 tools (`list_report_templates`, `save_report_template`, `delete_report_template`, `list_reports`, `save_report`, `get_report`, `delete_report`, `set_report_sharing`, `get_backlinks_overview`, `get_backlinks_profile`) | `projectId` (UUID, required for `list_report_templates`), `templateId`, `reportId`, `title`, `summary`, `html`, `public` (bool), `pageSize` (50/100/200, default 50; `get_report` accepts `includeHtml: true`), `page` (int). | Reports and templates are free D1 operations. Backlinks bill DataForSEO credits. | Template workflow: `list_report_templates` $\rightarrow$ generate HTML report following brief $\rightarrow$ `save_report` $\rightarrow$ optional operator-confirmed `set_report_sharing`. |
 
 ### 6.2 Detailed Family Tool Breakdown
 
@@ -808,7 +810,7 @@ OpenSEO exposes 78 registered MCP tools in `src/server/mcp/server.ts`:
 - `list_saved_keywords`: List enrolled keywords for a project with historical positions.
 - `remove_saved_keywords`: Remove keywords from project tracking.
 - `research_keywords`: Discover new keyword opportunities with search volume and CPC metrics.
-- `save_keywords`: Save discovered keywords to project tracking.
+- `save_keywords`: Save discovered keywords to the project keyword library (free operation).
 - `get_domain_keyword_suggestions`: Generate keyword suggestions based on seed domain content.
 - `get_serp_results`: Query live search engine result pages for target keyword and location.
 - `search_serp_locations`: Search supported geographic location codes.

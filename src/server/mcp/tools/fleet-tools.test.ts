@@ -16,6 +16,15 @@ vi.mock("@/db", () => {
       if (count === 2) {
         return [{ id: "proj_1", domain: "kaca.co.id" }];
       }
+      if (count === 100) {
+        return [
+          {
+            id: "roster_v1",
+            approvedAt: "2026-11-20T00:00:00Z",
+            domainCount: 1,
+          },
+        ];
+      }
       return [
         {
           id: "issue_1",

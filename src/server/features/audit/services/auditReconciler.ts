@@ -11,9 +11,9 @@
  *     error is copied into the row before Workflows retention deletes it.
  */
 import { env } from "cloudflare:workers";
-import { and, eq, isNotNull, isNull, notLike, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, notLike, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { audits, projects } from "@/db/schema";
+import { audits, projects, watchdogCursor } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
 import { AuditRepository } from "@/server/features/audit/repositories/AuditRepository";
 import {
@@ -56,10 +56,18 @@ export async function reconcileRunningAudit(
 
   let errorInfo: AuditErrorInfo | null = null;
   try {
-    const instance = await env.SITE_AUDIT_WORKFLOW.get(
-      audit.workflowInstanceId,
-    );
-    const status = await instance.status();
+    const probePromise = (async () => {
+      const instance = await env.SITE_AUDIT_WORKFLOW.get(
+        audit.workflowInstanceId!,
+      );
+      return instance.status();
+    })();
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error("Workflow probe timed out")), 5000);
+    });
+
+    const status = await Promise.race([probePromise, timeoutPromise]);
     if (status.status === "errored" || status.status === "terminated") {
       errorInfo = status.error
         ? classifyAuditError(
@@ -113,19 +121,61 @@ type WatchdogCursor = {
 
 let sweepCursor: WatchdogCursor = null;
 
-function resetWatchdogCursor() {
-  sweepCursor = null;
+async function loadPersistedCursor(): Promise<WatchdogCursor> {
+  try {
+    const row = await db.query.watchdogCursor.findFirst({
+      where: eq(watchdogCursor.id, "singleton"),
+    });
+    if (row && row.startedAt && row.auditId) {
+      return { startedAt: row.startedAt, id: row.auditId };
+    }
+  } catch {}
+  return sweepCursor;
 }
 
-function getWatchdogCursor(): WatchdogCursor {
-  return sweepCursor;
+async function savePersistedCursor(cursor: WatchdogCursor): Promise<void> {
+  sweepCursor = cursor;
+  try {
+    const isPg = getDatabaseProvider() === "postgres";
+    const nowIso = new Date().toISOString();
+    const existing = await db.query.watchdogCursor.findFirst({
+      where: eq(watchdogCursor.id, "singleton"),
+    });
+
+    if (existing) {
+      await db
+        .update(watchdogCursor)
+        .set({
+          startedAt: cursor ? cursor.startedAt : null,
+          auditId: cursor ? cursor.id : null,
+          revision: existing.revision + 1,
+          updatedAt: isPg ? nowIso : sql`(current_timestamp)`,
+        })
+        .where(
+          and(
+            eq(watchdogCursor.id, "singleton"),
+            eq(watchdogCursor.revision, existing.revision),
+          ),
+        );
+    } else {
+      await db
+        .insert(watchdogCursor)
+        .values({
+          id: "singleton",
+          startedAt: cursor ? cursor.startedAt : null,
+          auditId: cursor ? cursor.id : null,
+          revision: 1,
+        })
+        .onConflictDoNothing();
+    }
+  } catch {}
 }
 
 /** Cron watchdog: sweep stale running audits and reconcile each. */
 export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
   const cutoff = new Date(Date.now() - STALE_RUNNING_AFTER_MS);
   let activeCursor =
-    overrideCursor !== undefined ? overrideCursor : sweepCursor;
+    overrideCursor !== undefined ? overrideCursor : await loadPersistedCursor();
   let stale = await getStaleRunningAudits(
     cutoff,
     WATCHDOG_BATCH_LIMIT,
@@ -141,9 +191,9 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
   // Update cursor for next sweep
   if (stale.length > 0) {
     const last = stale[stale.length - 1];
-    sweepCursor = { startedAt: last.startedAt, id: last.id };
+    await savePersistedCursor({ startedAt: last.startedAt, id: last.id });
   } else {
-    sweepCursor = null;
+    await savePersistedCursor(null);
   }
 
   // Reconcile legacy running rows with NULL workflow_instance_id that are older than cutoff
@@ -161,6 +211,7 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
         isNull(audits.workflowInstanceId),
         nullTimestampPredicate,
       ),
+      orderBy: [asc(audits.startedAt), asc(audits.id)],
       limit: 20,
       columns: {
         id: true,
@@ -169,7 +220,7 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
     });
 
     for (const legacy of nullInstanceAudits) {
-      await AuditRepository.failAudit(legacy.id, "none", {
+      await AuditRepository.failAudit(legacy.id, null, {
         errorCode: "instance_lost",
         errorDetail: "Legacy running audit has null workflow instance ID",
         failedPhase: legacy.currentPhase,
