@@ -43,6 +43,7 @@ vi.mock("@/server/features/audit/repositories/AuditRepository", () => ({
     completeAudit: vi
       .fn()
       .mockResolvedValue({ kind: "committed", id: "audit-1" }),
+    getAuditForWorkflow: vi.fn(),
   },
 }));
 vi.mock("@/server/features/audit/AuditScratchpad", () => ({
@@ -70,6 +71,7 @@ import { AuditRepository } from "@/server/features/audit/repositories/AuditRepos
 import { getAuditScratchpad } from "@/server/features/audit/AuditScratchpad";
 import { runCrawlPhase } from "@/server/workflows/siteAuditWorkflowCrawl";
 import { runMultipageChecks } from "@/server/lib/audit/issues/multipage";
+import { captureServerEvent } from "@/server/lib/posthog";
 
 const PHASE_PARAMS = {
   auditId: "audit-1",
@@ -253,4 +255,177 @@ describe("app-shell crawl coverage", () => {
       });
     },
   );
+});
+
+describe("audit finalization CAS replay and conflict handling", () => {
+  it("emits completion event and cleans up scratchpad on won CAS", async () => {
+    vi.mocked(AuditRepository.hasPagesForAudit).mockResolvedValue(true);
+    vi.mocked(runCrawlPhase).mockResolvedValue({
+      pagesCrawled: 5,
+      completed: true,
+    });
+    vi.mocked(runMultipageChecks).mockResolvedValue({
+      issues: [],
+      hasUnreadShells: false,
+    });
+    const destroyMock = vi.fn();
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    vi.mocked(getAuditScratchpad).mockReturnValue({
+      runFinalizeChecks: vi.fn().mockResolvedValue({ brokenLinks: [], orphanPages: [] }),
+      destroy: destroyMock,
+    } as unknown as ReturnType<typeof getAuditScratchpad>);
+
+    // Won CAS
+    vi.mocked(AuditRepository.completeAudit).mockResolvedValueOnce({
+      kind: "committed",
+      id: "audit-1",
+    });
+    vi.mocked(captureServerEvent).mockClear();
+
+    pgStepMock.mockImplementation(
+      async (
+        _step: unknown,
+        name: string,
+        _config: unknown,
+        callback: () => Promise<unknown>,
+      ) => {
+        if (name === "discover-urls-v2") return { robotsText: "", seededCount: 5 };
+        return callback();
+      },
+    );
+
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    await runAuditPhases({} as never, {
+      ...PHASE_PARAMS,
+      config: { maxPages: 50, lighthouseStrategy: "none" },
+      renderUsage: { cloudflareAttempts: 0, contextCredits: 0 },
+    });
+
+    expect(captureServerEvent).toHaveBeenCalledTimes(1);
+    expect(captureServerEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: "site_audit:complete",
+      }),
+    );
+    expect(destroyMock).toHaveBeenCalled();
+  });
+
+  it("handles same-instance replay cleanly without duplicate completion event", async () => {
+    vi.mocked(AuditRepository.hasPagesForAudit).mockResolvedValue(true);
+    vi.mocked(runCrawlPhase).mockResolvedValue({
+      pagesCrawled: 5,
+      completed: true,
+    });
+    vi.mocked(runMultipageChecks).mockResolvedValue({
+      issues: [],
+      hasUnreadShells: false,
+    });
+    const destroyMock = vi.fn();
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    vi.mocked(getAuditScratchpad).mockReturnValue({
+      runFinalizeChecks: vi.fn().mockResolvedValue({ brokenLinks: [], orphanPages: [] }),
+      destroy: destroyMock,
+    } as unknown as ReturnType<typeof getAuditScratchpad>);
+
+    // Lost initial CAS update because row was already committed by this workflow instance
+    vi.mocked(AuditRepository.completeAudit).mockResolvedValueOnce({
+      kind: "conflict",
+    });
+    // getAuditForWorkflow confirms this exact workflowInstanceId owns the completed audit
+    vi.mocked(AuditRepository.getAuditForWorkflow).mockResolvedValueOnce({
+      id: "audit-1",
+      workflowInstanceId: "workflow-1",
+      status: "completed",
+      config: "{}",
+      completedAt: new Date().toISOString(),
+      projectId: "proj-1",
+      startedAt: new Date().toISOString(),
+      startedByUserId: "user-1",
+      startUrl: "https://example.com/",
+      currentPhase: "completed",
+      pagesCrawled: 5,
+      pagesTotal: 5,
+      lighthouseCompleted: 0,
+      lighthouseFailed: 0,
+      lighthouseTotal: 0,
+      errorCode: null,
+      errorDetail: null,
+      failedPhase: null,
+    });
+    vi.mocked(captureServerEvent).mockClear();
+
+    pgStepMock.mockImplementation(
+      async (
+        _step: unknown,
+        name: string,
+        _config: unknown,
+        callback: () => Promise<unknown>,
+      ) => {
+        if (name === "discover-urls-v2") return { robotsText: "", seededCount: 5 };
+        return callback();
+      },
+    );
+
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    await runAuditPhases({} as never, {
+      ...PHASE_PARAMS,
+      config: { maxPages: 50, lighthouseStrategy: "none" },
+      renderUsage: { cloudflareAttempts: 0, contextCredits: 0 },
+    });
+
+    // Zero duplicate events emitted on replay
+    expect(captureServerEvent).not.toHaveBeenCalled();
+    // Scratchpad cleaned up
+    expect(destroyMock).toHaveBeenCalled();
+  });
+
+  it("returns early without cleaning up foreign owner state on non-replay conflict", async () => {
+    vi.mocked(AuditRepository.hasPagesForAudit).mockResolvedValue(true);
+    vi.mocked(runCrawlPhase).mockResolvedValue({
+      pagesCrawled: 5,
+      completed: true,
+    });
+    vi.mocked(runMultipageChecks).mockResolvedValue({
+      issues: [],
+      hasUnreadShells: false,
+    });
+    const destroyMock = vi.fn();
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    vi.mocked(getAuditScratchpad).mockReturnValue({
+      runFinalizeChecks: vi.fn().mockResolvedValue({ brokenLinks: [], orphanPages: [] }),
+      destroy: destroyMock,
+    } as unknown as ReturnType<typeof getAuditScratchpad>);
+
+    // Lost CAS to another instance / timeout reclaim
+    vi.mocked(AuditRepository.completeAudit).mockResolvedValueOnce({
+      kind: "conflict",
+    });
+    // Not a completed replay for this workflow
+    vi.mocked(AuditRepository.getAuditForWorkflow).mockResolvedValueOnce(
+      undefined,
+    );
+    vi.mocked(captureServerEvent).mockClear();
+
+    pgStepMock.mockImplementation(
+      async (
+        _step: unknown,
+        name: string,
+        _config: unknown,
+        callback: () => Promise<unknown>,
+      ) => {
+        if (name === "discover-urls-v2") return { robotsText: "", seededCount: 5 };
+        return callback();
+      },
+    );
+
+    // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
+    await runAuditPhases({} as never, {
+      ...PHASE_PARAMS,
+      config: { maxPages: 50, lighthouseStrategy: "none" },
+      renderUsage: { cloudflareAttempts: 0, contextCredits: 0 },
+    });
+
+    expect(captureServerEvent).not.toHaveBeenCalled();
+    expect(destroyMock).not.toHaveBeenCalled();
+  });
 });

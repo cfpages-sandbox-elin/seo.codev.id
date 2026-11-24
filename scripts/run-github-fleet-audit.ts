@@ -287,6 +287,15 @@ export interface CompletedAuditMatch {
   hasDiagnostic: boolean;
 }
 
+export type RosterSource = Readonly<{
+  versionId: string;
+  memberId: string;
+  projectId: string;
+  canonicalHost: string;
+  repoName: string;
+  publishRoot: string;
+}>;
+
 export function findMatchingCompletedAudit(
   projectId: string,
   repoName: string,
@@ -342,6 +351,13 @@ export function findMatchingCompletedAudit(
       cfg.repoName !== repoName ||
       (cfg.publishRoot ?? ".") !== normalizedRoot ||
       cfg.commitSha !== commitSha
+    ) {
+      return null;
+    }
+    if (
+      effectiveRosterId &&
+      cfg.rosterSource?.versionId &&
+      cfg.rosterSource.versionId !== effectiveRosterId
     ) {
       return null;
     }
@@ -580,7 +596,7 @@ async function auditRepository(
   // Handle stale recovery (> 2 hours old without completion) strictly for repository-lane audits (Sol R3)
   executeD1SqlStatements(
     [
-      `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2;`,
+      `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = ${sqlText(projectId)} AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2;`,
     ],
     isRemote,
   );
@@ -601,6 +617,17 @@ async function auditRepository(
     maxPages,
     totalFiles: htmlFiles.length,
     treeTruncated: isTreeTruncated,
+    rosterSource:
+      mapping.expectedRosterVersionId && mapping.expectedMemberId
+        ? {
+            versionId: mapping.expectedRosterVersionId,
+            memberId: mapping.expectedMemberId,
+            projectId,
+            canonicalHost: domain,
+            repoName,
+            publishRoot: normalizeGitRelativePath(mapping.publishRoot ?? "."),
+          }
+        : null,
   });
 
   // Reserve audit attempt in D1 conditionally — fails atomically if an active running repository audit already exists
@@ -612,12 +639,12 @@ async function auditRepository(
       pages_total, lighthouse_total, current_phase, started_at
     )
     SELECT
-      '${auditId}', '${projectId}', 'system', 'https://${domain}',
-      'github-audit-${auditId}', ${sqlText(configJson)}, 'running', 0,
-      ${htmlFiles.length}, 0, 'analyzing', '${startedAtIso}'
+      ${sqlText(auditId)}, ${sqlText(projectId)}, 'system', ${sqlText(`https://${domain}`)},
+      ${sqlText(`github-audit-${auditId}`)}, ${sqlText(configJson)}, 'running', 0,
+      ${htmlFiles.length}, 0, 'analyzing', ${sqlText(startedAtIso)}
     WHERE NOT EXISTS (
       SELECT 1 FROM audits
-      WHERE project_id = '${projectId}' AND status = 'running'
+      WHERE project_id = ${sqlText(projectId)} AND status = 'running'
     );`,
     ],
     isRemote,
@@ -835,12 +862,19 @@ async function auditRepository(
     processedCount > 0;
   const finalStatus = isComplete ? "completed" : "failed";
 
-  // 4. Detect Orphan Pages (only when tree is complete, all eligible pages read, and link graph untruncated — Sol P1-03, P2-03)
+  // 4. Detect Orphan Pages (only when tree is complete, all eligible pages read, link graph untruncated, and no unrendered shells — Sol P1-03, P2-03, A3)
   const homeNorm = normalizeRoute(domain);
+  const hasUnrenderedShells = crawledPages.some(
+    (page) => page.javascriptShell === true,
+  );
   if (isComplete && unreadCount === 0) {
     if (hasTruncatedLinks) {
       console.warn(
         `[WARN] Links were truncated on one or more pages (>1,000 links); orphan page detection suppressed to prevent false orphan reports.`,
+      );
+    } else if (hasUnrenderedShells) {
+      console.warn(
+        `[WARN] Unrendered JavaScript app shell detected; orphan page detection suppressed to prevent false orphan reports.`,
       );
     } else {
       for (const page of crawledPages) {
@@ -1033,10 +1067,10 @@ async function auditRepository(
           id, audit_id, issue_type, severity, page_id, page_url, details_json
         )
         SELECT
-          '${issueId}', '${auditId}', ${sqlText(issue.issueType)}, ${sqlText(severity)}, ${issue.pageId ? `'${issue.pageId}'` : "NULL"},
+          ${sqlText(issueId)}, ${sqlText(auditId)}, ${sqlText(issue.issueType)}, ${sqlText(severity)}, ${issue.pageId ? sqlText(issue.pageId) : "NULL"},
           ${sqlText(issue.pageUrl)}, ${sqlText(boundedDetails)}
-        WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${auditId}' AND status = 'running')
-          AND (${issue.pageId ? `EXISTS (SELECT 1 FROM audit_pages WHERE id = '${issue.pageId}' AND audit_id = '${auditId}')` : "1=1"})
+        WHERE EXISTS (SELECT 1 FROM audits WHERE id = ${sqlText(auditId)} AND status = 'running')
+          AND (${issue.pageId ? `EXISTS (SELECT 1 FROM audit_pages WHERE id = ${sqlText(issue.pageId)} AND audit_id = ${sqlText(auditId)})` : "1=1"})
         ON CONFLICT(id) DO NOTHING;
       `);
     }
@@ -1047,9 +1081,9 @@ async function auditRepository(
     // Pre-CAS: Verify child row count integrity and ensure zero orphaned page references (Sol V1-03)
     const integrity = runD1Query(
       `SELECT
-         (SELECT COUNT(*) FROM audit_pages WHERE audit_id = '${auditId}') AS pages,
-         (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') AS issues,
-         (SELECT COUNT(*) FROM audit_issues ai LEFT JOIN audit_pages ap ON ai.page_id = ap.id AND ap.audit_id = '${auditId}' WHERE ai.audit_id = '${auditId}' AND ai.page_id IS NOT NULL AND ap.id IS NULL) AS invalid_refs;`,
+         (SELECT COUNT(*) FROM audit_pages WHERE audit_id = ${sqlText(auditId)}) AS pages,
+         (SELECT COUNT(*) FROM audit_issues WHERE audit_id = ${sqlText(auditId)}) AS issues,
+         (SELECT COUNT(*) FROM audit_issues ai LEFT JOIN audit_pages ap ON ai.page_id = ap.id AND ap.audit_id = ${sqlText(auditId)} WHERE ai.audit_id = ${sqlText(auditId)} AND ai.page_id IS NOT NULL AND ap.id IS NULL) AS invalid_refs;`,
       isRemote,
     );
     const actualPages = Number(integrity[0]?.pages ?? 0);
@@ -1068,21 +1102,21 @@ async function auditRepository(
 
     // Stage 4: Atomic compare-and-set flip to final status with child row count reconciliation and RETURNING assertion (Sol P1-01, P1-05)
     const casSql = `UPDATE audits
-       SET status = '${finalStatus}',
-           current_phase = '${finalStatus}',
+       SET status = ${sqlText(finalStatus)},
+           current_phase = ${sqlText(finalStatus)},
            pages_crawled = ${processedCount},
            pages_total = ${htmlFiles.length},
            completed_at = datetime('now')
-       WHERE id = '${auditId}'
+       WHERE id = ${sqlText(auditId)}
          AND status = 'running'
-         AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = '${auditId}') = ${crawledPages.length}
-         AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') = ${detectedIssues.length}
+         AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = ${sqlText(auditId)}) = ${crawledPages.length}
+         AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = ${sqlText(auditId)}) = ${detectedIssues.length}
          AND NOT EXISTS (
            SELECT 1 FROM audit_issues i
-           WHERE i.audit_id = '${auditId}' AND i.page_id IS NOT NULL
+           WHERE i.audit_id = ${sqlText(auditId)} AND i.page_id IS NOT NULL
              AND NOT EXISTS (
                SELECT 1 FROM audit_pages p
-               WHERE p.id = i.page_id AND p.audit_id = '${auditId}'
+               WHERE p.id = i.page_id AND p.audit_id = ${sqlText(auditId)}
              )
          )
        RETURNING id;`;
@@ -1220,9 +1254,16 @@ async function auditRepository(
             `[DIAGNOSTIC] Recorded and verified fleet diagnostic series run item for ${domain} (${runItemId}, score: ${score}, coverage: ${coverage}%, status: ${itemStatus})`,
           );
         } else {
-          console.log(
-            `[DIAGNOSTIC] Host '${domain}' is not in effective roster '${effectiveRoster.id}' or project is inactive. Skipped fleet diagnostic series.`,
-          );
+          if (mapping.expectedRosterVersionId && mapping.expectedMemberId) {
+            console.error(
+              `[ERROR] Host '${domain}' was expected in roster '${mapping.expectedRosterVersionId}' (member '${mapping.expectedMemberId}') but failed diagnostic admission.`,
+            );
+            diagnosticFailed = true;
+          } else {
+            console.log(
+              `[DIAGNOSTIC] Host '${domain}' is not in effective roster '${effectiveRoster.id}' or project is inactive. Skipped fleet diagnostic series.`,
+            );
+          }
         }
       }
     } catch (diagErr: any) {
@@ -1315,33 +1356,33 @@ function verifyDiagnosticTriple(
     FROM fleet_runs r
     JOIN fleet_run_items i ON i.run_id = r.id
     JOIN fleet_snapshots s ON s.run_item_id = i.id
-    WHERE r.id = '${runId}'
-      AND i.id = '${runItemId}'
-      AND s.id = '${snapshotId}'
-      AND r.organization_id = '${orgId}'
-      AND r.roster_version_id = '${rosterId}'
-      AND i.audit_id = '${auditId}'
-      AND i.member_id = '${memberId}'
-      AND i.project_id = '${projectId}'
-      AND s.member_id = '${memberId}'
-      AND s.project_id = '${projectId}'
-      AND s.canonical_host = '${canonicalHost.replace(/'/g, "''")}'
+    WHERE r.id = ${sqlText(runId)}
+      AND i.id = ${sqlText(runItemId)}
+      AND s.id = ${sqlText(snapshotId)}
+      AND r.organization_id = ${sqlText(orgId)}
+      AND r.roster_version_id = ${sqlText(rosterId)}
+      AND i.audit_id = ${sqlText(auditId)}
+      AND i.member_id = ${sqlText(memberId)}
+      AND i.project_id = ${sqlText(projectId)}
+      AND s.member_id = ${sqlText(memberId)}
+      AND s.project_id = ${sqlText(projectId)}
+      AND s.canonical_host = ${sqlText(canonicalHost)}
       AND i.primary_series_key = 'diagnostic'
       AND s.series_key = 'diagnostic'
-      AND r.status = '${expectedRunStatus}'
-      AND i.status = '${expectedItemStatus}'
+      AND r.status = ${sqlText(expectedRunStatus)}
+      AND i.status = ${sqlText(expectedItemStatus)}
       AND 1 = (
         SELECT count(*)
         FROM fleet_run_items fri
         JOIN fleet_runs fr ON fr.id = fri.run_id
         JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
-        WHERE fri.audit_id = '${auditId}'
-          AND fri.member_id = '${memberId}'
-          AND fr.roster_version_id = '${rosterId}'
+        WHERE fri.audit_id = ${sqlText(auditId)}
+          AND fri.member_id = ${sqlText(memberId)}
+          AND fr.roster_version_id = ${sqlText(rosterId)}
           AND fri.primary_series_key = 'diagnostic'
           AND fs.series_key = 'diagnostic'
-          AND fr.status = '${expectedRunStatus}'
-          AND fri.status = '${expectedItemStatus}'
+          AND fr.status = ${sqlText(expectedRunStatus)}
+          AND fri.status = ${sqlText(expectedItemStatus)}
       );
   `;
   const res = runD1Query(query, isRemote);
@@ -1437,7 +1478,7 @@ function repairDiagnosticObservation(
     if (Number(page_count || 0) < total) return false;
     if (Number(orphaned_count || 0) > 0) return false;
 
-    // Sol F1: Validate audit config source tuple matches expectedSource
+    // Sol F1, A1: Validate audit config source tuple matches expectedSource
     if (expectedSource) {
       try {
         const cfg = JSON.parse(rawConfig || "{}");
@@ -1446,6 +1487,20 @@ function repairDiagnosticObservation(
         const auditRoot = normalizeGitRelativePath(cfg.publishRoot || ".");
         const expectedRoot = normalizeGitRelativePath(expectedSource.publishRoot || ".");
         if (auditRoot !== expectedRoot) return false;
+        if (
+          expectedSource.expectedVersionId &&
+          cfg.rosterSource?.versionId &&
+          cfg.rosterSource.versionId !== expectedSource.expectedVersionId
+        ) {
+          return false;
+        }
+        if (
+          expectedSource.expectedMemberId &&
+          cfg.rosterSource?.memberId &&
+          cfg.rosterSource.memberId !== expectedSource.expectedMemberId
+        ) {
+          return false;
+        }
       } catch {
         return false;
       }
@@ -1716,27 +1771,39 @@ async function main() {
 
   if (targetDomain) {
     const approvedMember = approvedMembersByHost.get(targetDomain);
-    if (!isWorkspace && effectiveRoster && !approvedHosts.has(targetDomain)) {
-      console.error(
-        `[ERROR] Domain '${targetDomain}' is not in approved fleet roster '${effectiveRoster.id}'. Pass --workspace to audit wider inventory.`,
-      );
-      process.exit(1);
+    let projId: string | undefined;
+    let repoName: string | undefined;
+    let publishRoot = ".";
+
+    if (!isWorkspace) {
+      if (effectiveRoster && !approvedHosts.has(targetDomain)) {
+        console.error(
+          `[ERROR] Domain '${targetDomain}' is not in approved fleet roster '${effectiveRoster.id}'. Pass --workspace to audit wider inventory.`,
+        );
+        process.exit(1);
+      }
+      if (!approvedMember) {
+        console.error(
+          `[ERROR] Domain '${targetDomain}' is not found among approved active roster members. Pass --workspace to audit wider inventory.`,
+        );
+        process.exit(1);
+      }
+      if (!approvedMember.repoName || !isValidRepoSlug(approvedMember.repoName)) {
+        console.error(
+          `[ERROR] Domain '${targetDomain}' has no approved repository mapping in roster '${effectiveRoster?.id}'. Use edge mode or link an approved repository in the roster.`,
+        );
+        process.exit(1);
+      }
+      projId = approvedMember.projectId;
+      repoName = approvedMember.repoName;
+      publishRoot = approvedMember.publishRoot;
+    } else {
+      const fallbackRepo = repoMappings.get(targetDomain);
+      projId = approvedMember?.projectId || projectIdByDomain.get(targetDomain);
+      repoName = approvedMember?.repoName || fallbackRepo?.repoName;
+      publishRoot =
+        approvedMember?.publishRoot || (fallbackRepo?.publishRoot ?? ".");
     }
-
-    const projId =
-      !isWorkspace && approvedMember
-        ? approvedMember.projectId
-        : projectIdByDomain.get(targetDomain);
-
-    const fallbackRepo = repoMappings.get(targetDomain);
-    const repoName =
-      !isWorkspace && approvedMember?.repoName
-        ? approvedMember.repoName
-        : fallbackRepo?.repoName;
-    const publishRoot =
-      !isWorkspace && approvedMember
-        ? approvedMember.publishRoot
-        : (fallbackRepo?.publishRoot ?? ".");
 
     if (!projId || !repoName) {
       console.error(
@@ -1806,19 +1873,25 @@ async function main() {
       const isEligible = isWorkspace || approvedHosts.has(dom);
       if (!isEligible) continue;
 
-      const projId =
-        !isWorkspace && approvedMember
-          ? approvedMember.projectId
-          : projectIdByDomain.get(dom);
-      const fallbackRepo = repoMappings.get(dom);
-      const repoName =
-        !isWorkspace && approvedMember?.repoName
-          ? approvedMember.repoName
-          : fallbackRepo?.repoName;
-      const publishRoot =
-        !isWorkspace && approvedMember
-          ? approvedMember.publishRoot
-          : (fallbackRepo?.publishRoot ?? ".");
+      let projId: string | undefined;
+      let repoName: string | undefined;
+      let publishRoot = ".";
+
+      if (!isWorkspace) {
+        if (!approvedMember?.repoName || !isValidRepoSlug(approvedMember.repoName)) {
+          // Unmapped member in approved roster: skip, do NOT plan action or substitute unapproved repo
+          continue;
+        }
+        projId = approvedMember.projectId;
+        repoName = approvedMember.repoName;
+        publishRoot = approvedMember.publishRoot;
+      } else {
+        const fallbackRepo = repoMappings.get(dom);
+        projId = approvedMember?.projectId || projectIdByDomain.get(dom);
+        repoName = approvedMember?.repoName || fallbackRepo?.repoName;
+        publishRoot =
+          approvedMember?.publishRoot || (fallbackRepo?.publishRoot ?? ".");
+      }
 
       if (projId && repoName) {
         try {

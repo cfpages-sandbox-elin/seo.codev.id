@@ -1,47 +1,29 @@
 import { execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { parseArgs } from "node:util";
 import { executeD1SqlBatches } from "./github-archive-utils";
 
-const ENV_FILE = resolve("C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/.env.selfhost");
-
-function loadEnv(): Record<string, string> {
-  const env: Record<string, string> = { ...process.env } as Record<string, string>;
-  try {
-    const content = readFileSync(ENV_FILE, "utf8");
-    for (const rawLine of content.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      const eqIdx = line.indexOf("=");
-      if (eqIdx > 0 && !line.startsWith("#")) {
-        const key = line.slice(0, eqIdx).trim();
-        const val = line.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, "");
-        env[key] = val;
-        process.env[key] = val;
-      }
-    }
-  } catch (err) {
-    console.warn("Could not read .env.selfhost:", err);
-  }
-  return env;
+let args;
+try {
+  args = parseArgs({
+    options: {
+      remote: { type: "boolean" },
+      local: { type: "boolean" },
+    },
+    allowPositionals: false,
+  });
+} catch (err: any) {
+  console.error(`[ERROR] Invalid arguments: ${err.message}`);
+  process.exit(1);
 }
 
-const envVars = loadEnv();
-
-function extractJson(raw: string): any {
-  const firstBracket = raw.indexOf("[");
-  const lastBracket = raw.lastIndexOf("]");
-  if (firstBracket !== -1 && lastBracket !== -1) {
-    return JSON.parse(raw.slice(firstBracket, lastBracket + 1));
-  }
-  const firstBrace = raw.indexOf("{");
-  const lastBrace = raw.lastIndexOf("}");
-  if (firstBrace !== -1 && lastBrace !== -1) {
-    return JSON.parse(raw.slice(firstBrace, lastBrace + 1));
-  }
-  return JSON.parse(raw);
+if (args.values.remote && args.values.local) {
+  console.error("[ERROR] Conflicting flags: cannot specify both --remote and --local.");
+  process.exit(1);
 }
 
-const isRemote = !process.argv.includes("--local");
+const isRemote = args.values.local ? false : true;
 
 function runD1Query(query: string): any[] {
   return executeD1SqlBatches([query], isRemote);

@@ -14,6 +14,7 @@ import { parseArgs } from "node:util";
 import {
   executeD1SqlBatches,
   selectEffectiveRosterVersion,
+  sqlText,
 } from "./github-archive-utils";
 
 interface RosterVersionRow {
@@ -85,7 +86,7 @@ export function checkFleetCoverage(options?: {
                          AND p.organization_id = 'shared-workspace'
                          AND p.archived_at IS NULL
                          AND lower(trim(p.domain)) = lower(trim(rm.canonical_host))
-     WHERE rm.version_id = '${effectiveRoster.id}'
+     WHERE rm.version_id = ${sqlText(effectiveRoster.id)}
        AND rm.enrollment_state = 'active';`,
     isRemote,
   ) as RosterMemberRow[];
@@ -142,7 +143,7 @@ export function checkFleetCoverage(options?: {
      JOIN audits a ON a.project_id = p.id
                   AND a.status = 'completed'
                   AND (a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL)
-     WHERE rm.version_id = '${effectiveRoster.id}'
+     WHERE rm.version_id = ${sqlText(effectiveRoster.id)}
        AND rm.enrollment_state = 'active';`,
     isRemote,
   );
@@ -150,7 +151,7 @@ export function checkFleetCoverage(options?: {
     edgeAudits.map((a: any) => a.member_id),
   );
 
-  // 5. Query qualified repository audits bound to active roster members with verified diagnostic lineage (Sol T1, Round 17)
+  // 5. Query qualified repository audits bound to active roster members with verified diagnostic lineage (Sol T1, C1)
   const repoAudits = runD1Query(
     `SELECT DISTINCT rm.id AS member_id
      FROM fleet_roster_members rm
@@ -161,6 +162,8 @@ export function checkFleetCoverage(options?: {
      JOIN audits a ON a.project_id = p.id
                   AND a.status = 'completed'
                   AND a.workflow_instance_id LIKE 'github-audit-%'
+                  AND a.pages_total > 0
+                  AND a.pages_crawled >= a.pages_total
      JOIN fleet_run_items i ON i.audit_id = a.id
                            AND i.member_id = rm.id
                            AND i.project_id = p.id
@@ -173,10 +176,18 @@ export function checkFleetCoverage(options?: {
      JOIN fleet_snapshots s ON s.run_item_id = i.id
                            AND s.member_id = rm.id
                            AND s.project_id = p.id
-                           AND s.canonical_host = rm.canonical_host
+                           AND lower(trim(s.canonical_host)) = lower(trim(rm.canonical_host))
                            AND s.series_key = 'diagnostic'
-     WHERE rm.version_id = '${effectiveRoster.id}'
-       AND rm.enrollment_state = 'active';`,
+     WHERE rm.version_id = ${sqlText(effectiveRoster.id)}
+       AND rm.enrollment_state = 'active'
+       AND rm.repo_name IS NOT NULL
+       AND CASE WHEN json_valid(a.config) THEN
+         json_extract(a.config, '$.source') = 'github_repository_direct'
+         AND json_extract(a.config, '$.repoName') = rm.repo_name
+         AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(rm.publish_root, '.')
+         AND (json_extract(a.config, '$.rosterSource.versionId') IS NULL OR json_extract(a.config, '$.rosterSource.versionId') = rm.version_id)
+         AND (json_extract(a.config, '$.rosterSource.memberId') IS NULL OR json_extract(a.config, '$.rosterSource.memberId') = rm.id)
+       ELSE 0 END;`,
     isRemote,
   );
   const repoQualifiedMemberIds = new Set(

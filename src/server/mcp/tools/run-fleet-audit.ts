@@ -8,7 +8,6 @@ import {
 import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
-import { FLEET_MANIFEST_MEMBERS } from "@/server/features/fleet/data/fleetManifest";
 import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
 
 const CANONICAL_DOMAIN_REGEX =
@@ -133,54 +132,52 @@ export const runFleetAuditTool = {
       targetProjectId = activeProjects[0].id;
     }
 
-    if (mode === "repository_direct") {
-      const effectiveRoster = await FleetRepository.getApprovedRoster(orgId);
-      if (!effectiveRoster) {
+    const effectiveRoster = await FleetRepository.getApprovedRoster(orgId);
+    if (!effectiveRoster) {
+      throw new Error(
+        `No effective approved fleet roster found in organization '${orgId}'. An approved roster version with approvedAt <= now is required.`,
+      );
+    }
+
+    if (domain) {
+      const rosterMember = await db
+        .select({
+          id: fleetRosterMembers.id,
+          enrollmentState: fleetRosterMembers.enrollmentState,
+          projectId: fleetRosterMembers.projectId,
+          repoName: fleetRosterMembers.repoName,
+        })
+        .from(fleetRosterMembers)
+        .where(
+          and(
+            eq(fleetRosterMembers.versionId, effectiveRoster.id),
+            eq(fleetRosterMembers.canonicalHost, domain),
+          ),
+        )
+        .limit(1);
+
+      if (rosterMember.length === 0) {
         throw new Error(
-          `No effective approved fleet roster found for repository_direct mode in organization '${orgId}'. An approved roster version with approvedAt <= now is required.`,
+          `Domain '${domain}' is not in approved fleet roster '${effectiveRoster.id}'.`,
         );
       }
-
-      if (domain) {
-        const manifestMember = FLEET_MANIFEST_MEMBERS.find(
-          (m) => m.canonicalHost.toLowerCase() === domain,
+      if (rosterMember[0].enrollmentState !== "active") {
+        throw new Error(
+          `Domain '${domain}' is '${rosterMember[0].enrollmentState}' in roster '${effectiveRoster.id}'; only active members can be planned for audit.`,
         );
-        if (!manifestMember?.repoName)
-          throw new Error(
-            `Domain '${domain}' does not have an approved repository mapping for repository_direct mode. Use edge_workflow mode or link a repository in the fleet manifest.`,
-          );
-
-        const rosterMember = await db
-          .select({
-            id: fleetRosterMembers.id,
-            enrollmentState: fleetRosterMembers.enrollmentState,
-            projectId: fleetRosterMembers.projectId,
-            repoName: fleetRosterMembers.repoName,
-          })
-          .from(fleetRosterMembers)
-          .where(
-            and(
-              eq(fleetRosterMembers.versionId, effectiveRoster.id),
-              eq(fleetRosterMembers.canonicalHost, domain),
-            ),
-          )
-          .limit(1);
-
-        if (rosterMember.length === 0) {
-          throw new Error(
-            `Domain '${domain}' is not in approved fleet roster '${effectiveRoster.id}'.`,
-          );
-        }
-        if (rosterMember[0].enrollmentState !== "active") {
-          throw new Error(
-            `Domain '${domain}' is '${rosterMember[0].enrollmentState}' in roster '${effectiveRoster.id}'; only active members can be planned for audit.`,
-          );
-        }
-        if (!rosterMember[0].projectId || rosterMember[0].projectId !== targetProjectId) {
-          throw new Error(
-            `Domain '${domain}' has mismatched or missing project mapping in roster '${effectiveRoster.id}'.`,
-          );
-        }
+      }
+      if (
+        !rosterMember[0].projectId ||
+        rosterMember[0].projectId !== targetProjectId
+      ) {
+        throw new Error(
+          `Domain '${domain}' has mismatched or missing project mapping in roster '${effectiveRoster.id}'.`,
+        );
+      }
+      if (mode === "repository_direct" && !rosterMember[0].repoName) {
+        throw new Error(
+          `Domain '${domain}' has no approved repository mapping in roster '${effectiveRoster.id}' for repository_direct mode. Use edge_workflow mode or link an approved repository in the roster.`,
+        );
       }
     }
 
@@ -210,6 +207,8 @@ export const runFleetAuditTool = {
         "tsx",
         "scripts/run-fleet-audits.ts",
         ...scopeArgs,
+        "--roster-id",
+        effectiveRoster.id,
         "--max-pages",
         String(maxPages),
         "--concurrency",

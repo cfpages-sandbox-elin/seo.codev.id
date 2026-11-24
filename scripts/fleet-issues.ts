@@ -17,6 +17,7 @@ import {
   isValidCanonicalHostname,
   executeD1SqlBatches,
   selectEffectiveRosterVersion,
+  sqlText,
 } from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
@@ -110,12 +111,12 @@ export async function getAggregatedFleetIssues(options: {
 
   if (options.domain) {
     whereClauses.push(
-      `p.domain = '${options.domain.toLowerCase().trim().replace(/'/g, "''")}'`,
+      `lower(trim(p.domain)) = ${sqlText(options.domain.toLowerCase().trim())}`,
     );
   }
   if (options.severity) {
     whereClauses.push(
-      `i.severity = '${options.severity.toLowerCase().trim().replace(/'/g, "''")}'`,
+      `i.severity = ${sqlText(options.severity.toLowerCase().trim())}`,
     );
   }
   if (options.issueType) {
@@ -123,11 +124,11 @@ export async function getAggregatedFleetIssues(options: {
     const hyphenated = raw.toLowerCase().replace(/_/g, "-");
     const underscored = raw.toLowerCase().replace(/-/g, "_");
     whereClauses.push(
-      `(i.issue_type = '${raw.replace(/'/g, "''")}' OR i.issue_type = '${hyphenated.replace(/'/g, "''")}' OR i.issue_type = '${underscored.replace(/'/g, "''")}')`,
+      `(i.issue_type = ${sqlText(raw)} OR i.issue_type = ${sqlText(hyphenated)} OR i.issue_type = ${sqlText(underscored)})`,
     );
   }
 
-  // Sol Round 18 F2: Bind repository qualification strictly to effective approved roster version
+  // Sol Round 18 F2, Round 19 C1: Bind repository qualification strictly to effective approved roster version with full source mapping
   const allRosterVersions = runD1Query(
     `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';`,
     isRemote,
@@ -136,7 +137,27 @@ export async function getAggregatedFleetIssues(options: {
   const effectiveRosterId = effectiveRoster?.id ?? null;
 
   const repoDiagnosticProof = effectiveRosterId
-    ? `EXISTS (SELECT 1 FROM fleet_roster_members m JOIN fleet_run_items fri ON fri.audit_id = a.id AND fri.member_id = m.id AND fri.project_id = p.id AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = p.organization_id AND fr.status = 'completed' JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = p.id AND fs.canonical_host = m.canonical_host AND fs.series_key = 'diagnostic' WHERE m.project_id = p.id AND m.canonical_host = p.domain AND m.enrollment_state = 'active' AND m.version_id = '${effectiveRosterId}' AND fr.roster_version_id = '${effectiveRosterId}')`
+    ? `EXISTS (
+        SELECT 1 FROM fleet_roster_members m
+        JOIN fleet_run_items fri ON fri.audit_id = a.id AND fri.member_id = m.id AND fri.project_id = p.id AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed'
+        JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = p.organization_id AND fr.status = 'completed'
+        JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = p.id AND lower(trim(fs.canonical_host)) = lower(trim(m.canonical_host)) AND fs.series_key = 'diagnostic'
+        WHERE m.project_id = p.id
+          AND lower(trim(m.canonical_host)) = lower(trim(p.domain))
+          AND m.enrollment_state = 'active'
+          AND m.version_id = ${sqlText(effectiveRosterId)}
+          AND fr.roster_version_id = ${sqlText(effectiveRosterId)}
+          AND m.repo_name IS NOT NULL
+          AND a.pages_total > 0
+          AND a.pages_crawled >= a.pages_total
+          AND CASE WHEN json_valid(a.config) THEN
+            json_extract(a.config, '$.source') = 'github_repository_direct'
+            AND json_extract(a.config, '$.repoName') = m.repo_name
+            AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
+            AND (json_extract(a.config, '$.rosterSource.versionId') IS NULL OR json_extract(a.config, '$.rosterSource.versionId') = m.version_id)
+            AND (json_extract(a.config, '$.rosterSource.memberId') IS NULL OR json_extract(a.config, '$.rosterSource.memberId') = m.id)
+          ELSE 0 END
+      )`
     : "(1 = 0)";
 
   const sourceFilterCondition =

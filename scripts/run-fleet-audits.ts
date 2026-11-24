@@ -16,6 +16,7 @@ import { parseArgs } from "node:util";
 import {
   executeD1SqlBatches,
   isValidCanonicalHostname,
+  sqlText,
 } from "./github-archive-utils";
 
 // Sourced environment from .env.selfhost
@@ -122,32 +123,33 @@ interface TargetProject {
 }
 
 async function main() {
-  const rawArgs = process.argv.slice(2);
-  if (rawArgs.includes("--remote") && rawArgs.includes("--local")) {
+  let args;
+  try {
+    args = parseArgs({
+      options: {
+        limit: { type: "string", short: "l" },
+        concurrency: { type: "string", short: "c", default: "2" },
+        domain: { type: "string", short: "d" },
+        "roster-id": { type: "string" },
+        "max-pages": { type: "string", short: "m", default: "500" },
+        "skip-recent": { type: "boolean", default: true },
+        "no-skip-recent": { type: "boolean", default: false },
+        all: { type: "boolean", default: false },
+        remote: { type: "boolean" },
+        local: { type: "boolean" },
+      },
+      allowPositionals: false,
+    });
+  } catch (err: any) {
     console.error(
-      "[ERROR] Conflicting flags: cannot specify both --remote and --local.",
+      `[ERROR] Invalid arguments: ${err.message}`,
     );
     process.exit(1);
   }
 
-  const args = parseArgs({
-    options: {
-      limit: { type: "string", short: "l" },
-      concurrency: { type: "string", short: "c", default: "2" },
-      domain: { type: "string", short: "d" },
-      "max-pages": { type: "string", short: "m", default: "500" },
-      "skip-recent": { type: "boolean", default: true },
-      "no-skip-recent": { type: "boolean", default: false },
-      all: { type: "boolean", default: false },
-      remote: { type: "boolean", default: true },
-      local: { type: "boolean", default: false },
-    },
-    allowPositionals: true,
-  });
-
-  if (args.positionals.length > 0) {
+  if (args.values.remote && args.values.local) {
     console.error(
-      `[ERROR] Stray positional arguments detected (${args.positionals.join(", ")}). Positional arguments not permitted.`,
+      "[ERROR] Conflicting flags: cannot specify both --remote and --local.",
     );
     process.exit(1);
   }
@@ -243,10 +245,22 @@ async function main() {
   if (targetDomainFilter)
     console.log(`Target Domain Filter: ${targetDomainFilter}`);
 
-  // Query enrolled projects in shared-workspace with normalized UTC epoch of completed edge crawls (Sol F05)
+  const rosterId = args.values["roster-id"]
+    ? String(args.values["roster-id"]).trim()
+    : null;
+  if (rosterId) {
+    console.log(`Enrolled Roster Filter: ${rosterId}`);
+  }
+
+  // Query enrolled projects in shared-workspace with normalized UTC epoch of completed edge crawls (Sol F05, C2)
   const sql = `
     SELECT p.id, p.name, p.domain, MAX(unixepoch(a.completed_at)) AS last_audited_epoch
     FROM projects p
+    ${
+      rosterId
+        ? `JOIN fleet_roster_members rm ON rm.project_id = p.id AND rm.version_id = ${sqlText(rosterId)} AND rm.enrollment_state = 'active' AND lower(trim(rm.canonical_host)) = lower(trim(p.domain))`
+        : ""
+    }
     LEFT JOIN audits a ON p.id = a.project_id
       AND a.status = 'completed'
       AND (a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL)

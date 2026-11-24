@@ -53,9 +53,8 @@ export async function reconcileRunningAudit(
   // Sol P1-05, R3: Repository runner audits (workflow_instance_id LIKE 'github-audit-%') are executed out-of-band by the CLI runner.
   // If running longer than 2 hours, reclaim the abandoned reservation without querying Cloudflare Workflows.
   if (audit.workflowInstanceId.startsWith("github-audit-")) {
-    const startedAtMs = new Date(audit.startedAt).getTime();
     const GITHUB_AUDIT_TTL_MS = 2 * 60 * 60 * 1000;
-    if (Date.now() - startedAtMs > GITHUB_AUDIT_TTL_MS) {
+    if (isOlderThan(audit.startedAt, GITHUB_AUDIT_TTL_MS)) {
       const errorInfo: AuditErrorInfo = {
         errorCode: "runner_timeout",
         errorDetail:
@@ -143,23 +142,57 @@ type WatchdogCursor = {
 
 let sweepCursor: WatchdogCursor = null;
 
-async function loadPersistedCursor(): Promise<WatchdogCursor> {
+type LoadedCursorState = {
+  cursor: WatchdogCursor;
+  revision: number | null;
+};
+
+async function loadPersistedCursor(): Promise<LoadedCursorState> {
   try {
     const row = await db.query.watchdogCursor.findFirst({
       where: eq(watchdogCursor.id, "singleton"),
     });
-    if (row && row.startedAt && row.auditId) {
-      return { startedAt: row.startedAt, id: row.auditId };
+    if (row) {
+      if (row.startedAt && row.auditId) {
+        return {
+          cursor: { startedAt: row.startedAt, id: row.auditId },
+          revision: row.revision,
+        };
+      }
+      // A stored null reset must be honored rather than falling back to process memory
+      return { cursor: null, revision: row.revision };
     }
   } catch {}
-  return sweepCursor;
+  return { cursor: sweepCursor, revision: null };
 }
 
-async function savePersistedCursor(cursor: WatchdogCursor): Promise<void> {
+async function savePersistedCursor(
+  cursor: WatchdogCursor,
+  expectedRevision?: number | null,
+): Promise<boolean> {
   sweepCursor = cursor;
   try {
     const isPg = getDatabaseProvider() === "postgres";
     const nowIso = new Date().toISOString();
+
+    if (expectedRevision !== undefined && expectedRevision !== null) {
+      await db
+        .update(watchdogCursor)
+        .set({
+          startedAt: cursor ? cursor.startedAt : null,
+          auditId: cursor ? cursor.id : null,
+          revision: expectedRevision + 1,
+          updatedAt: isPg ? nowIso : sql`(current_timestamp)`,
+        })
+        .where(
+          and(
+            eq(watchdogCursor.id, "singleton"),
+            eq(watchdogCursor.revision, expectedRevision),
+          ),
+        );
+      return true;
+    }
+
     const existing = await db.query.watchdogCursor.findFirst({
       where: eq(watchdogCursor.id, "singleton"),
     });
@@ -190,14 +223,20 @@ async function savePersistedCursor(cursor: WatchdogCursor): Promise<void> {
         })
         .onConflictDoNothing();
     }
-  } catch {}
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** Cron watchdog: sweep stale running audits and reconcile each. */
 export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
   const cutoff = new Date(Date.now() - STALE_RUNNING_AFTER_MS);
-  let activeCursor =
-    overrideCursor !== undefined ? overrideCursor : await loadPersistedCursor();
+  const loaded =
+    overrideCursor !== undefined
+      ? { cursor: overrideCursor, revision: null }
+      : await loadPersistedCursor();
+  let activeCursor = loaded.cursor;
   let stale = await getStaleRunningAudits(
     cutoff,
     WATCHDOG_BATCH_LIMIT,
@@ -210,12 +249,15 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
     stale = await getStaleRunningAudits(cutoff, WATCHDOG_BATCH_LIMIT, null);
   }
 
-  // Update cursor for next sweep
+  // Update cursor for next sweep with CAS revision check
   if (stale.length > 0) {
     const last = stale[stale.length - 1];
-    await savePersistedCursor({ startedAt: last.startedAt, id: last.id });
+    await savePersistedCursor(
+      { startedAt: last.startedAt, id: last.id },
+      loaded.revision,
+    );
   } else {
-    await savePersistedCursor(null);
+    await savePersistedCursor(null, loaded.revision);
   }
 
   // Reconcile legacy running rows with NULL workflow_instance_id that are older than cutoff
@@ -302,8 +344,8 @@ async function getStaleRunningAudits(
   const repoCutoffIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
   const stalenessPredicate = isPg
-    ? sql`(${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${audits.startedAt}::timestamptz < ${edgeCutoffIso}::timestamptz) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${audits.startedAt}::timestamptz < ${repoCutoffIso}::timestamptz)`
-    : sql`(${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND julianday(${audits.startedAt}) < julianday(${edgeCutoffIso})) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND julianday(${audits.startedAt}) < julianday(${repoCutoffIso}))`;
+    ? sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${audits.startedAt}::timestamptz < ${edgeCutoffIso}::timestamptz) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${audits.startedAt}::timestamptz < ${repoCutoffIso}::timestamptz)))`
+    : sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND julianday(${audits.startedAt}) < julianday(${edgeCutoffIso})) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND julianday(${audits.startedAt}) < julianday(${repoCutoffIso}))))`;
 
   const cursorPredicate = cursor
     ? isPg

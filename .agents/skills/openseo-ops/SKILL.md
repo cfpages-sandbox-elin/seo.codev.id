@@ -295,20 +295,28 @@ pnpm exec tsx scripts/fleet-issues.ts --csv fleet-issues.csv
 ```
 
 #### Shipped Sovereign Skill Remediation Routing Map (`src/server/lib/audit/issue-routing.ts`)
-| Issue Category / Type | Sovereign Skill Route | Operational Remediation Protocol |
+Dispatched in exact strict precedence order:
+| Precedence / Issue Category | Sovereign Skill Route | Operational Remediation Protocol |
 |---|---|---|
-| `canonical-mismatch`, `orphan-page`, `broken-internal-link` (page targets) | `/internal-linking` | Update internal link graph, add contextual breadcrumbs, resolve dead internal routes with live indexable URLs. |
-| Broken assets (CSS, JS, fonts), asset-like internal links | `/static-site-css-repair` | Verify static export assets, repair relative paths, fix missing CSS stylesheets and scripts. |
-| `missing-title`, `missing-meta-description`, `missing-h1`, `thin-content` | `/unslop-seo` | Strip AI writing fluff, inject 40-word direct answers, write unique high-density titles/meta descriptions. |
-| `slow-page`, `poor-lcp`, `poor-cls`, `high-tbt`, `crawl-rate-limited` | `/web-perf` | Optimize asset delivery, reduce bundle sizes, eliminate render-blocking resources. |
-| `broken-external-link`, `redirect-3xx`, `server-error-5xx`, default | `/seo-audit` | Replace or prune dead third-party outbound links, resolve origin HTTP 5xx responses. |
+| 1. `canonical-mismatch` | `/internal-linking` | Correct non-canonical links, align rel="canonical" headers and internal link hrefs. |
+| 2. `redirect-loop`, `redirect-chain`, `redirect-3xx` | `/seo-audit` | Replace chained or looping internal redirects with direct final destination URLs. |
+| 3. `broken-external-link` | `/seo-audit` | Replace or prune dead third-party outbound links. |
+| 4. `broken-internal-link` / generic broken links targeting recognized asset paths (`.css`, `.js`, `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.svg`, or `/wp-content/themes/`, `/wp-content/plugins/`, `/wp-content/uploads/`) | `/static-site-css-repair` | Verify static export assets, repair relative paths, fix missing CSS stylesheets, scripts, and theme images. |
+| 5. `broken-internal-link` (standard HTML page targets) | `/internal-linking` | Update internal link graph, add contextual breadcrumbs, resolve dead internal routes with live indexable URLs. |
+| 6. Explicit broken assets (`broken-resource`, `broken-image`, `broken-asset`, `404-resource`) | `/static-site-css-repair` | Repair broken page assets, verify CDN URLs, re-export missing static media. |
+| 7. `server-error-5xx`, `server-error-4xx` | `/seo-audit` | Resolve origin HTTP 5xx responses and edge worker exceptions. |
+| 8. `orphan-page`, internal link family | `/internal-linking` | Provide inbound links from topical parent pages, categories, or sitemaps. |
+| 9. `missing-title`, `missing-meta-description`, `missing-h1`, `thin-content`, `duplicate-title` | `/unslop-seo` | Strip AI writing fluff, inject 40-word direct answers, write unique high-density titles/meta descriptions. |
+| 10. `slow-page`, `poor-lcp`, `poor-cls`, `high-tbt`, `crawl-rate-limited` | `/web-perf` | Optimize asset delivery, reduce bundle sizes, eliminate render-blocking resources. |
+| 11. Default / Unrecognized issues | `/seo-audit` | Fallback general SEO analysis and issue triage. |
 
 ### Playbook 2D: Programmatic Fleet Operations via MCP
+Repository results require the newest completed direct audit with qualifying diagnostic lineage in the active effective roster. Edge results cover active workspace projects.
 ```typescript
 // Query fleet aggregated issues with skill routing (evaluates latest completed audit per active project, partitioned by source)
 // Source lane partitioning:
 // - 'edge': selects newest completed edge audit per project (workflow_instance_id NOT LIKE 'github-audit-%' OR NULL)
-// - 'repository': selects newest completed direct repository audit per project (workflow_instance_id LIKE 'github-audit-%')
+// - 'repository': selects newest completed direct repository audit per project with verified diagnostic lineage in effective roster
 // - 'all' / 'both': selects the union of newest edge audit AND newest repository audit for each active project
 // Limit parameter: default 50, permitted 1–200. Domain must be a valid canonical lowercase hostname.
 const issuesResult = await client.callTool({
@@ -334,6 +342,8 @@ console.log("Execution argv:", auditPlan.structuredContent?.argv);
 ```
 
 ### Playbook 2E: Fleet Telemetry & Inventory Inspection
+Repository results require the newest completed direct audit with qualifying diagnostic lineage in the active effective roster. Edge results cover active workspace projects. The coverage CLI denominator includes unlinked active roster members. Its mapped count may include supplemental repository hints. The status CLI counts active workspace projects.
+GitHub authentication uses ambient `gh api` identity plus raw-download `gh auth token` and explicit `GITHUB_TOKEN` fallback.
 ```powershell
 # View fleet status summary with mutually exclusive coverage stats (completed, running, failed, never_audited)
 # Supports --local or default remote D1 execution
@@ -751,26 +761,36 @@ try {
      const status = statusRes.structuredContent?.status;
      console.log(`Audit phase: ${status?.currentPhase}, crawled: ${status?.pagesCrawled}`);
      ```
-  2. Query issues filtered by severity or issue type (default limit 200, capped at 1,000; omitting `auditId` defaults to most recent completed audit):
+  2. Query issues filtered by severity or issue type (default limit 200, capped at 1,000; omission of `auditId` selects the newest attempt regardless of status). For completed-audit triage, explicitly query and pass a completed audit ID:
      ```ts
+     const history = await client.callTool({
+       name: "list_site_audits",
+       arguments: { projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b" },
+     });
+     const audits = (history.structuredContent as any)?.audits as
+       | { id: string; status: string }[]
+       | undefined;
+     const completed = audits?.find((audit) => audit.status === "completed");
+     if (!completed) throw new Error("No completed audit for this project");
+
      const issues = await client.callTool({
        name: "get_audit_issues",
        arguments: {
          projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
-         auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a",
+         auditId: completed.id,
          severity: "critical",
          issueType: "broken-internal-link",
-         limit: 200
-       }
+         limit: 200,
+       },
      });
      ```
-  3. Query crawled pages (default limit 100, capped at 1,000; filterable by urlContains substring, fetchClass, and statusCode):
+  3. Query crawled pages (default limit 100, capped at 1,000; filterable by `urlContains` substring, `fetchClass`, and `statusCode`; note that repository source pages store HTTP status as NULL, so filtering by `statusCode: 200` excludes direct repository pages):
      ```ts
      const pages = await client.callTool({
        name: "get_audit_pages",
        arguments: {
          projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
-         auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a",
+         auditId: completed.id,
          urlContains: "/category",
          fetchClass: "ok",
          statusCode: 200,
@@ -821,101 +841,101 @@ OpenSEO exposes 78 registered MCP tools in `src/server/mcp/server.ts`:
 | **7. Audit Follow-Through & Fleet Operations** | 8 tools (`run_site_audit`, `list_site_audits`, `delete_site_audit`, `get_audit_status`, `get_audit_issues`, `get_audit_pages`, `get_fleet_issues`, `run_fleet_audit`) | `run_site_audit`: `maxPages` (default 50, edge), `renderJavaScript` (bool), `runLighthouse` (bool). `get_fleet_issues`: `source` (`all`, `edge`, `repository`, `both`), `severity` (`critical`, `warning`, `info`), `limit` (1–200, default 50). `run_fleet_audit`: exactly one selector required (`domain`, `limit` 1–100, or `all: true`), `mode` (`repository_direct` default, `edge_workflow`), `maxPages` (10–10,000, default 2000), `concurrency` (1–5, default 2). | Free D1 edge operations (free tier isolate boundary). Fleet tools constrained to `shared-workspace`. | Single project: `run_site_audit` $\rightarrow$ poll `get_audit_status` $\rightarrow$ triage `get_audit_issues`. Fleet planning: `run_fleet_audit` (emits executable CLI) $\rightarrow$ host execution $\rightarrow$ triage via `get_fleet_issues` with sovereign skill routing. |
 | **8. Reports, Templates & Backlinks** | 10 tools (`list_report_templates`, `save_report_template`, `delete_report_template`, `list_reports`, `save_report`, `get_report`, `delete_report`, `set_report_sharing`, `get_backlinks_overview`, `get_backlinks_profile`) | `projectId` (UUID, required for `list_report_templates`), `templateId`, `reportId`, `title`, `summary`, `html`, `public` (bool), `pageSize` (50/100/200, default 50; `get_report` accepts `includeHtml: true`), `page` (int). | Reports and templates are free D1 operations. Backlinks bill DataForSEO credits. | Template workflow: `list_report_templates` $\rightarrow$ generate HTML report following brief $\rightarrow$ `save_report` $\rightarrow$ optional operator-confirmed `set_report_sharing`. |
 
-### 6.2 Detailed Family Tool Breakdown
+### 6.2 Detailed Family Tool Breakdown & Shipped Input Parameter Contracts
 
 ### Family 1: Workspace and Project Management (8 tools)
 - `whoami`: Read authenticated identity, returning `userEmail`, `scopes`, `mode`, and `creditsRemaining`.
-- `create_project`: Create a new tracked domain project with language and location configuration.
-- `list_projects`: List active projects in caller's organization (can enumerate projects across multiple authorized organizations).
-- `research_project_website`: Crawl and summarize initial project brand data from root page.
-- `save_project_website_setup`: Save initial domain branding and keyword focus during onboarding.
-- `get_project_context`: Retrieve project configuration, target keywords, and brand identity.
-- `update_project_context`: Update project branding, competitors, or target locale.
-- `get_domain_overview`: Get aggregate domain metrics and health status.
+- `create_project`: Create a new tracked domain project with language and location configuration (`domain`, `name`, `languageCode`, `locationCode`).
+- `list_projects`: List active projects in caller's organization (`organizationId`).
+- `research_project_website`: Crawl and summarize initial project brand data from root page (`domain`, `brandName`).
+- `save_project_website_setup`: Save initial domain branding and keyword focus during onboarding (`projectId`, `suggestedTopics` [max 5 topics, each 5 prompts], `suggestedKeywords` [max 15 keywords]).
+- `get_project_context`: Retrieve project configuration, target keywords, and brand identity (`projectId`).
+- `update_project_context`: Update project branding, competitors, or target locale (`projectId`, `name`, `competitors`, `targetAudience`).
+- `get_domain_overview`: Get aggregate domain metrics and health status (`domain`, `includeSubdomains` [boolean, default false]).
 
 ### Family 2: Keyword, Domain and SERP Research (10 tools)
-- `list_saved_keywords`: List enrolled keywords for a project with historical positions.
-- `remove_saved_keywords`: Remove keywords from project tracking.
-- `research_keywords`: Discover new keyword opportunities with search volume and CPC metrics.
-- `save_keywords`: Save discovered keywords to the project keyword library (free operation).
-- `get_domain_keyword_suggestions`: Generate keyword suggestions based on seed domain content.
-- `get_serp_results`: Query live search engine result pages for target keyword and location.
-- `search_serp_locations`: Search supported geographic location codes.
-- `get_ranked_keywords`: Query keywords a target domain already ranks for.
-- `find_serp_competitors`: Identify organic search competitors from shared SERP rankings.
-- `get_keyword_metrics`: Retrieve detailed search volume, difficulty, and intent for keywords.
+- `list_saved_keywords`: List enrolled keywords for a project with historical positions (`projectId`, `tag`).
+- `remove_saved_keywords`: Remove keywords from project tracking (`projectId`, `savedKeywordIds` [array of keyword UUID strings to delete]).
+- `research_keywords`: Discover new keyword opportunities with search volume and CPC metrics (`queries`, `locationCode`, `languageCode`, `includeClickstreamData` [boolean], `groupKeywords` [boolean]).
+- `save_keywords`: Save discovered keywords to project library (`projectId`, `keywords` array, `tagMode` [`"replace"` | `"append"`]).
+- `get_domain_keyword_suggestions`: Generate keyword suggestions based on seed domain content (`domain`, `locationCode`, `languageCode`).
+- `get_serp_results`: Query live search engine result pages (`keyword`, `locationCode`, `languageCode`, `device`).
+- `search_serp_locations`: Search supported geographic location codes (`query`, `countryCode` [required 2-letter ISO country code e.g. `"ID"`, `"US"`]).
+- `get_ranked_keywords`: Query keywords a target domain already ranks for (`target`, `locationCode`, `languageCode`, `resultTypes`, `includeSubdomains` [boolean], `minSearchVolume`, `maxRank`, `excludeBrandTerms` [boolean], `sortBy`, `offset` [pagination integer]).
+- `find_serp_competitors`: Identify organic search competitors from shared SERP rankings (`target`, `locationCode`, `languageCode`, `resultTypes`, `excludeDomains` [array of domain strings to exclude], `includeSubdomains` [boolean], `sortBy`, `offset`).
+- `get_keyword_metrics`: Retrieve detailed search volume, difficulty, and intent for keywords (`keywords` array, `locationCode`, `languageCode`, `includeMonthlyTrends` [boolean], `includeClickstreamData` [boolean], `sortBy`).
 
 ### Family 3: AI Visibility and Prompts (15 tools)
-- `get_ai_visibility_tracker`: Retrieve configured AI visibility tracker configuration.
-- `save_ai_visibility_tracker`: Save configured AI visibility engines and query prompts.
-- `estimate_ai_visibility_cost`: Estimate API credit cost for AI visibility checks before dispatch.
-- `run_ai_visibility_check`: Dispatch one-off or scheduled AI visibility collection run.
-- `get_ai_visibility_run`: Inspect status, results, and citations of a specific AI visibility run.
-- `explore_prompt`: Explore generative AI responses for a prompt query.
-- `generate_ai_visibility_prompts`: Generate candidate visibility prompts for brand tracking.
-- `research_ai_visibility_prompts`: Deep research on market prompts and citation opportunities.
-- `complete_ai_research_setup`: Finalize AI visibility tracker setup with approved prompt set.
-- `set_ai_visibility_schedule`: Configure recurring cron schedule for AI search monitoring.
-- `get_ai_visibility_results`: Retrieve aggregated citations, sentiment, and share of voice.
-- `get_ai_visibility_answer`: Inspect raw answer text from ChatGPT, Perplexity, or Gemini.
-- `get_ai_visibility_sources`: List cited domains and URLs from generative AI answers.
-- `get_ai_visibility_trend`: Retrieve historical citation share trends over time.
-- `export_ai_visibility_data`: Export visibility results to structured JSON/CSV format.
+- `get_ai_visibility_tracker`: Retrieve configured AI visibility tracker configuration (`projectId`).
+- `save_ai_visibility_tracker`: Save configured AI visibility engines and query prompts (`projectId`, `engines`, `prompts`, `archivePromptIds` [array of prompt UUIDs to archive]).
+- `estimate_ai_visibility_cost`: Estimate API credit cost for AI visibility checks before dispatch (`projectId`, `engines`, `prompts`, `promptIds` [array of prompt UUIDs to price]).
+- `run_ai_visibility_check`: Dispatch one-off or scheduled AI visibility collection run (`projectId`, `engines`, `promptIds` [array of prompt UUIDs to run]).
+- `get_ai_visibility_run`: Inspect status, results, and citations of a specific AI visibility run (`projectId`, `runId`).
+- `explore_prompt`: Explore generative AI responses for a prompt query (`prompt`, `models` [array of model slugs], `highlightBrand` [string], `webSearch` [boolean], `webSearchCountryCode` [string]).
+- `generate_ai_visibility_prompts`: Generate candidate visibility prompts for brand tracking (`projectId`, `brandName`, `topic`, `excludePrompts` [array of string prompts to exclude]).
+- `research_ai_visibility_prompts`: Deep research on market prompts and citation opportunities (`projectId`, `query`, `locale`).
+- `complete_ai_research_setup`: Finalize AI visibility tracker setup with approved prompt set (`projectId`, `approvedPrompts`).
+- `set_ai_visibility_schedule`: Configure recurring cron schedule for AI search monitoring (`projectId`, `scheduleInterval` [`"daily"` | `"weekly"` | `"monthly"`], `scheduleTime`, `maxCostUsd`).
+- `get_ai_visibility_results`: Retrieve aggregated citations, sentiment, and share of voice (`projectId`, `promptId`, `includeHistory` [boolean], `competitorGap` [boolean], `branded` [boolean], `cursor` [pagination string]).
+- `get_ai_visibility_answer`: Inspect raw answer text from ChatGPT, Perplexity, or Gemini (`projectId`, `observationId` [observation UUID]).
+- `get_ai_visibility_sources`: List cited domains and URLs from generative AI answers (`projectId`, `promptId`, `includeHistory` [boolean], `competitorGap` [boolean], `branded` [boolean], `cursor`, `groupBy` [`"domain"` | `"url"`], `ownership` [`"all"` | `"owned"` | `"competitor"`]).
+- `get_ai_visibility_trend`: Retrieve historical citation share trends over time (`projectId`, `period`).
+- `export_ai_visibility_data`: Export visibility results to structured JSON/CSV format (`projectId`, `promptId`, `includeHistory` [boolean], `competitorGap` [boolean], `branded` [boolean], `cursor`).
 
 ### Family 4: Rank Tracking Maintenance (7 tools)
-- `create_rank_tracker`: Initialize rank tracking for a project domain.
-- `add_rank_tracking_keywords`: Add keyword queries to active rank tracker.
-- `estimate_rank_tracker_cost`: Calculate DataForSEO credit cost before executing tracking run.
-- `run_rank_tracker`: Execute rank tracking check across search engines.
-- `get_rank_tracker`: Retrieve current positions, SERP features, and ranking distribution.
-- `remove_rank_tracking_keywords`: Delete tracked keywords.
-- `pin_rank_tracking_keywords`: Pin high-priority keywords for quick dashboard access.
+- `create_rank_tracker`: Initialize rank tracking for a project domain (`projectId`, `domain`, `locationCode`, `locationName` [string], `serpDepth` [integer e.g. 100]).
+- `add_rank_tracking_keywords`: Add keyword queries to active rank tracker (`projectId`, `keywords` array, `matchCase` [boolean]).
+- `estimate_rank_tracker_cost`: Calculate DataForSEO credit cost before executing tracking run (`projectId`, `additionalKeywordCount` [integer]).
+- `run_rank_tracker`: Execute rank tracking check across search engines (`projectId`).
+- `get_rank_tracker`: Retrieve current positions, SERP features, and ranking distribution (`projectId`, `offset` [pagination integer]).
+- `remove_rank_tracking_keywords`: Delete tracked keywords (`projectId`, `keywordIds` [array of keyword UUID strings]).
+- `pin_rank_tracking_keywords`: Pin high-priority keywords for quick dashboard access (`projectId`, `keywordIds` [array of keyword UUID strings]).
 
 ### Family 5: Local SEO & Google Business Profile (8 tools)
-- `search_local_businesses`: Search Google Maps businesses by query and coordinates.
-- `get_local_serp_results`: Query local pack search results.
-- `get_google_business_questions`: Retrieve Q&A questions from Google Business Profile.
-- `get_business_profile`: Retrieve complete GBP metadata, hours, and attributes.
-- `get_business_reviews`: Retrieve customer reviews and star ratings.
-- `get_business_updates`: Retrieve posts and updates from Google Business Profile.
-- `list_business_categories`: Search valid Google Business categories.
-- `get_local_rank_grid`: Generate geo-grid rank distribution across geographic coordinates.
+- `search_local_businesses`: Search Google Maps businesses by query and coordinates (`query`, `latitude`, `longitude`, `radiusKm`, `minRating` [1–5], `minReviews` [int], `isClaimed` [boolean], `sortBy`, `offset`).
+- `get_local_serp_results`: Query local pack search results (`query`, `locationCode`, `searchType` [`"organic"` | `"local"` | `"maps"`]).
+- `get_google_business_questions`: Retrieve Q&A questions from Google Business Profile (`businessName` [string], `placeId`, `cid`).
+- `get_business_profile`: Retrieve complete GBP metadata, hours, and attributes (`businessName` [string], `placeId`, `cid`).
+- `get_business_reviews`: Retrieve customer reviews and star ratings (`businessName` [string], `placeId`, `cid`, `sortBy`, `includeOtherSources` [boolean], `taskId` [resumption string]).
+- `get_business_updates`: Retrieve posts and updates from Google Business Profile (`businessName` [string], `placeId`, `cid`, `taskId` [resumption string]).
+- `list_business_categories`: Search valid Google Business categories (`query`, `languageCode`).
+- `get_local_rank_grid`: Generate geo-grid rank distribution across geographic coordinates (`target`, `center`, `gridSize` [3 or 5], `spacingKm`).
 
 ### Family 6: GA4, Search Console & Search Opportunities (12 tools)
-- `get_google_analytics_organic_overview`: High-level organic traffic and engagement metrics.
-- `get_google_analytics_organic_landing_pages`: Landing page traffic acquisition performance.
-- `get_google_analytics_page_performance`: Page-level metrics, bounce rates, and session durations.
-- `get_google_analytics_key_events`: Conversion events and ecommerce goals attributed to search.
-- `get_search_opportunities`: Cross-reference GSC impressions with GA4 conversions to identify quick wins.
-- `get_google_analytics_traffic_acquisition`: Session channel breakdown (organic, direct, referral).
-- `get_google_analytics_measurement_health`: Validate GA4 measurement tag health and event streaming.
-- `get_google_analytics_ecommerce_performance`: Revenue, transactions, and average order value.
-- `get_google_analytics_site_search`: Internal search queries entered by visitors.
-- `get_google_analytics_audience_breakdown`: Visitor demographics, devices, and browsers.
-- `get_search_console_performance`: Query Google Search Console performance data (clicks, impressions, CTR, position).
-- `inspect_urls`: Inspect indexation status and canonical URL indexing via Search Console API.
+- `get_google_analytics_organic_overview`: High-level organic traffic and engagement metrics (`projectId`, `startDate`, `endDate`).
+- `get_google_analytics_organic_landing_pages`: Landing page traffic acquisition performance (`projectId`, `startDate`, `endDate`, `offset` [pagination integer]).
+- `get_google_analytics_page_performance`: Page-level metrics, bounce rates, and session durations (`projectId`, `startDate`, `endDate`, `offset`, `includeDate` [boolean]).
+- `get_google_analytics_key_events`: Conversion events and ecommerce goals attributed to search (`projectId`, `startDate`, `endDate`, `offset`, `comparePreviousPeriod` [boolean]).
+- `get_search_opportunities`: Cross-reference GSC impressions with GA4 conversions to identify quick wins (`projectId`, `minImpressions`, `maxPosition`).
+- `get_google_analytics_traffic_acquisition`: Session channel breakdown (`projectId`, `startDate`, `endDate`, `offset`, `comparePreviousPeriod` [boolean]).
+- `get_google_analytics_measurement_health`: Validate GA4 measurement tag health and event streaming (`projectId`).
+- `get_google_analytics_ecommerce_performance`: Revenue, transactions, and average order value (`projectId`, `startDate`, `endDate`, `offset`, `onlyWithTransactions` [boolean]).
+- `get_google_analytics_site_search`: Internal search queries entered by visitors (`projectId`, `startDate`, `endDate`, `offset`).
+- `get_google_analytics_audience_breakdown`: Visitor demographics, devices, and browsers (`projectId`, `startDate`, `endDate`, `offset`, `comparePreviousPeriod` [boolean]).
+- `get_search_console_performance`: Query Google Search Console performance data (`projectId`, `startDate`, `endDate`, `dimensions`, `dateRange` [string], `filters` [array], `rowLimit` [1–25000], `startRow` [integer], `minPosition`, `maxPosition`, `minImpressions`, `dataState` [`"all"` | `"final"`]).
+- `inspect_urls`: Inspect indexation status and canonical URL indexing via Search Console API (`projectId`, `urls` array).
 
 ### Family 7: Audit Follow-Through & Fleet (8 tools)
-- `run_site_audit`: Trigger live edge HTTP site crawl on auxiliary worker.
-- `list_site_audits`: List historical crawl runs for a project.
-- `delete_site_audit`: Delete a historical crawl run and associated pages/issues.
-- `get_audit_status`: Query active crawl phase, progress percentage, and page counts.
-- `get_audit_issues`: Query detected issues for an audit with severity filtering.
-- `get_audit_pages`: Retrieve crawled URL records and page-level metadata.
-- `get_fleet_issues`: Query aggregated technical SEO issues across the entire enrolled fleet.
-- `run_fleet_audit`: Generate execution plan for fleet-wide audits across enrolled properties.
+- `run_site_audit`: Trigger live edge HTTP site crawl on auxiliary worker (`projectId`, `url`, `maxPages` [default 50], `renderJavaScript` [boolean], `runLighthouse` [boolean]).
+- `list_site_audits`: List historical crawl runs for a project (`projectId`).
+- `delete_site_audit`: Delete a historical crawl run and associated pages/issues (`projectId`, `auditId`).
+- `get_audit_status`: Query active crawl phase, progress percentage, and page counts (`projectId`, `auditId`).
+- `get_audit_issues`: Query detected issues for an audit with severity filtering (`projectId`, `auditId`, `severity`, `issueType`, `limit` [1–1000, default 200]).
+- `get_audit_pages`: Retrieve crawled URL records and page-level metadata (`projectId`, `auditId`, `urlContains`, `fetchClass`, `statusCode`, `limit` [1–1000, default 100]).
+- `get_fleet_issues`: Query aggregated technical SEO issues across the entire enrolled fleet (`source` [`"all"` | `"edge"` | `"repository"` | `"both"`], `severity` [`"critical"` | `"warning"` | `"info"`], `limit` [1–200, default 50], `domain` [canonical host], `issueType`).
+- `run_fleet_audit`: Generate execution plan for fleet-wide audits across enrolled properties (requires exactly one selector: `domain`, `limit` [1–100], or `all: true`; `mode` [`"repository_direct"` | `"edge_workflow"`], `maxPages` [10–10,000, default 2000], `concurrency` [1–5, default 2, edge only]).
 
 ### Family 8: Reports, Templates & Backlinks (10 tools)
-- `list_report_templates`: List available executive report templates.
-- `save_report_template`: Save a custom reusable report layout.
-- `delete_report_template`: Delete a report template.
-- `list_reports`: List generated reports for a project.
-- `save_report`: Save a complete HTML executive report document.
-- `get_report`: Retrieve report HTML and executive summary.
-- `delete_report`: Delete a saved report.
-- `set_report_sharing`: Toggle public sharing link for a report.
-- `get_backlinks_overview`: Domain backlink authority score, referring domains, and total links.
-- `get_backlinks_profile`: Paginated list of referring domains, anchors, and anchor texts.
+- `list_report_templates`: List available executive report templates (`projectId`).
+- `save_report_template`: Save a custom reusable report layout (`projectId`, `title`, `description`, `sections`, `instructions` [rendering instructions/brief]).
+- `delete_report_template`: Delete a report template (`templateId`).
+- `list_reports`: List generated reports for a project (`projectId`, `offset` [pagination integer]).
+- `save_report`: Save a complete HTML executive report document (`projectId`, `title`, `summary`, `html`, `templateId`, `public` [boolean]).
+- `get_report`: Retrieve report HTML and executive summary (`reportId`, `includeHtml` [boolean]).
+- `delete_report`: Delete a saved report (`reportId`).
+- `set_report_sharing`: Toggle public sharing link for a report (`reportId`, `public` [boolean]).
+- `get_backlinks_overview`: Domain backlink authority score, referring domains, and total links (`target`, `hideSpam` [boolean, default false]).
+- `get_backlinks_profile`: Paginated list of referring domains, anchors, and anchor texts (`target`, `limit`, `offset`, `sortField`, `sortOrder`, `filters`, `hideSpam` [boolean, default false]).
 
 ---
 
