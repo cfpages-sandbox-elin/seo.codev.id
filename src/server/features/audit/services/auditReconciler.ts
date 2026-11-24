@@ -11,7 +11,7 @@
  *     error is copied into the row before Workflows retention deletes it.
  */
 import { env } from "cloudflare:workers";
-import { and, eq, isNotNull, notLike, sql } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, notLike, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { audits, projects } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
@@ -106,10 +106,76 @@ export async function reconcileRunningAudit(
   return errorInfo;
 }
 
+type WatchdogCursor = {
+  startedAt: string;
+  id: string;
+} | null;
+
+let sweepCursor: WatchdogCursor = null;
+
+function resetWatchdogCursor() {
+  sweepCursor = null;
+}
+
+function getWatchdogCursor(): WatchdogCursor {
+  return sweepCursor;
+}
+
 /** Cron watchdog: sweep stale running audits and reconcile each. */
-export async function reconcileStaleAudits() {
+export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
   const cutoff = new Date(Date.now() - STALE_RUNNING_AFTER_MS);
-  const stale = await getStaleRunningAudits(cutoff, WATCHDOG_BATCH_LIMIT);
+  let activeCursor =
+    overrideCursor !== undefined ? overrideCursor : sweepCursor;
+  let stale = await getStaleRunningAudits(
+    cutoff,
+    WATCHDOG_BATCH_LIMIT,
+    activeCursor,
+  );
+
+  // Sol R1: If bounded keyset reached the end, wrap around to the beginning
+  if (stale.length === 0 && activeCursor !== null) {
+    activeCursor = null;
+    stale = await getStaleRunningAudits(cutoff, WATCHDOG_BATCH_LIMIT, null);
+  }
+
+  // Update cursor for next sweep
+  if (stale.length > 0) {
+    const last = stale[stale.length - 1];
+    sweepCursor = { startedAt: last.startedAt, id: last.id };
+  } else {
+    sweepCursor = null;
+  }
+
+  // Reconcile legacy running rows with NULL workflow_instance_id that are older than cutoff
+  // (Sol R1: "Handle historical null IDs via a separately scoped recovery rule.")
+  const isPg = getDatabaseProvider() === "postgres";
+  const cutoffIso = cutoff.toISOString();
+  const nullTimestampPredicate = isPg
+    ? sql`${audits.startedAt}::timestamptz < ${cutoffIso}::timestamptz`
+    : sql`julianday(${audits.startedAt}) < julianday(${cutoffIso})`;
+
+  try {
+    const nullInstanceAudits = await db.query.audits.findMany({
+      where: and(
+        eq(audits.status, "running"),
+        isNull(audits.workflowInstanceId),
+        nullTimestampPredicate,
+      ),
+      limit: 20,
+      columns: {
+        id: true,
+        currentPhase: true,
+      },
+    });
+
+    for (const legacy of nullInstanceAudits) {
+      await AuditRepository.failAudit(legacy.id, "none", {
+        errorCode: "instance_lost",
+        errorDetail: "Legacy running audit has null workflow instance ID",
+        failedPhase: legacy.currentPhase,
+      });
+    }
+  } catch {}
 
   for (const audit of stale) {
     try {
@@ -148,28 +214,37 @@ export async function reconcileStaleAudits() {
  * are stored as text, so this compares lexicographically: PG rows use ISO
  * with a "T", D1-default rows use "YYYY-MM-DD HH:MM:SS" (space < "T", so a
  * same-day ISO cutoff would misorder against D1 rows without the reformat).
+ * Sol R1: Uses (startedAt, id) keyset pagination and tiebreaker so later stranded rows
+ * are never starved by earlier stalled rows.
  */
-async function getStaleRunningAudits(cutoff: Date, limit: number) {
+async function getStaleRunningAudits(
+  cutoff: Date,
+  limit: number,
+  cursor: WatchdogCursor = sweepCursor,
+) {
   const isPg = getDatabaseProvider() === "postgres";
   const cutoffIso = cutoff.toISOString();
   const timestampPredicate = isPg
     ? sql`${audits.startedAt}::timestamptz < ${cutoffIso}::timestamptz`
     : sql`julianday(${audits.startedAt}) < julianday(${cutoffIso})`;
 
-  // Oldest first: genuinely dead audits age past the cutoff and stay there,
-  // while long-but-live crawls are the newest of the stale set — without a
-  // deterministic order they could occupy the whole batch every sweep and
-  // starve real zombies.
+  const cursorPredicate = cursor
+    ? isPg
+      ? sql`(${audits.startedAt}::timestamptz > ${cursor.startedAt}::timestamptz OR (${audits.startedAt}::timestamptz = ${cursor.startedAt}::timestamptz AND ${audits.id} > ${cursor.id}))`
+      : sql`(julianday(${audits.startedAt}) > julianday(${cursor.startedAt}) OR (julianday(${audits.startedAt}) = julianday(${cursor.startedAt}) AND ${audits.id} > ${cursor.id}))`
+    : undefined;
+
   return db.query.audits.findMany({
     where: and(
       eq(audits.status, "running"),
       isNotNull(audits.workflowInstanceId),
       notLike(audits.workflowInstanceId, "github-audit-%"),
       timestampPredicate,
+      cursorPredicate,
     ),
     orderBy: isPg
-      ? sql`${audits.startedAt}::timestamptz ASC`
-      : sql`julianday(${audits.startedAt}) ASC`,
+      ? [sql`${audits.startedAt}::timestamptz ASC`, sql`${audits.id} ASC`]
+      : [sql`julianday(${audits.startedAt}) ASC`, sql`${audits.id} ASC`],
     columns: {
       id: true,
       workflowInstanceId: true,

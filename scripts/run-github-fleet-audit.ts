@@ -29,6 +29,7 @@ import {
   isValidCanonicalHostname,
   isValidRepoSlug,
   discoverGitHubTree,
+  resolveGitHubHead,
   selectEffectiveRosterVersion,
   executeD1SqlBatches,
   acquireVerifiedBlob,
@@ -211,20 +212,25 @@ const normalizeRoute = (urlOrPath: string): string => {
   return `${host}${path}`;
 };
 
-function boundIssueDetails(details: any, maxBytes = 3500): string | null {
+function boundIssueDetails(details: any, maxBytes = 3499): string | null {
   if (!details || typeof details !== "object") return null;
-  const candidate = JSON.stringify(details);
-  if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
-    return candidate;
+
+  try {
+    const candidate = JSON.stringify(details);
+    if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
+      return candidate;
+    }
+  } catch {}
+
+  let targetUrl =
+    typeof details.targetUrl === "string" ? details.targetUrl : undefined;
+  let message =
+    typeof details.message === "string" ? details.message : undefined;
+
+  if (message && message.length > 200) {
+    message = message.slice(0, 200);
   }
-  const targetUrl =
-    typeof details.targetUrl === "string"
-      ? details.targetUrl.slice(0, 1000)
-      : undefined;
-  const message =
-    typeof details.message === "string"
-      ? details.message.slice(0, 500)
-      : undefined;
+
   const fallback = JSON.stringify({
     ...details,
     targetUrl,
@@ -234,7 +240,28 @@ function boundIssueDetails(details: any, maxBytes = 3500): string | null {
   if (Buffer.byteLength(fallback, "utf8") <= maxBytes) {
     return fallback;
   }
-  return JSON.stringify({ targetUrl, _truncated: true });
+
+  // Progressively truncate targetUrl until valid JSON strictly fits within maxBytes
+  if (targetUrl) {
+    let curUrl = targetUrl.slice(0, 500);
+    while (curUrl.length > 20) {
+      const minimal = JSON.stringify({
+        targetUrl: curUrl,
+        message,
+        _truncated: true,
+      });
+      if (Buffer.byteLength(minimal, "utf8") <= maxBytes) {
+        return minimal;
+      }
+      curUrl = curUrl.slice(0, Math.floor(curUrl.length * 0.7));
+    }
+  }
+
+  const marker = JSON.stringify({ _truncated: true });
+  if (Buffer.byteLength(marker, "utf8") <= maxBytes) {
+    return marker;
+  }
+  return null;
 }
 
 async function auditRepository(
@@ -270,15 +297,30 @@ async function auditRepository(
     );
 
     if (!isForce) {
+      const normalizedRoot = mapping.publishRoot ?? ".";
       const existingSameCommit = runD1Query(
-        `SELECT id FROM audits WHERE project_id = '${projectId}' AND status = 'completed' AND workflow_instance_id LIKE 'github-audit-%' AND config LIKE '%"${commitSha}"%' AND pages_total > 0 AND pages_crawled >= pages_total LIMIT 1;`,
+        `SELECT id, config FROM audits WHERE project_id = '${projectId}' AND status = 'completed' AND workflow_instance_id LIKE 'github-audit-%' AND json_extract(config, '$.source') = 'github_repository_direct' AND json_extract(config, '$.commitSha') = '${commitSha}' AND json_extract(config, '$.repoName') = '${repoName}' AND coalesce(json_extract(config, '$.publishRoot'), '.') = '${normalizedRoot}' AND pages_total > 0 AND pages_crawled >= pages_total LIMIT 1;`,
         isRemote,
       );
       if (existingSameCommit.length > 0) {
-        console.log(
-          `[REUSED] Project ${domain} already has a completed audit for commit ${commitSha.slice(0, 10)}. Use --force to re-audit.`,
-        );
-        return true;
+        let isMatch = false;
+        try {
+          const cfg = JSON.parse(existingSameCommit[0].config);
+          if (
+            cfg.source === "github_repository_direct" &&
+            cfg.repoName === repoName &&
+            (cfg.publishRoot ?? ".") === normalizedRoot &&
+            cfg.commitSha === commitSha
+          ) {
+            isMatch = true;
+          }
+        } catch {}
+        if (isMatch) {
+          console.log(
+            `[REUSED] Project ${domain} already has a completed audit for commit ${commitSha.slice(0, 10)}. Use --force to re-audit.`,
+          );
+          return true;
+        }
       }
     }
   } catch (err: any) {
@@ -512,7 +554,6 @@ async function auditRepository(
     WHERE NOT EXISTS (
       SELECT 1 FROM audits
       WHERE project_id = '${projectId}' AND status = 'running'
-        AND workflow_instance_id LIKE 'github-audit-%'
     );`,
     ],
     isRemote,
@@ -1145,10 +1186,14 @@ function verifyDiagnosticTriple(
         SELECT count(*)
         FROM fleet_run_items fri
         JOIN fleet_runs fr ON fr.id = fri.run_id
+        JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
         WHERE fri.audit_id = '${auditId}'
           AND fri.member_id = '${memberId}'
           AND fr.roster_version_id = '${rosterId}'
           AND fri.primary_series_key = 'diagnostic'
+          AND fs.series_key = 'diagnostic'
+          AND fr.status = '${expectedRunStatus}'
+          AND fri.status = '${expectedItemStatus}'
       );
   `;
   const res = runD1Query(query, isRemote);
@@ -1208,15 +1253,29 @@ function repairDiagnosticObservation(
         .slice(0, 16);
 
     const counts = runD1Query(
-      `SELECT a.pages_crawled, a.pages_total, a.completed_at,
-              (SELECT COUNT(*) FROM audit_issues WHERE audit_id = a.id) as issue_count
-       FROM audits a WHERE a.id = '${auditId}';`,
+      `SELECT a.pages_crawled, a.pages_total, a.completed_at, a.status,
+              (SELECT COUNT(*) FROM audit_issues WHERE audit_id = a.id) as issue_count,
+              (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) as page_count,
+              (SELECT COUNT(*) FROM audit_issues i WHERE i.audit_id = a.id AND i.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages p WHERE p.id = i.page_id AND p.audit_id = a.id)) as orphaned_count
+       FROM audits a WHERE a.id = '${auditId}' AND a.project_id = '${projectId}';`,
       isRemote,
     );
     if (counts.length === 0) return false;
-    const { pages_crawled, pages_total, completed_at, issue_count } = counts[0];
+    const {
+      pages_crawled,
+      pages_total,
+      completed_at,
+      issue_count,
+      page_count,
+      orphaned_count,
+      status,
+    } = counts[0];
+    if (status !== "completed") return false;
     const crawled = Number(pages_crawled || 0);
-    const total = Number(pages_total || 1);
+    const total = Number(pages_total || 0);
+    if (total === 0 || crawled < total) return false;
+    if (Number(page_count || 0) < total) return false;
+    if (Number(orphaned_count || 0) > 0) return false;
     const issues = Number(issue_count || 0);
 
     const score = Math.max(
@@ -1452,70 +1511,76 @@ async function main() {
     }
   }
 
-  // Load deterministic latest completed source audits with verified diagnostic triple (Sol F02, F07, F10, A2)
-  const completedAudits = runD1Query(
-    `WITH ranked_audits AS (
-       SELECT a.id, a.project_id, a.completed_at, a.config, a.pages_total, a.pages_crawled,
-              ROW_NUMBER() OVER (
-                PARTITION BY a.project_id
-                ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
-              ) AS audit_rank
+  interface CompletedAuditMatch {
+    id: string;
+    hasDiagnostic: boolean;
+  }
+
+  function findMatchingCompletedAudit(
+    projectId: string,
+    repoName: string,
+    publishRoot: string,
+    commitSha: string,
+    effectiveRosterId: string | null,
+    isRemote = true,
+  ): CompletedAuditMatch | null {
+    const normalizedRoot = publishRoot || ".";
+    const rows = runD1Query(
+      `SELECT a.id, a.config,
+              (
+                SELECT COUNT(*)
+                FROM fleet_runs r
+                JOIN fleet_run_items fri ON fri.run_id = r.id
+                JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
+                JOIN fleet_roster_members rm ON fri.member_id = rm.id
+                WHERE fri.audit_id = a.id
+                  AND fri.primary_series_key = 'diagnostic'
+                  AND fs.series_key = 'diagnostic'
+                  AND r.status = 'completed'
+                  AND fri.status = 'completed'
+                  AND fri.project_id = a.project_id
+                  AND fs.project_id = a.project_id
+                  AND fs.member_id = fri.member_id
+                  AND rm.project_id = a.project_id
+                  AND fs.canonical_host = rm.canonical_host
+                  AND r.organization_id = 'shared-workspace'
+                  ${effectiveRosterId ? `AND r.roster_version_id = '${effectiveRosterId}' AND rm.version_id = '${effectiveRosterId}'` : ""}
+              ) AS has_verified_triple
        FROM audits a
-       WHERE a.status = 'completed'
+       WHERE a.project_id = '${projectId}'
+         AND a.status = 'completed'
          AND a.workflow_instance_id LIKE 'github-audit-%'
          AND a.pages_total > 0
          AND a.pages_crawled >= a.pages_total
-     )
-     SELECT ra.id, ra.project_id, ra.config, ra.pages_total, ra.pages_crawled,
-            (
-              SELECT COUNT(*)
-              FROM fleet_runs r
-              JOIN fleet_run_items fri ON fri.run_id = r.id
-              JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
-              JOIN fleet_roster_members rm ON fri.member_id = rm.id
-              WHERE fri.audit_id = ra.id
-                AND fri.primary_series_key = 'diagnostic'
-                AND fs.series_key = 'diagnostic'
-                AND r.status = 'completed'
-                AND fri.status = 'completed'
-                AND fri.project_id = ra.project_id
-                AND fs.project_id = ra.project_id
-                AND fs.member_id = fri.member_id
-                AND rm.project_id = ra.project_id
-                AND fs.canonical_host = rm.canonical_host
-                AND r.organization_id = 'shared-workspace'
-                ${effectiveRoster ? `AND r.roster_version_id = '${effectiveRoster.id}' AND rm.version_id = '${effectiveRoster.id}'` : ""}
-            ) AS has_verified_triple
-     FROM ranked_audits ra
-     WHERE ra.audit_rank = 1;`,
-    isRemote,
-  );
-  const auditByProjectId = new Map<
-    string,
-    {
-      id: string;
-      repoName: string | null;
-      commitSha: string | null;
-      publishRoot: string | null;
-      pagesTotal: number;
-      pagesCrawled: number;
-      hasDiagnostic: boolean;
-    }
-  >();
-  for (const a of completedAudits) {
-    let cfg: any = null;
+         AND json_extract(a.config, '$.source') = 'github_repository_direct'
+         AND json_extract(a.config, '$.commitSha') = '${commitSha}'
+         AND json_extract(a.config, '$.repoName') = '${repoName}'
+         AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = '${normalizedRoot}'
+       ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
+       LIMIT 1;`,
+      isRemote,
+    );
+
+    if (rows.length === 0) return null;
+    const row = rows[0];
     try {
-      cfg = a.config ? JSON.parse(a.config) : null;
-    } catch {}
-    auditByProjectId.set(a.project_id, {
-      id: a.id,
-      repoName: cfg?.repoName ?? null,
-      commitSha: cfg?.commitSha ?? null,
-      publishRoot: cfg?.publishRoot ?? null,
-      pagesTotal: Number(a.pages_total ?? 0),
-      pagesCrawled: Number(a.pages_crawled ?? 0),
-      hasDiagnostic: Number(a.has_verified_triple ?? 0) === 1,
-    });
+      const cfg = JSON.parse(row.config);
+      if (
+        cfg.source !== "github_repository_direct" ||
+        cfg.repoName !== repoName ||
+        (cfg.publishRoot ?? ".") !== normalizedRoot ||
+        cfg.commitSha !== commitSha
+      ) {
+        return null;
+      }
+    } catch {
+      return null;
+    }
+
+    return {
+      id: row.id,
+      hasDiagnostic: Number(row.has_verified_triple ?? 0) === 1,
+    };
   }
 
   const repoMappings = loadRepoMappings();
@@ -1545,26 +1610,40 @@ async function main() {
       );
       process.exit(1);
     }
-    const existingAudit = auditByProjectId.get(projId);
-    const isMatchingSource =
-      existingAudit !== undefined &&
-      existingAudit.pagesTotal > 0 &&
-      existingAudit.pagesCrawled >= existingAudit.pagesTotal &&
-      existingAudit.repoName === repoMeta.repoName &&
-      (existingAudit.publishRoot ?? ".") === (repoMeta.publishRoot ?? ".");
 
-    if (!force && isMatchingSource) {
+    let headInfo: { branch: string; commitSha: string } | null = null;
+    try {
+      headInfo = resolveGitHubHead(repoMeta.repoName);
+    } catch (e: any) {
+      console.warn(
+        `Could not resolve git head for ${repoMeta.repoName}:`,
+        e?.message,
+      );
+    }
+
+    const matchingAudit = headInfo
+      ? findMatchingCompletedAudit(
+          projId,
+          repoMeta.repoName,
+          repoMeta.publishRoot ?? ".",
+          headInfo.commitSha,
+          effectiveRoster?.id ?? null,
+          isRemote,
+        )
+      : null;
+
+    if (!force && matchingAudit) {
       const isRosterMember = approvedHosts.has(targetDomain);
-      if (isRosterMember && !existingAudit.hasDiagnostic) {
+      if (isRosterMember && !matchingAudit.hasDiagnostic) {
         plannedActions.push({
           kind: "repair",
           domain: targetDomain,
           projectId: projId,
-          auditId: existingAudit.id,
+          auditId: matchingAudit.id,
         });
       } else {
         console.log(
-          `[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit matching ${repoMeta.repoName}. Use --force to re-audit.`,
+          `[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit matching ${repoMeta.repoName} at commit ${headInfo?.commitSha.slice(0, 10)}. Use --force to re-audit.`,
         );
         return;
       }
@@ -1583,22 +1662,32 @@ async function main() {
           ? approvedMember.projectId
           : projectIdByDomain.get(dom);
       if (projId && isEligible) {
-        const existingAudit = auditByProjectId.get(projId);
-        const isMatchingSource =
-          existingAudit !== undefined &&
-          existingAudit.pagesTotal > 0 &&
-          existingAudit.pagesCrawled >= existingAudit.pagesTotal &&
-          existingAudit.repoName === m.repoName &&
-          (existingAudit.publishRoot ?? ".") === (m.publishRoot ?? ".");
+        let headInfo: { branch: string; commitSha: string } | null = null;
+        if (!force) {
+          try {
+            headInfo = resolveGitHubHead(m.repoName);
+          } catch {}
+        }
 
-        if (!force && isMatchingSource) {
+        const matchingAudit = headInfo
+          ? findMatchingCompletedAudit(
+              projId,
+              m.repoName,
+              m.publishRoot ?? ".",
+              headInfo.commitSha,
+              effectiveRoster?.id ?? null,
+              isRemote,
+            )
+          : null;
+
+        if (!force && matchingAudit) {
           const isRosterMember = approvedHosts.has(dom);
-          if (isRosterMember && !existingAudit.hasDiagnostic) {
+          if (isRosterMember && !matchingAudit.hasDiagnostic) {
             plannedActions.push({
               kind: "repair",
               domain: dom,
               projectId: projId,
-              auditId: existingAudit.id,
+              auditId: matchingAudit.id,
             });
           } else {
             continue; // Reused

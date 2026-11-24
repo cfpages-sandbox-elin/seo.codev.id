@@ -2,6 +2,67 @@
  * Shared audit issue skill router for CLI and MCP surfaces.
  * Maps audit issue types and resource URLs to the appropriate remediation skill and action.
  */
+
+const STATIC_EXTENSIONS = [
+  ".css",
+  ".js",
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".svg",
+] as const;
+
+const WP_CONTENT_MARKERS = [
+  "/wp-content/themes/",
+  "/wp-content/plugins/",
+  "/wp-content/uploads/",
+] as const;
+
+const BROKEN_LINK_PATTERNS = [
+  "broken-link",
+  "broken-internal-link",
+  "broken-external-link",
+] as const;
+
+const BROKEN_ASSET_PATTERNS = [
+  "broken-image",
+  "broken-resource",
+  "broken-asset",
+  "404-resource",
+] as const;
+
+const ON_PAGE_PATTERNS = [
+  "title",
+  "description",
+  "heading",
+  "thin-content",
+  "duplicate",
+  "alt",
+] as const;
+
+const PERF_PATTERNS = [
+  "slow",
+  "speed",
+  "large-page",
+  "lighthouse",
+] as const;
+
+function hasAny(target: string, patterns: readonly string[]): boolean {
+  for (const pattern of patterns) {
+    if (target.includes(pattern)) return true;
+  }
+  return false;
+}
+
+function hasAnySuffix(target: string, suffixes: readonly string[]): boolean {
+  for (const suffix of suffixes) {
+    if (target.endsWith(suffix)) return true;
+  }
+  return false;
+}
+
 export function routeIssueToSkill(
   issueType: string,
   url: string = "",
@@ -15,18 +76,11 @@ export function routeIssueToSkill(
   }
 
   const isStaticAsset =
-    pathname.endsWith(".css") ||
-    pathname.endsWith(".js") ||
-    pathname.endsWith(".png") ||
-    pathname.endsWith(".jpg") ||
-    pathname.endsWith(".jpeg") ||
-    pathname.endsWith(".gif") ||
-    pathname.endsWith(".webp") ||
-    pathname.endsWith(".svg") ||
-    pathname.includes("/wp-content/");
+    hasAnySuffix(pathname, STATIC_EXTENSIONS) ||
+    hasAny(pathname, WP_CONTENT_MARKERS);
 
-  // High-value specific routes by descriptor
-  if (code === "canonical-conflict" || code.includes("canonical")) {
+  // 1. Canonical conflicts always route to internal-linking
+  if (code.includes("canonical")) {
     return {
       skill: "internal-linking",
       action:
@@ -34,15 +88,25 @@ export function routeIssueToSkill(
     };
   }
 
-  if (code === "redirect-loop" || code === "redirect-chain") {
+  // 2. Redirect loops vs redirect chains (Sol T2)
+  if (code.includes("redirect-loop")) {
     return {
       skill: "seo-audit",
       action:
-        "Identify the mutually redirecting URLs and make the intended destination return directly.",
+        "Identify circular redirect loops and break the cycle so the URL resolves cleanly.",
     };
   }
 
-  if (code === "broken-link") {
+  if (code.includes("redirect-chain")) {
+    return {
+      skill: "seo-audit",
+      action:
+        "Shorten multi-hop redirect chains so the source URL redirects directly to the final intended destination.",
+    };
+  }
+
+  // 3. Broken link classes (broken-link, broken-internal-link, broken-external-link)
+  if (hasAny(code, BROKEN_LINK_PATTERNS)) {
     if (isStaticAsset) {
       return {
         skill: "static-site-css-repair",
@@ -57,11 +121,8 @@ export function routeIssueToSkill(
     };
   }
 
-  if (
-    code.includes("broken-image") ||
-    code.includes("broken-resource") ||
-    (isStaticAsset && !code.includes("canonical"))
-  ) {
+  // 4. Broken asset classes (broken-image, broken-resource, 404 on assets)
+  if (hasAny(code, BROKEN_ASSET_PATTERNS)) {
     return {
       skill: "static-site-css-repair",
       action:
@@ -69,6 +130,16 @@ export function routeIssueToSkill(
     };
   }
 
+  // 5. Server errors (HTTP 5xx)
+  if (code.includes("server-error") || code.includes("5xx")) {
+    return {
+      skill: "seo-audit",
+      action:
+        "Investigate HTTP 5xx server error, isolate endpoint failure, and restore reliable response.",
+    };
+  }
+
+  // 6. Orphans and internal linking
   if (code.includes("orphan") || code.includes("internal-link")) {
     return {
       skill: "internal-linking",
@@ -77,13 +148,8 @@ export function routeIssueToSkill(
     };
   }
 
-  if (
-    code.includes("title") ||
-    code.includes("description") ||
-    code.includes("heading") ||
-    code.includes("thin-content") ||
-    code.includes("duplicate")
-  ) {
+  // 7. On-page content issues (titles, descriptions, headings, alt text)
+  if (hasAny(code, ON_PAGE_PATTERNS)) {
     return {
       skill: "unslop-seo",
       action:
@@ -91,12 +157,8 @@ export function routeIssueToSkill(
     };
   }
 
-  if (
-    code.includes("slow") ||
-    code.includes("speed") ||
-    code.includes("large-page") ||
-    code.includes("lighthouse")
-  ) {
+  // 8. Performance issues
+  if (hasAny(code, PERF_PATTERNS)) {
     return {
       skill: "web-perf",
       action:

@@ -83,8 +83,12 @@ unmapped → exempt → unavailable → terminal partial (fresh_partial or stale
 
 **Interval Display Contract**: Provisional interval $[L, U]$ is a rendering presentation rule displayed if and only if:
 1. Reconciled evidence coverage satisfies $80\% \le C < 100\%$.
-2. Admitted observation evidence provides reconciled upper and lower bounds.
+2. Admitted observation evidence provides reconciled upper and lower bounds agreeing with earned mass.
 If observation evidence is missing, contradictory, or fails to reconcile, the score displays as `—` (unavailable/incomplete). Full point scores require $C = 100\%$. Freshness evaluation (10-day TTL window) and unavailable precedence operate independently of interval display eligibility.
+
+**10-Day Freshness TTL vs. 21-Day Trend Comparability Window**:
+- **10-Day Freshness TTL (`FRESHNESS_TTL_MS = 10 * 86_400_000`)**: Evaluates status badge freshness. Completed audits older than 10 days receive the `stale` badge on `/onsite`.
+- **21-Day Comparability Window (`COMPARABLE_BASELINE_WINDOW_MS = 21 * 86_400_000`)**: Governs historical trend comparability in `fleet_change_verifications` and delta tracking. Two baseline snapshots can only be compared for causal attribution (improvement or regression) if their observation gap is $\le 21$ days. Gaps exceeding 21 days return `null` (baseline expired).
 
 **Critical Incident Cap**: Requires qualified confirmation (`parseIncidentConfirmation` in `fleetEvidence.ts`) with essential failure codes (DNS failure, TLS failure, origin connection drops), verified expected intent, independent corroboration probe, and finite confirmation timestamps. Validated incidents cap the maximum score at **59 (F)** with a critical incident badge.
 
@@ -113,7 +117,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 ### Lane 1: Commit-Pinned GitHub Direct Audit Engine (`run-github-fleet-audit.ts`) — Primary Source Diagnostic Lane
 - **Purpose**: Rapid, high-volume static source inspection directly from GitHub repositories without Worker isolate memory ceilings.
 - **Commit Pinning**: Resolves target branch to an immutable commit SHA (`gh api /repos/:owner/:repo/commits/:branch`). All Git tree queries and blob reads are bound to this commit.
-- **Git Tree Discovery**: Retrieves up to 100,000 files in a single atomic call (`GET /repos/:owner/:repo/git/trees/:commitSha?recursive=1`). Fails fast if `truncated: true`.
+- **Git Tree Discovery**: Retrieves up to 100,000 files in a single atomic call (`GET /repos/:owner/:repo/git/trees/:commitSha?recursive=1`), bounded by GitHub API's 100,000 entry and 7 MB response payload cap. Fails fast if `truncated: true` (requiring recursive subtree enumeration).
 - **Zero Edge Heap Pressure**: HTML parsing, heading extraction, meta tag inspection, and OpenGraph analysis execute host-side in Node.js, completely bypassing Cloudflare Workers Free Tier 128 MB isolate memory ceiling.
 - **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/index.htm` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set using unified route indexing and domain host equivalence (supporting HTTP/HTTPS and apex/www pairs on default ports 80/443) to detect broken links and orphan pages with zero network calls.
 - **Staged D1 Persistence**:
@@ -129,21 +133,23 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **Purpose**: Full live HTTP validation, external third-party crawls, robots.txt enforcement, and real edge TTFB latency measurement. (Note: neither `run-fleet-audits.ts` nor `run_site_audit` publishes official weekly fleet snapshots; official weekly baseline grading is reserved for dedicated aggregate grading publishers).
 - **Control Plane (`SiteAuditWorkflow`):** Cloudflare Workflow managing phase ordering, retries, and failure states on `open-seo-selfhost-audit`.
 - **Data Plane (`AuditScratchpad`):** SQLite-backed Durable Object instance per audit (`idFromName(auditId)`). Manages URL frontier leases in chunks of up to 100 URLs.
-- **Limits & Defaults**: Edge crawler defaults to 500 pages (max 10,000 for self-hosted instances) and concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`). When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots until workflows terminate. JavaScript-rendered crawls up to 1,000 pages (`RENDERED_MAX_AUDIT_PAGES`) via Cloudflare Browser Run.
+- **Limits, Defaults & Robots Scope**: Edge crawler defaults to 500 pages (max 10,000 for self-hosted instances) and concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`). Respects `robots.txt` disallow rules and hostname boundaries. When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots; if an in-flight audit exceeds 20 minutes (15m + 5m drain), the runner terminates queue drain. JavaScript-rendered crawls up to 1,000 pages (`RENDERED_MAX_AUDIT_PAGES`) via Cloudflare Browser Run.
 
 ---
 
 ## 4. Operational Playbooks: Fleet & Site Audit
 
 ### Playbook 1: Roster Enrollment & Turnkey Linking
-**Prerequisites**:
-- The parent organization row (`id = 'shared-workspace'`) must exist in D1 before importing rosters to satisfy foreign key constraints.
-- Approval JSON requires canonical schema fields: `organizationId`, `versionTag`, `rosterPlanSha256`, `approvedBy`, and optional `approvedAt` (ISO timestamp).
-- Importer execution (`import-fleet-roster.ts`) has local-only semantics (runs against local D1 `DB`). To compute the canonical roster plan SHA-256 for the approval file without mutating D1:
+**Prerequisites & Environment Architecture**:
+- **Organization Bootstrap Prerequisite**: The parent organization row (`id = 'shared-workspace'`) must exist in D1 before importing rosters to satisfy foreign key constraints.
+- **Port & State Topology**: Local Vite frontend runs on port `3001` (default), auxiliary audit worker / local Wrangler dev runs on port `8787`, and both bind to shared local D1 state at `.wrangler/state/v3/d1`.
+- **Approval Protocol**: Approval JSON requires canonical schema fields: `organizationId`, `versionTag`, `rosterPlanSha256`, `approvedBy`, and optional `approvedAt` (ISO timestamp).
+- **Importer Semantics**: Importer execution (`import-fleet-roster.ts`) has local-only semantics (runs against local D1 `DB`). To compute the canonical roster plan SHA-256 for the approval file without mutating D1:
   ```powershell
   node --import tsx --input-type=module -e 'import {hashCanonicalRosterPlan} from "./scripts/import-fleet-roster.ts"; import {FLEET_MANIFEST_MEMBERS} from "./src/server/features/fleet/data/fleetManifest.ts"; console.log(hashCanonicalRosterPlan("shared-workspace", FLEET_MANIFEST_MEMBERS))'
   ```
-- Fleet linking (`link-github-fleet.ts`) defaults to local D1 (`DB`); pass `--remote` for remote production D1 (`open-seo-db-selfhost`), scoped via `--org-id` (default `shared-workspace`). It requires an existing effective approved roster in D1 (`approved_at IS NOT NULL AND julianday(approved_at) <= julianday('now')`). Always preview mutations with `--dry-run` before applying live. (Note: legacy `generate-fleet-linking-sql.ts` is retired).
+- **Turnkey Fleet Linking**: Fleet linking (`link-github-fleet.ts`) defaults to local D1 (`DB`); pass `--remote` for remote production D1 (`open-seo-db-selfhost`), scoped via `--org-id` (default `shared-workspace`). It requires an existing effective approved roster in D1 (`approved_at IS NOT NULL AND julianday(approved_at) <= julianday('now')`). Always preview mutations with `--dry-run` before applying live. (Note: legacy `generate-fleet-linking-sql.ts` is retired).
+- **Recency Filter Bypass**: In `run-fleet-audits.ts`, passing `--domain <host>` targets that domain exclusively and completely bypasses the 10-day recency cutoff filter, whereas `--all` and `--limit` filter out domains audited within the last 10 days unless `--no-skip-recent` is passed.
 
 For fresh **local development** (`localhost:3001` / `wrangler dev` on `8787`):
 ```powershell
@@ -222,7 +228,7 @@ For live HTTP validation across deployed sites, dispatch via the CLI edge runner
 > **Lifecycle, Defaults & Drain**:
 > - Directly invoked edge CLI defaults to 500 pages (max 10,000 for self-hosted instances) and selects `auto` Lighthouse, with concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`).
 > - In contrast, the single-site MCP tool (`run_site_audit`) defaults to 50 pages and leaves Lighthouse off.
-> - **Drain & Pause Window**: When in-flight audits exceed the 15-minute deadline, new admissions pause. The runner executes a bounded 20-minute drain; if active workflows fail to terminate within the drain limit, the command logs active and undispatched counts and exits with failure code 1.
+> - **Drain & Pause Window**: When in-flight audits exceed the 15-minute deadline, new admissions pause to protect the concurrency window. The runner allows a bounded 5-minute overdue drain (20 minutes total from start); if active workflows fail to terminate within the 20-minute limit, the command logs active and undispatched counts and exits with failure code 1.
 > - **Local Operation**: When running locally, `--local` requires a running local dev session (`wrangler dev` on port `8787`). `--no-skip-recent` overrides the 10-day recency cutoff filter.
 
 ```powershell
@@ -287,15 +293,25 @@ pnpm exec tsx scripts/fleet-issues.ts --csv fleet-issues.csv
 ### Playbook 2D: Programmatic Fleet Operations via MCP
 ```typescript
 // Query fleet aggregated issues with skill routing (evaluates latest completed audit per active project, partitioned by source)
-// Limit parameter: default 50, permitted 1–200. Filter by source lane: 'all' | 'edge' | 'repository' | 'both'.
+// Source lane partitioning:
+// - 'edge': selects newest completed edge audit per project (workflow_instance_id NOT LIKE 'github-audit-%' OR NULL)
+// - 'repository': selects newest completed direct repository audit per project (workflow_instance_id LIKE 'github-audit-%')
+// - 'all' / 'both': selects the union of newest edge audit AND newest repository audit for each active project
+// Limit parameter: default 50, permitted 1–200. Domain must be a valid canonical lowercase hostname.
 const issuesResult = await client.callTool({
   name: "get_fleet_issues",
   arguments: { domain: "concrete.co.id", severity: "critical", issueType: "broken-internal-link", source: "all", limit: 20 },
 });
 
 // Generate execution plan for fleet audit (read-only planning tool; emits structured argv and planId without dispatching)
-// Planner defaults to maxPages: 2000 for both modes (allowed range 10–10,000). Omitting domain implicitly emits --all.
-// Concurrency (1–5, default 2) is emitted only in edge_workflow argv. The emitted command targets default remote D1.
+// Scope Selector Contract: Requires EXACTLY ONE scope selector: `domain`, `limit` (1–100), or `all: true`.
+// Omitting `domain` does NOT implicitly emit --all; it fails with an explicit scope requirement error.
+// Parameters and Bounds:
+// - mode: 'repository_direct' (default) or 'edge_workflow'
+// - maxPages: integer between 10 and 10,000 (default 2000)
+// - concurrency: integer between 1 and 5 (default 2, emitted ONLY in edge_workflow mode)
+// - limit: integer between 1 and 100 (when using limit selector)
+// Emitted executionCommand targets default remote D1 (open-seo-db-selfhost).
 const auditPlan = await client.callTool({
   name: "run_fleet_audit",
   arguments: { domain: "concrete.co.id", mode: "edge_workflow", maxPages: 2000, concurrency: 2 },
@@ -312,11 +328,11 @@ pnpm exec tsx scripts/fleet-status.ts
 pnpm exec tsx scripts/fleet-status.ts --local
 
 # Reconcile local manifest and external inventory mappings against workspace projects and completed audit IDs queried via remote D1
-# (Remote inventory coverage report; does not make live GitHub API queries)
+# Note: check-fleet-repos.ts queries remote D1 projects and audits directly; it makes ZERO live GitHub API calls.
 pnpm exec tsx scripts/check-fleet-repos.ts
 ```
 > [!NOTE]
-> The coverage panel considers the latest attempt per active workspace project with a domain. The overall audit totals and recent audit samples include active workspace projects. A fresh partial status can result from a partial attempt or insufficient evidence for an official grade; an interval is rendered only when reconciled evidence satisfies 80% <= coverage < 100% and bounds agree with earned mass.
+> The coverage panel considers the latest attempt per active workspace project with a domain. The overall audit totals and recent audit samples include active workspace projects. A fresh partial status can result from a partial attempt or insufficient evidence for an official grade; an interval is rendered only when reconciled evidence satisfies 80% <= coverage < 100% and bounds agree with earned mass (otherwise displayed as `—`). Full point scores require 100% evidence coverage. Status badge freshness (10-day TTL) and historical trend comparability (21-day window) operate independently of interval display eligibility.
 
 ### Playbook 3: Monitoring Workspace Audit Execution in Remote D1
 To inspect real-time crawler progress and audit state using workspace-scoped predicates:
@@ -376,7 +392,7 @@ try {
 ```
 
 > [!NOTE]
-> For origin service-to-service authentication, the worker verifier requires a signed `Cf-Access-Jwt-Assertion` header containing valid `sub` and `email` identity claims. For public client connections through Cloudflare Access edge, pass the authenticated session via the `Cookie: CF_Authorization=<token>` header. For local offline testing, use `http://127.0.0.1:8787/mcp` with `AUTH_MODE=local_noauth` (zero Access headers required).
+> For origin service-to-service authentication, the worker verifier requires a signed `Cf-Access-Jwt-Assertion` header containing valid `sub` and `email` identity claims. For public client connections through Cloudflare Access edge, pass the authenticated session via the `Cookie: CF_Authorization=<token>` header. For local offline development and testing, the Vite web application runs on port `3001` (default), while the auxiliary audit worker and local MCP endpoint run under Wrangler dev on port `8787` (`http://127.0.0.1:8787/mcp`) with `AUTH_MODE=local_noauth` (zero Access headers required). Both bind to shared local D1 state in `.wrangler/state/v3/d1`.
 
 ---
 
@@ -557,7 +573,7 @@ try {
 - **UI Route**: `/p/:projectId/reports`
 - **MCP Tools**: `list_report_templates`, `list_reports`, `save_report`, `get_report`, `set_report_sharing`
 - **Workflow**:
-  1. List available report templates: `list_report_templates({})`.
+  1. List available report templates: `list_report_templates({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b" })`.
   2. List existing reports: `list_reports({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b" })`.
   3. Save complete audit report: `save_report({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", title: "Q4 2026 Technical Audit", summary: "Executive technical audit summary for Q4", html: "<!DOCTYPE html><html><head><title>Q4 Audit</title></head><body><h1>Audit Report</h1></body></html>" })`.
   4. Read back report: `get_report({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", reportId: "c3d6e5f2-8e4a-4f0c-9d2b-6a7b8c9d0e1f" })`.
@@ -593,21 +609,27 @@ try {
      const projectId = projRes.structuredContent?.project?.id;
      if (!projectId) throw new Error("Project creation did not return an ID");
      ```
-  3. Extract initial brand profile and save reviewed setup (note: `research_project_website` bills actual model/search credits against balance; use the returned draft payload to construct setup arguments instead of discarding it):
+  3. Extract initial brand profile and save reviewed setup:
+     Note: `research_project_website` bills actual model and search costs against balance and returns top-level fields directly in `structuredContent` (`name`, `domain`, `overview`, `competitors`, `preserveCompetitors`, `suggestedTopics`, `suggestedKeywords`). In `save_project_website_setup`, each topic in `suggestedTopics` requires **exactly 5 prompts** (`length(5)`), and `preserveCompetitors: true` preserves existing competitors in the project context.
      ```ts
-     const researchRes = await client.callTool({ name: "research_project_website", arguments: { projectId, website: "https://toiletcubicle.co.id" } });
-     const draft = researchRes.structuredContent?.draft ?? {};
+     const researchRes = await client.callTool({
+       name: "research_project_website",
+       arguments: { projectId, website: "https://toiletcubicle.co.id" }
+     });
+     const research = researchRes.structuredContent ?? {};
+     const { name, domain, overview, competitors, suggestedTopics, suggestedKeywords } = research;
+
      await client.callTool({
        name: "save_project_website_setup",
        arguments: {
          projectId,
-         name: "Toilet Cubicle Surabaya",
-         domain: "toiletcubicle.co.id",
-         overview: "Surabaya commercial toilet cubicle contractor providing phenolic and glass cubicle installations.",
-         competitors: [
+         name: name ?? "Toilet Cubicle Surabaya",
+         domain: domain ?? "toiletcubicle.co.id",
+         overview: overview ?? "Surabaya commercial toilet cubicle contractor providing phenolic and glass cubicle installations.",
+         competitors: competitors ?? [
            { name: "Cubicle ID", domain: "cubicle.id", notes: "Local competitor" }
          ],
-         suggestedTopics: [
+         suggestedTopics: suggestedTopics ?? [
            {
              name: "Cubicle Toilet Surabaya",
              prompts: [
@@ -619,7 +641,7 @@ try {
              ]
            }
          ],
-         suggestedKeywords: ["cubicle toilet surabaya", "partisi toilet surabaya"]
+         suggestedKeywords: suggestedKeywords ?? ["cubicle toilet surabaya", "partisi toilet surabaya"]
        }
      });
      const context = await client.callTool({ name: "get_project_context", arguments: { projectId } });
@@ -756,6 +778,21 @@ try {
 ## 6. Complete 78-Tool Registry Reference by Capability Family
 
 OpenSEO exposes 78 registered MCP tools in `src/server/mcp/server.ts`:
+
+### 6.1 Tool Family Reference Matrix & Parameter Bounds
+
+| Capability Family | Registered Tools Count | Key Parameters & Strict Bounds | Auth & Credit Model | Workflow & Branching Invariants |
+|---|---|---|---|---|
+| **1. Workspace & Project Management** | 8 tools (`whoami`, `create_project`, `list_projects`, `research_project_website`, `save_project_website_setup`, `get_project_context`, `update_project_context`, `get_domain_overview`) | `projectId` (UUID), `domain` (canonical hostname $\le 253$ chars), `locationCode` (int > 0), `languageCode` (2–10 chars), `suggestedTopics` (max 5 topics, each with exactly 5 prompts), `suggestedKeywords` (max 15 keywords, $\le 5$ words each), `preserveCompetitors` (boolean). | Free D1 operations, except `research_project_website` which bills actual model/search credits against balance. Requires project-level authentication. | Onboarding branch: `create_project` $\rightarrow$ `research_project_website` $\rightarrow$ review draft $\rightarrow$ `save_project_website_setup`. First 3 topics seed weekly AI tracking starting ~1 week later. |
+| **2. Keyword, Domain & SERP Research** | 10 tools (`list_saved_keywords`, `remove_saved_keywords`, `research_keywords`, `save_keywords`, `get_domain_keyword_suggestions`, `get_serp_results`, `search_serp_locations`, `get_ranked_keywords`, `find_serp_competitors`, `get_keyword_metrics`) | `seeds` (1–5 items), `resultLimit` (150, 300, 500), `queries` array, `locationCode`, `languageCode`. | Billed via DataForSEO balance. Read-only queries check credit balance before dispatch. | Seed discovery $\rightarrow$ SERP competition check $\rightarrow$ filter by intent/volume $\rightarrow$ `save_keywords`. |
+| **3. AI Visibility & Prompts** | 15 tools (`get_ai_visibility_tracker`, `save_ai_visibility_tracker`, `estimate_ai_visibility_cost`, `run_ai_visibility_check`, `get_ai_visibility_run`, `explore_prompt`, `generate_ai_visibility_prompts`, `research_ai_visibility_prompts`, `complete_ai_research_setup`, `set_ai_visibility_schedule`, `get_ai_visibility_results`, `get_ai_visibility_answer`, `get_ai_visibility_sources`, `get_ai_visibility_trend`, `export_ai_visibility_data`) | `engines` (`["chatgpt", "perplexity", "gemini"]`), `prompts` array ($\le 500$ chars), `scheduleInterval` (`"weekly"` / `"monthly"`), `scheduleTime` (`{ weekday, hour, minute, timeZone }`), `maxCostUsd` (quote ceiling). | Per-query and recurring scheduled billing. Requires operator quote approval before enabling schedules. | Estimation (`estimate_ai_visibility_cost`) $\rightarrow$ confirmation $\rightarrow$ `save_ai_visibility_tracker` $\rightarrow$ `set_ai_visibility_schedule` (creates initial baseline run) $\rightarrow$ inspect results via `get_ai_visibility_run`. |
+| **4. Rank Tracking Maintenance** | 7 tools (`create_rank_tracker`, `add_rank_tracking_keywords`, `estimate_rank_tracker_cost`, `run_rank_tracker`, `get_rank_tracker`, `remove_rank_tracking_keywords`, `pin_rank_tracking_keywords`) | `domain`, `locationCode` (int), `languageCode` (str), `keywords` array, `maxCostCredits`, `maxEstimatedScheduledCheckCredits`. | DataForSEO credits. Quote envelope in `structuredContent` separates one-off live run from recurring scheduled estimates. | Create tracker $\rightarrow$ estimate cost $\rightarrow$ enroll keywords $\rightarrow$ optional manual `run_rank_tracker` $\rightarrow$ poll positions via `get_rank_tracker`. |
+| **5. Local SEO & Google Business Profile** | 8 tools (`search_local_businesses`, `get_local_serp_results`, `get_google_business_questions`, `get_business_profile`, `get_business_reviews`, `get_business_updates`, `list_business_categories`, `get_local_rank_grid`) | `near` (`{ latitude, longitude, radiusKm }`), `gridSize` ($3 \times 3$ to $7 \times 7$), `spacingKm` ($1-10$ km), `query`, `cid`, `placeId`. | Geo-grid searches bill per grid node. Repeating identical grid arguments within 1 hour resumes without re-billing. | Search GBP entities $\rightarrow$ obtain placeId/CID $\rightarrow$ dispatch `get_local_rank_grid` $\rightarrow$ analyze rank heatmaps across map points. |
+| **6. GA4, Search Console & Search Opportunities** | 12 tools (`get_google_analytics_organic_overview`, `get_google_analytics_organic_landing_pages`, `get_google_analytics_page_performance`, `get_google_analytics_key_events`, `get_search_opportunities`, `get_google_analytics_traffic_acquisition`, `get_google_analytics_measurement_health`, `get_google_analytics_ecommerce_performance`, `get_google_analytics_site_search`, `get_google_analytics_audience_breakdown`, `get_search_console_performance`, `inspect_urls`) | `startDate`, `endDate` (`YYYY-MM-DD`), `dimensions` array (`query`, `page`, `country`, `device`), `urls` array. | Free (uses connected OAuth integration tokens for GSC and GA4). Bound to project settings. | Validate connection health $\rightarrow$ query acquisition trends $\rightarrow$ cross-reference impressions with conversions via `get_search_opportunities`. |
+| **7. Audit Follow-Through & Fleet Operations** | 8 tools (`run_site_audit`, `list_site_audits`, `delete_site_audit`, `get_audit_status`, `get_audit_issues`, `get_audit_pages`, `get_fleet_issues`, `run_fleet_audit`) | `run_site_audit`: `maxPages` (default 50, edge), `renderJavaScript` (bool), `runLighthouse` (bool). `get_fleet_issues`: `source` (`all`, `edge`, `repository`, `both`), `severity` (`critical`, `warning`, `info`), `limit` (1–200, default 50). `run_fleet_audit`: exactly one selector required (`domain`, `limit` 1–100, or `all: true`), `mode` (`repository_direct` default, `edge_workflow`), `maxPages` (10–10,000, default 2000), `concurrency` (1–5, default 2). | Free D1 edge operations (free tier isolate boundary). Fleet tools constrained to `shared-workspace`. | Single project: `run_site_audit` $\rightarrow$ poll `get_audit_status` $\rightarrow$ triage `get_audit_issues`. Fleet planning: `run_fleet_audit` (emits executable CLI) $\rightarrow$ host execution $\rightarrow$ triage via `get_fleet_issues` with sovereign skill routing. |
+| **8. Reports, Templates & Backlinks** | 10 tools (`list_report_templates`, `save_report_template`, `delete_report_template`, `list_reports`, `save_report`, `get_report`, `delete_report`, `set_report_sharing`, `get_backlinks_overview`, `get_backlinks_profile`) | `projectId` (UUID, required for `list_report_templates`), `templateId`, `reportId`, `title`, `summary`, `html`, `public` (bool), `pageSize` (1–100), `page` (int). | Reports and templates are free D1 operations. Backlinks bill DataForSEO credits. | Template workflow: `list_report_templates` $\rightarrow$ generate HTML report following brief $\rightarrow$ `save_report` $\rightarrow$ optional operator-confirmed `set_report_sharing`. |
+
+### 6.2 Detailed Family Tool Breakdown
 
 ### Family 1: Workspace and Project Management (8 tools)
 - `whoami`: Read authenticated identity, returning `userEmail`, `scopes`, `mode`, and `creditsRemaining`.

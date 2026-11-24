@@ -115,16 +115,28 @@ async function startAudit(input: {
     crawlerCredentialId: credential?.id,
   };
 
-  await AuditRepository.createAudit({
-    id: auditId,
-    projectId: input.projectId,
-    startedByUserId: input.actorUserId,
-    startUrl,
-    workflowInstanceId: auditId,
-    config,
-    pagesTotal: reservation.pagesTotal,
-    lighthouseTotal: reservation.lighthouseTotal,
-  });
+  try {
+    await AuditRepository.createAudit({
+      id: auditId,
+      projectId: input.projectId,
+      startedByUserId: input.actorUserId,
+      startUrl,
+      workflowInstanceId: auditId,
+      config,
+      pagesTotal: reservation.pagesTotal,
+      lighthouseTotal: reservation.lighthouseTotal,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (
+      message.includes("UNIQUE") ||
+      message.includes("audits_project_running_idx") ||
+      message.includes("duplicate key")
+    ) {
+      throw new AppError("AUDIT_ALREADY_RUNNING");
+    }
+    throw err;
+  }
 
   let renderLocks: RenderingLock[] = [];
   try {

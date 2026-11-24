@@ -422,7 +422,6 @@ async function main() {
           WHERE NOT EXISTS (
             SELECT 1 FROM audits
             WHERE project_id = '${project.id}' AND status = 'running'
-              AND (workflow_instance_id NOT LIKE 'github-audit-%' OR workflow_instance_id IS NULL)
           );
         `;
         runD1Query(insertSql, isRemote);

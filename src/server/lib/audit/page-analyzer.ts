@@ -92,16 +92,24 @@ function getDocumentEffectiveBase(
   let effectiveBaseUrl = pageUrl;
   let inTemplate = 0;
   let inNoscript = 0;
+  let inSvg = 0;
+
+  // WHATWG raw-text handling: when scripting is enabled, <noscript> contents are treated as inert text.
+  // Stripping <noscript>...</noscript> prevents malformed nested tags (like <noscript><style></noscript>)
+  // from leaving htmlparser2 in an unclosed raw-text state.
+  const cleanHtml = html.replace(/<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi, "");
 
   const parser = new Parser(
     {
       onopentag(name, attribs) {
         if (name === "template") inTemplate++;
         if (name === "noscript") inNoscript++;
+        if (name === "svg") inSvg++;
         if (
           name !== "base" ||
           inTemplate > 0 ||
           inNoscript > 0 ||
+          inSvg > 0 ||
           firstBaseHref !== null
         ) {
           return;
@@ -116,12 +124,13 @@ function getDocumentEffectiveBase(
       onclosetag(name) {
         if (name === "template" && inTemplate > 0) inTemplate--;
         if (name === "noscript" && inNoscript > 0) inNoscript--;
+        if (name === "svg" && inSvg > 0) inSvg--;
       },
     },
     { decodeEntities: true, lowerCaseTags: true },
   );
 
-  parser.write(html);
+  parser.write(cleanHtml);
   parser.end();
 
   return { baseHref: firstBaseHref, effectiveBaseUrl };
@@ -178,6 +187,7 @@ export function analyzeHtml(
   const fallbackParts: string[] = [];
 
   const handleMetaTag = (attribs: Record<string, string>) => {
+    if (suppressDepth > 0 || noscriptDepth > 0) return;
     const content = attribs["content"];
     // HTML meta names are ASCII case-insensitive: "Description" is valid.
     const metaName = attribs["name"]?.toLowerCase();
@@ -239,6 +249,8 @@ export function analyzeHtml(
         }
         if (name === "noscript") noscriptDepth += 1;
         if (noscriptDepth > 0) return;
+        // Exclude all template descendants from document evidence (Sol R2)
+        if (suppressDepth > (NON_CONTENT_TAGS.has(name) ? 1 : 0)) return;
         if (headDepth === 0 && suppressDepth === 0) {
           hasAppRoot ||= APP_ROOT_IDS.has(attribs["id"]) || name === "app-root";
         }
@@ -322,12 +334,13 @@ export function analyzeHtml(
       onclosetag(name) {
         if (NON_CONTENT_TAGS.has(name) && suppressDepth > 0) {
           suppressDepth -= 1;
+          return;
         }
         if (name === "noscript" && noscriptDepth > 0) {
           noscriptDepth -= 1;
           return;
         }
-        if (noscriptDepth > 0) return;
+        if (noscriptDepth > 0 || suppressDepth > 0) return;
         if (name === "title" && titleDepth > 0) {
           titleDepth -= 1;
           if (titleDepth === 0) titleDone = true;
@@ -344,7 +357,11 @@ export function analyzeHtml(
     // Defaults (non-XML mode): lowercased tag/attribute names, decoded
     // entities — matching what the DOM-based implementation saw.
   );
-  parser.write(html);
+  const cleanHtml = html.replace(
+    /<noscript\b[^>]*>[\s\S]*?<\/noscript>/gi,
+    "",
+  );
+  parser.write(cleanHtml);
   parser.end();
 
   const rawText = (sawBody ? bodyParts : fallbackParts).join("");

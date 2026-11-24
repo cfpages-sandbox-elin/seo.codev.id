@@ -1,7 +1,11 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNotNull, isNull } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
-import { projects } from "@/db/schema";
+import {
+  projects,
+  fleetRosterVersions,
+  fleetRosterMembers,
+} from "@/db/schema";
 import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
@@ -106,7 +110,7 @@ export const runFleetAuditTool = {
     const concurrency = args.concurrency || 2;
 
     if (domain) {
-      const proj = await db
+      const activeProjects = await db
         .select({ id: projects.id })
         .from(projects)
         .where(
@@ -116,10 +120,14 @@ export const runFleetAuditTool = {
             isNull(projects.archivedAt),
           ),
         )
-        .limit(1);
-      if (proj.length === 0)
+        .limit(2);
+      if (activeProjects.length === 0)
         throw new Error(
           `Domain '${domain}' is not enrolled in organization '${orgId}'.`,
+        );
+      if (activeProjects.length > 1)
+        throw new Error(
+          `Ambiguous domain binding: multiple active projects (${activeProjects.length}) found for '${domain}' in organization '${orgId}'.`,
         );
 
       if (mode === "repository_direct") {
@@ -130,6 +138,38 @@ export const runFleetAuditTool = {
           throw new Error(
             `Domain '${domain}' does not have an approved repository mapping for repository_direct mode. Use edge_workflow mode or link a repository in the fleet manifest.`,
           );
+
+        // Check if domain is in effective approved fleet roster (Sol T1)
+        const effectiveRoster = await db
+          .select({ id: fleetRosterVersions.id })
+          .from(fleetRosterVersions)
+          .where(
+            and(
+              eq(fleetRosterVersions.organizationId, orgId),
+              isNotNull(fleetRosterVersions.approvedAt),
+            ),
+          )
+          .orderBy(desc(fleetRosterVersions.approvedAt))
+          .limit(1);
+
+        if (effectiveRoster.length > 0) {
+          const rosterMember = await db
+            .select({ id: fleetRosterMembers.id })
+            .from(fleetRosterMembers)
+            .where(
+              and(
+                eq(fleetRosterMembers.versionId, effectiveRoster[0].id),
+                eq(fleetRosterMembers.canonicalHost, domain),
+              ),
+            )
+            .limit(1);
+
+          if (rosterMember.length === 0) {
+            throw new Error(
+              `Domain '${domain}' is not in approved fleet roster '${effectiveRoster[0].id}'.`,
+            );
+          }
+        }
       }
     }
 

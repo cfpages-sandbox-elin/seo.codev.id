@@ -118,10 +118,10 @@ export interface DiscoveredGitTree {
  * Enforces literal argument arrays, URL segment encoding, commit SHA validation,
  * and fail-closed tree truncation checks.
  */
-export function discoverGitHubTree(
+export function resolveGitHubHead(
   repoName: string,
   options?: { branch?: string; timeoutMs?: number },
-): DiscoveredGitTree {
+): { branch: string; commitSha: string } {
   if (!isValidRepoSlug(repoName)) {
     throw new Error(
       `Invalid GitHub repository slug: "${repoName}". Must match owner/repo pattern.`,
@@ -162,6 +162,23 @@ export function discoverGitHubTree(
   if (!/^[a-f0-9]{40}$/i.test(commitSha)) {
     throw new Error(`Invalid commit SHA returned by GitHub: ${commitSha}`);
   }
+
+  return { branch, commitSha };
+}
+
+/**
+ * Discover the repository default branch, pinned commit SHA, and recursive git tree.
+ */
+export function discoverGitHubTree(
+  repoName: string,
+  options?: { branch?: string; timeoutMs?: number },
+): DiscoveredGitTree {
+  const { branch, commitSha } = resolveGitHubHead(repoName, options);
+
+  const [owner, repo] = repoName.split("/");
+  const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
+  const ghExe = process.platform === "win32" ? "gh.exe" : "gh";
+  const timeoutMs = options?.timeoutMs ?? 30_000;
 
   // 3. Fetch recursive git tree for commit
   const treeRaw = execFileSync(

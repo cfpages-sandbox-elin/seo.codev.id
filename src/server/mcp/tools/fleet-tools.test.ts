@@ -12,28 +12,33 @@ vi.mock("@/db", () => {
     leftJoin: () => dummyChain,
     where: () => dummyChain,
     orderBy: () => dummyChain,
-    limit: () => [
-      {
-        id: "issue_1",
-        auditId: "audit_1",
-        workflowInstanceId: null,
-        issueType: "broken_link",
-        severity: "critical",
-        detailsJson: JSON.stringify({ targetUrl: "/missing-style.css" }),
-        pageUrl: "https://kaca.co.id/page1",
-        domain: "kaca.co.id",
-      },
-      {
-        id: "issue_2",
-        auditId: "audit_2",
-        workflowInstanceId: "github-audit-123",
-        issueType: "missing_meta_description",
-        severity: "warning",
-        detailsJson: null,
-        pageUrl: "https://kaca.co.id/page2",
-        domain: "kaca.co.id",
-      },
-    ],
+    limit: (count?: number) => {
+      if (count === 2) {
+        return [{ id: "proj_1", domain: "kaca.co.id" }];
+      }
+      return [
+        {
+          id: "issue_1",
+          auditId: "audit_1",
+          workflowInstanceId: null,
+          issueType: "broken_link",
+          severity: "critical",
+          detailsJson: JSON.stringify({ targetUrl: "/missing-style.css" }),
+          pageUrl: "https://kaca.co.id/page1",
+          domain: "kaca.co.id",
+        },
+        {
+          id: "issue_2",
+          auditId: "audit_2",
+          workflowInstanceId: "github-audit-123",
+          issueType: "missing_meta_description",
+          severity: "warning",
+          detailsJson: null,
+          pageUrl: "https://kaca.co.id/page2",
+          domain: "kaca.co.id",
+        },
+      ];
+    },
   };
 
   return {

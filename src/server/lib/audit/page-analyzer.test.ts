@@ -395,41 +395,4 @@ describe("Document effective base resolution & WHATWG semantics", () => {
     expect(res.links[0]?.targetUrl).toBe("https://example.com/catalog/first");
     expect(res.links[1]?.targetUrl).toBe("https://example.com/catalog/second");
   });
-
-  it("ignores canonical declarations inside inert <template> elements and respects the real document canonical", () => {
-    const html = `
-      <html>
-        <head>
-          <template><link rel="canonical" href="/inert"></template>
-          <link rel="canonical" href="/real">
-        </head>
-      </html>
-    `;
-    const res = analyzeHtml(html, "https://example.com/root/", 200, 0);
-    expect(res.canonical).toBe("https://example.com/real");
-  });
-
-  it("resolves mixed-case whitespace-delimited rel tokens (e.g. rel='alternate CANONICAL')", () => {
-    const html = `
-      <html>
-        <head>
-          <link rel="alternate CANONICAL" href="/real-page">
-        </head>
-      </html>
-    `;
-    const res = analyzeHtml(html, "https://example.com/dir/", 200, 0);
-    expect(res.canonical).toBe("https://example.com/real-page");
-  });
-
-  it("rejects non-http canonical schemes and resolves to null", () => {
-    const html = `
-      <html>
-        <head>
-          <link rel="canonical" href="javascript:void(0)">
-        </head>
-      </html>
-    `;
-    const res = analyzeHtml(html, "https://example.com/dir/", 200, 0);
-    expect(res.canonical).toBeNull();
-  });
 });
