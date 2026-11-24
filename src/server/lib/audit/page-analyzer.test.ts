@@ -16,7 +16,8 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
   const title = $("title").first().text().trim();
   const metaDescription =
     $('meta[name="description"]').first().attr("content")?.trim() ?? "";
-  const canonical = $('link[rel="canonical"]').first().attr("href") ?? null;
+  const rawCanonical =
+    $('link[rel="canonical"]').first().attr("href")?.trim() ?? null;
   const robotsMeta = $('meta[name="robots"]').first().attr("content") ?? null;
   const ogTitle =
     $('meta[property="og:title"]').first().attr("content") ?? null;
@@ -43,21 +44,30 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
   });
 
   const bodyClone = $("body").clone();
-  bodyClone.find("script, style, noscript, svg").remove();
+  bodyClone.find("script, style, noscript, svg, template").remove();
   const bodyText = bodyClone.text().replace(/\s+/g, " ").trim();
   const wordCount = bodyText ? bodyText.split(/\s+/).length : 0;
 
-  const baseTag = $("base[href]").first();
+  const baseTag = $("head > base[href], body base[href], base[href]")
+    .not("template base, noscript base")
+    .first();
   const rawBase = baseTag.attr("href");
   const baseHref = rawBase !== undefined ? rawBase.trim() : null;
   let effectiveBaseUrl = pageUrl;
-  if (baseHref !== null) {
+  if (baseHref) {
     try {
-      effectiveBaseUrl = baseHref ? new URL(baseHref, pageUrl).href : pageUrl;
+      const candidate = new URL(baseHref, pageUrl);
+      if (candidate.protocol === "http:" || candidate.protocol === "https:") {
+        effectiveBaseUrl = candidate.href;
+      }
     } catch {
       effectiveBaseUrl = pageUrl;
     }
   }
+
+  const canonical = rawCanonical
+    ? (normalizeUrl(rawCanonical, effectiveBaseUrl) ?? rawCanonical)
+    : null;
 
   const images: Array<{ src: string | null; alt: string | null }> = [];
   $("img").each((_, el) => {
@@ -320,4 +330,57 @@ describe("JavaScript app-shell detection", () => {
       expect(analyzeHtml(html, PAGE_URL, 200, 0).javascriptShell).toBe(false);
     },
   );
+});
+
+describe("Document effective base resolution & WHATWG semantics", () => {
+  it("ignores base tags inside inert <template> elements and respects the real document base", () => {
+    const html = `
+      <html>
+        <head>
+          <template><base href="https://template.example.com/sub/"></template>
+          <base href="https://cdn.example.com/assets/">
+          <link rel="canonical" href="/canonical-page">
+        </head>
+        <body>
+          <a href="product">Product</a>
+        </body>
+      </html>
+    `;
+    const res = analyzeHtml(html, "https://example.com/dir/page.html", 200, 0);
+    expect(res.baseHref).toBe("https://cdn.example.com/assets/");
+    expect(res.links[0]?.targetUrl).toBe(
+      "https://cdn.example.com/assets/product",
+    );
+    expect(res.canonical).toBe("https://cdn.example.com/canonical-page");
+  });
+
+  it("falls back to document URL when base scheme is non-http (e.g. data: or javascript:)", () => {
+    const html = `
+      <html>
+        <head>
+          <base href="data:text/html;base64,PHNjcmlwdD4=">
+        </head>
+        <body>
+          <a href="/target">Target</a>
+        </body>
+      </html>
+    `;
+    const res = analyzeHtml(html, "https://example.com/path/", 200, 0);
+    expect(res.links[0]?.targetUrl).toBe("https://example.com/target");
+  });
+
+  it("resolves anchors appearing before the <base> tag against the document effective base", () => {
+    const html = `
+      <html>
+        <body>
+          <a href="first">First Link</a>
+          <base href="https://example.com/catalog/">
+          <a href="second">Second Link</a>
+        </body>
+      </html>
+    `;
+    const res = analyzeHtml(html, "https://example.com/root/", 200, 0);
+    expect(res.links[0]?.targetUrl).toBe("https://example.com/catalog/first");
+    expect(res.links[1]?.targetUrl).toBe("https://example.com/catalog/second");
+  });
 });

@@ -11,7 +11,7 @@
  *     error is copied into the row before Workflows retention deletes it.
  */
 import { env } from "cloudflare:workers";
-import { and, eq, lt, or, isNull, notLike } from "drizzle-orm";
+import { and, eq, isNotNull, notLike, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { audits, projects } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
@@ -88,10 +88,15 @@ export async function reconcileRunningAudit(
   }
   if (!errorInfo) return null;
 
-  await AuditRepository.failAudit(audit.id, audit.workflowInstanceId, {
-    ...errorInfo,
-    failedPhase: audit.currentPhase,
-  });
+  const didFail = await AuditRepository.failAudit(
+    audit.id,
+    audit.workflowInstanceId,
+    {
+      ...errorInfo,
+      failedPhase: audit.currentPhase,
+    },
+  );
+  if (!didFail) return null;
   return errorInfo;
 }
 
@@ -139,11 +144,12 @@ export async function reconcileStaleAudits() {
  * same-day ISO cutoff would misorder against D1 rows without the reformat).
  */
 async function getStaleRunningAudits(cutoff: Date, limit: number) {
-  const iso = cutoff.toISOString();
-  const startedBefore =
-    getDatabaseProvider() === "postgres"
-      ? iso
-      : iso.replace("T", " ").slice(0, 19);
+  const isPg = getDatabaseProvider() === "postgres";
+  const cutoffIso = cutoff.toISOString();
+  const timestampPredicate = isPg
+    ? sql`${audits.startedAt}::timestamptz < ${cutoffIso}::timestamptz`
+    : sql`julianday(${audits.startedAt}) < julianday(${cutoffIso})`;
+
   // Oldest first: genuinely dead audits age past the cutoff and stay there,
   // while long-but-live crawls are the newest of the stale set — without a
   // deterministic order they could occupy the whole batch every sweep and
@@ -151,11 +157,9 @@ async function getStaleRunningAudits(cutoff: Date, limit: number) {
   return db.query.audits.findMany({
     where: and(
       eq(audits.status, "running"),
-      lt(audits.startedAt, startedBefore),
-      or(
-        isNull(audits.workflowInstanceId),
-        notLike(audits.workflowInstanceId, "github-audit-%"),
-      ),
+      isNotNull(audits.workflowInstanceId),
+      notLike(audits.workflowInstanceId, "github-audit-%"),
+      timestampPredicate,
     ),
     orderBy: audits.startedAt,
     columns: {

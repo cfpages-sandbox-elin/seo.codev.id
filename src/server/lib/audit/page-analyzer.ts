@@ -16,7 +16,13 @@ import type { PageAnalysis, PageLink } from "./types";
 
 const SKIPPED_LINK_PROTOCOLS = /^(javascript:|mailto:|tel:|#)/;
 /** Subtrees whose text is not visible content. */
-const NON_CONTENT_TAGS = new Set(["script", "style", "noscript", "svg"]);
+const NON_CONTENT_TAGS = new Set([
+  "script",
+  "style",
+  "noscript",
+  "svg",
+  "template",
+]);
 const HEADING_LEVELS: Record<string, number> = {
   h1: 1,
   h2: 2,
@@ -44,6 +50,65 @@ interface OpenAnchor {
   text: string[];
 }
 
+function resolveCandidateBase(raw: string, pageUrl: string): string | null {
+  try {
+    const candidate = new URL(raw, pageUrl);
+    if (candidate.protocol === "http:" || candidate.protocol === "https:") {
+      return candidate.href;
+    }
+  } catch {}
+  return null;
+}
+
+/**
+ * Determine the first document-effective base URL with WHATWG browser semantics:
+ * - The first <base href> defines the document base URL for all elements.
+ * - <base> inside inert <template> or <noscript> is ignored.
+ * - Non-HTTP(S) base schemes (e.g. data:, javascript:) are rejected, falling back to document URL.
+ */
+function getDocumentEffectiveBase(
+  html: string,
+  pageUrl: string,
+): { baseHref: string | null; effectiveBaseUrl: string } {
+  let firstBaseHref: string | null = null;
+  let effectiveBaseUrl = pageUrl;
+  let inTemplate = 0;
+  let inNoscript = 0;
+
+  const parser = new Parser(
+    {
+      onopentag(name, attribs) {
+        if (name === "template") inTemplate++;
+        if (name === "noscript") inNoscript++;
+        if (
+          name !== "base" ||
+          inTemplate > 0 ||
+          inNoscript > 0 ||
+          firstBaseHref !== null
+        ) {
+          return;
+        }
+        if (typeof attribs["href"] !== "string") return;
+        const raw = attribs["href"].trim();
+        firstBaseHref = raw;
+        effectiveBaseUrl = raw
+          ? (resolveCandidateBase(raw, pageUrl) ?? pageUrl)
+          : pageUrl;
+      },
+      onclosetag(name) {
+        if (name === "template" && inTemplate > 0) inTemplate--;
+        if (name === "noscript" && inNoscript > 0) inNoscript--;
+      },
+    },
+    { decodeEntities: true, lowerCaseTags: true },
+  );
+
+  parser.write(html);
+  parser.end();
+
+  return { baseHref: firstBaseHref, effectiveBaseUrl };
+}
+
 /**
  * Analyze an HTML string and extract all SEO-relevant data.
  */
@@ -62,19 +127,10 @@ export function analyzeHtml(
   let noscriptDepth = 0;
   let metaDescription: string | null = null;
   let canonical: string | null = null;
-  let baseHref: string | null = null;
-  let effectiveBaseUrl = pageUrl;
-
-  const updateEffectiveBase = (rawHref: string | undefined) => {
-    if (baseHref !== null || rawHref === undefined) return;
-    const trimmed = rawHref.trim();
-    baseHref = trimmed;
-    try {
-      effectiveBaseUrl = trimmed ? new URL(trimmed, pageUrl).href : pageUrl;
-    } catch {
-      effectiveBaseUrl = pageUrl;
-    }
-  };
+  const { baseHref, effectiveBaseUrl } = getDocumentEffectiveBase(
+    html,
+    pageUrl,
+  );
   let robotsMeta: string | null = null;
   let ogTitle: string | null = null;
   let ogDescription: string | null = null;
@@ -122,7 +178,11 @@ export function analyzeHtml(
 
   const handleLinkTag = (attribs: Record<string, string>) => {
     if (attribs["rel"] === "canonical") {
-      canonical ??= attribs["href"] ?? null;
+      const rawCanonical = attribs["href"]?.trim();
+      if (rawCanonical && canonical === null) {
+        canonical =
+          normalizeUrl(rawCanonical, effectiveBaseUrl) ?? rawCanonical;
+      }
     } else if (attribs["rel"] === "alternate" && attribs["hreflang"]) {
       hreflangTags.push(attribs["hreflang"]);
     }
@@ -178,7 +238,6 @@ export function analyzeHtml(
             sawBody = true;
             break;
           case "base":
-            updateEffectiveBase(attribs["href"]);
             break;
           case "meta":
             handleMetaTag(attribs);

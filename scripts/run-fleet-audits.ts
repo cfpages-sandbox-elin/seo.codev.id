@@ -13,7 +13,10 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { parseArgs } from "node:util";
-import { executeD1SqlBatches, isValidCanonicalHostname } from "./github-archive-utils";
+import {
+  executeD1SqlBatches,
+  isValidCanonicalHostname,
+} from "./github-archive-utils";
 
 // Sourced environment from .env.selfhost
 const ENV_FILE = resolve(
@@ -32,7 +35,10 @@ function loadEnv(): Record<string, string> {
       const eqIdx = line.indexOf("=");
       if (eqIdx > 0 && !line.startsWith("#")) {
         const key = line.slice(0, eqIdx).trim();
-        const val = line.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, "");
+        const val = line
+          .slice(eqIdx + 1)
+          .trim()
+          .replace(/^['"]|['"]$/g, "");
         env[key] = val;
         process.env[key] = val;
       }
@@ -58,7 +64,15 @@ function triggerWorkflow(
   const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
   const wranglerJs = resolve(repoRoot, "node_modules/wrangler/bin/wrangler.js");
   const paramsStr = JSON.stringify(params);
-  const argv = [wranglerJs, "workflows", "trigger", workflowName, paramsStr, "--id", id];
+  const argv = [
+    wranglerJs,
+    "workflows",
+    "trigger",
+    workflowName,
+    paramsStr,
+    "--id",
+    id,
+  ];
   if (!isRemote) argv.push("--local");
 
   const res = spawnSync(process.execPath, argv, {
@@ -86,7 +100,9 @@ interface TargetProject {
 async function main() {
   const rawArgs = process.argv.slice(2);
   if (rawArgs.includes("--remote") && rawArgs.includes("--local")) {
-    console.error("[ERROR] Conflicting flags: cannot specify both --remote and --local.");
+    console.error(
+      "[ERROR] Conflicting flags: cannot specify both --remote and --local.",
+    );
     process.exit(1);
   }
 
@@ -106,7 +122,9 @@ async function main() {
   });
 
   if (args.positionals.length > 0) {
-    console.error(`[ERROR] Stray positional arguments detected (${args.positionals.join(", ")}). Positional arguments not permitted.`);
+    console.error(
+      `[ERROR] Stray positional arguments detected (${args.positionals.join(", ")}). Positional arguments not permitted.`,
+    );
     process.exit(1);
   }
 
@@ -114,17 +132,32 @@ async function main() {
   if (args.values["max-pages"] !== undefined) {
     const raw = String(args.values["max-pages"]);
     const num = Number(raw);
-    if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(num) || num < 1 || num > 10000) {
-      console.error("[ERROR] Invalid --max-pages value. Must be a safe positive integer between 1 and 10000.");
+    if (
+      !/^[1-9][0-9]*$/.test(raw) ||
+      !Number.isSafeInteger(num) ||
+      num < 1 ||
+      num > 10000
+    ) {
+      console.error(
+        "[ERROR] Invalid --max-pages value. Must be a safe positive integer between 1 and 10000.",
+      );
       process.exit(1);
     }
     maxPages = num;
   }
 
-  const rawConcurrency = args.values.concurrency !== undefined ? String(args.values.concurrency) : "2";
+  const rawConcurrency =
+    args.values.concurrency !== undefined
+      ? String(args.values.concurrency)
+      : "2";
   const numConcurrency = Number(rawConcurrency);
-  if (!/^[1-5]$/.test(rawConcurrency) || !Number.isSafeInteger(numConcurrency)) {
-    console.error("[ERROR] Invalid --concurrency value. Must be a safe integer between 1 and 5.");
+  if (
+    !/^[1-5]$/.test(rawConcurrency) ||
+    !Number.isSafeInteger(numConcurrency)
+  ) {
+    console.error(
+      "[ERROR] Invalid --concurrency value. Must be a safe integer between 1 and 5.",
+    );
     process.exit(1);
   }
   const concurrency = numConcurrency;
@@ -133,21 +166,35 @@ async function main() {
     const raw = String(args.values.limit);
     const num = Number(raw);
     if (!/^[1-9][0-9]*$/.test(raw) || !Number.isSafeInteger(num)) {
-      console.error("[ERROR] Invalid --limit value. Must be a safe positive integer.");
+      console.error(
+        "[ERROR] Invalid --limit value. Must be a safe positive integer.",
+      );
       process.exit(1);
     }
     limit = num;
   }
-  const targetDomainFilter = args.values.domain !== undefined ? String(args.values.domain).toLowerCase().trim() : undefined;
-  if (targetDomainFilter !== undefined && !isValidCanonicalHostname(targetDomainFilter)) {
-    console.error(`[ERROR] Invalid fleet hostname: "${args.values.domain}". Must be a valid lowercase RFC 1123 hostname without protocol, port, or path.`);
+  const targetDomainFilter =
+    args.values.domain !== undefined
+      ? String(args.values.domain).toLowerCase().trim()
+      : undefined;
+  if (
+    targetDomainFilter !== undefined &&
+    !isValidCanonicalHostname(targetDomainFilter)
+  ) {
+    console.error(
+      `[ERROR] Invalid fleet hostname: "${args.values.domain}". Must be a valid lowercase RFC 1123 hostname without protocol, port, or path.`,
+    );
     process.exit(1);
   }
 
   const isAll = !!args.values.all;
   const isRemote = args.values.local ? false : true;
   const target = isRemote
-    ? { database: "open-seo-db-selfhost", dbFlag: "--remote", workflow: "site-audit-workflow-selfhost" }
+    ? {
+        database: "open-seo-db-selfhost",
+        dbFlag: "--remote",
+        workflow: "site-audit-workflow-selfhost",
+      }
     : { database: "DB", dbFlag: "--local", workflow: "site-audit-workflow" };
 
   // Sol P2-04: Require mutually exclusive explicit execution scope
@@ -156,16 +203,21 @@ async function main() {
     Number(args.values.all === true) +
     Number(args.values.limit !== undefined);
   if (scopeCount !== 1) {
-    console.error("[ERROR] Missing or conflicting execution scope. Please specify exactly one of --domain <canonical-host>, --all, or --limit <n>.");
+    console.error(
+      "[ERROR] Missing or conflicting execution scope. Please specify exactly one of --domain <canonical-host>, --all, or --limit <n>.",
+    );
     process.exit(1);
   }
 
   console.log("=== OpenSEO Fleet Audit Runner ===");
-  console.log(`Execution Mode: ${isRemote ? "Remote Production" : "Local Development"}`);
+  console.log(
+    `Execution Mode: ${isRemote ? "Remote Production" : "Local Development"}`,
+  );
   console.log(`Target Workflow: ${target.workflow}`);
   console.log(`Pacing Concurrency: ${concurrency}`);
   console.log(`Max Pages Per Site: ${maxPages} (Full Depth Crawl)`);
-  if (targetDomainFilter) console.log(`Target Domain Filter: ${targetDomainFilter}`);
+  if (targetDomainFilter)
+    console.log(`Target Domain Filter: ${targetDomainFilter}`);
 
   // Query enrolled projects in shared-workspace with normalized UTC epoch of completed edge crawls (Sol F05)
   const sql = `
@@ -188,24 +240,57 @@ async function main() {
     id: r.id,
     name: r.name,
     domain: r.domain,
-    lastAuditedEpoch: typeof r.last_audited_epoch === "number" ? r.last_audited_epoch : null,
+    lastAuditedEpoch:
+      typeof r.last_audited_epoch === "number" ? r.last_audited_epoch : null,
   }));
 
   if (targetDomainFilter) {
-    candidates = candidates.filter((c) =>
-      c.domain.toLowerCase() === targetDomainFilter,
+    candidates = candidates.filter(
+      (c) => c.domain.toLowerCase() === targetDomainFilter,
     );
     if (candidates.length === 0) {
-      console.error(`[ERROR] Target domain '${targetDomainFilter}' was not found among enrolled projects in shared-workspace.`);
+      console.error(
+        `[ERROR] Target domain '${targetDomainFilter}' was not found among enrolled projects in shared-workspace.`,
+      );
       process.exit(1);
+    }
+    if (candidates.length > 1) {
+      console.error(
+        `[ERROR] Ambiguous domain binding: multiple active projects (${candidates.length}) found for '${targetDomainFilter}'.`,
+      );
+      process.exit(1);
+    }
+  } else {
+    // Detect and reject ambiguous duplicate domain bindings across the enrolled fleet
+    const seenDomains = new Set<string>();
+    const ambiguousDomains = new Set<string>();
+    for (const c of candidates) {
+      const d = c.domain.toLowerCase();
+      if (seenDomains.has(d)) ambiguousDomains.add(d);
+      seenDomains.add(d);
+    }
+    if (ambiguousDomains.size > 0) {
+      console.warn(
+        `[WARNING] Excluding ${ambiguousDomains.size} ambiguous domains with duplicate project bindings: ${Array.from(ambiguousDomains).join(", ")}`,
+      );
+      candidates = candidates.filter(
+        (c) => !ambiguousDomains.has(c.domain.toLowerCase()),
+      );
     }
   }
 
-  const shouldSkipRecent = args.values["no-skip-recent"] ? false : !!args.values["skip-recent"];
+  const shouldSkipRecent = args.values["no-skip-recent"]
+    ? false
+    : !!args.values["skip-recent"];
   if (shouldSkipRecent && !targetDomainFilter) {
-    const tenDaysAgoEpoch = Math.floor((Date.now() - 10 * 24 * 60 * 60 * 1000) / 1000);
+    const tenDaysAgoEpoch = Math.floor(
+      (Date.now() - 10 * 24 * 60 * 60 * 1000) / 1000,
+    );
     candidates = candidates.filter(
-      (c) => c.lastAuditedEpoch === null || c.lastAuditedEpoch === undefined || c.lastAuditedEpoch < tenDaysAgoEpoch,
+      (c) =>
+        c.lastAuditedEpoch === null ||
+        c.lastAuditedEpoch === undefined ||
+        c.lastAuditedEpoch < tenDaysAgoEpoch,
     );
   }
 
@@ -232,20 +317,25 @@ async function main() {
         isRemote,
       );
       if (statusRows.length === 0) {
-        console.warn(`[WARNING] Audit ${auditId} for ${info.project.domain} not found in database.`);
+        console.warn(
+          `[WARNING] Audit ${auditId} for ${info.project.domain} not found in database.`,
+        );
         activeAudits.delete(auditId);
         failedCount++;
         continue;
       }
 
       const audit = statusRows[0];
-      const isTerminal = audit.status === "completed" || audit.status === "failed";
+      const isTerminal =
+        audit.status === "completed" || audit.status === "failed";
 
       if (!isTerminal && Date.now() - info.startedAt > 15 * 60 * 1000) {
         // Sol F6: At deadline, pause admission to avoid exceeding concurrency window while workflow still runs
         if (!admissionPaused) {
           admissionPaused = true;
-          console.warn(`[DEADLINE EXCEEDED] Audit ${auditId} for ${info.project.domain} still running after 15m. Admission paused to protect concurrency cap.`);
+          console.warn(
+            `[DEADLINE EXCEEDED] Audit ${auditId} for ${info.project.domain} still running after 15m. Admission paused to protect concurrency cap.`,
+          );
         }
       }
 
@@ -280,16 +370,22 @@ async function main() {
     );
 
     // If an overdue item exceeds 15m + DRAIN_MS (20m total), break loop to prevent indefinite polling
-    if (overdue.some((item) => now - item.startedAt > 15 * 60 * 1000 + DRAIN_MS)) {
+    if (
+      overdue.some((item) => now - item.startedAt > 15 * 60 * 1000 + DRAIN_MS)
+    ) {
+      const unresolvedIds = Array.from(activeAudits.keys());
       console.error(
-        `[DRAIN TIMEOUT] Active audit exceeded 20m deadline. Terminating queue drain.`,
+        `[DRAIN TIMEOUT] Active audit exceeded 20m deadline. Unresolved in-flight audit IDs: ${unresolvedIds.join(", ")}. Terminating queue drain.`,
       );
       break;
     }
 
     // Only dispatch new work if no overdue audits are in flight (Sol F05)
     if (overdue.length === 0) {
-      while (activeAudits.size < concurrency && queueIndex < candidates.length) {
+      while (
+        activeAudits.size < concurrency &&
+        queueIndex < candidates.length
+      ) {
         const project = candidates[queueIndex++];
         const cleanHost = project.domain.trim().toLowerCase();
         if (!isValidCanonicalHostname(cleanHost)) {
@@ -350,7 +446,9 @@ async function main() {
             startedAt: Date.now(),
           });
         } else {
-          console.error(`[ERROR] Failed to start workflow for ${project.domain}`);
+          console.error(
+            `[ERROR] Failed to start workflow for ${project.domain}`,
+          );
           const failSql = `UPDATE audits SET status = 'failed', error_code = 'DISPATCH_ERROR', completed_at = datetime('now') WHERE id = '${auditId}' AND status = 'running' RETURNING id;`;
           const failedRows = runD1Query(failSql, isRemote);
           if (!failedRows || failedRows.length === 0) {

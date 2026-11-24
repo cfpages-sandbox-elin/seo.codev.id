@@ -12,7 +12,7 @@ vi.mock("cloudflare:workers", () => ({
 
 vi.mock("@/server/features/audit/repositories/AuditRepository", () => ({
   AuditRepository: {
-    failAudit: vi.fn(),
+    failAudit: vi.fn().mockResolvedValue(true),
   },
 }));
 
@@ -49,5 +49,23 @@ describe("auditReconciler", () => {
       errorCode: "instance_lost",
       errorDetail: "Workflow instance not found",
     });
+  });
+
+  it("returns null when failAudit returns false due to a lost race with workflow finalize", async () => {
+    mockGet.mockClear();
+    mockGet.mockRejectedValueOnce(new Error("Workflow instance not found"));
+    const { AuditRepository } =
+      await import("@/server/features/audit/repositories/AuditRepository");
+    vi.mocked(AuditRepository.failAudit).mockResolvedValueOnce(false);
+
+    const edgeAudit = {
+      id: "audit_edge_2",
+      workflowInstanceId: "site-audit-workflow-raced",
+      startedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
+      currentPhase: "crawling",
+    };
+
+    const result = await reconcileRunningAudit(edgeAudit);
+    expect(result).toBeNull();
   });
 });

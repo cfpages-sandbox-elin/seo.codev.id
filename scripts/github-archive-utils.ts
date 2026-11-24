@@ -9,13 +9,18 @@ import { parseUtcTimestampMs } from "../src/server/features/fleet/services/fleet
  * Streaming byte capping transform stream (Sol P1 - F1).
  * Enforces maximum byte bounds as chunks arrive without buffering the entire payload into RAM.
  */
-export function capBytes(maxBytes: number, label: string): TransformStream<Uint8Array, Uint8Array> {
+export function capBytes(
+  maxBytes: number,
+  label: string,
+): TransformStream<Uint8Array, Uint8Array> {
   let seen = 0;
   return new TransformStream<Uint8Array, Uint8Array>({
     transform(chunk, controller) {
       seen += chunk.byteLength;
       if (seen > maxBytes) {
-        controller.error(new Error(`${label} exceeds byte limit (${seen} > ${maxBytes})`));
+        controller.error(
+          new Error(`${label} exceeds byte limit (${seen} > ${maxBytes})`),
+        );
         return;
       }
       controller.enqueue(chunk);
@@ -26,14 +31,22 @@ export function capBytes(maxBytes: number, label: string): TransformStream<Uint8
 /**
  * Creates a typed gzip decompression TransformStream (Sol F1).
  */
-export function decompressGzipStream(): TransformStream<Uint8Array, Uint8Array> {
-  return new DecompressionStream("gzip") as unknown as TransformStream<Uint8Array, Uint8Array>;
+export function decompressGzipStream(): TransformStream<
+  Uint8Array,
+  Uint8Array
+> {
+  return new DecompressionStream("gzip") as unknown as TransformStream<
+    Uint8Array,
+    Uint8Array
+  >;
 }
 
 /**
  * Reads a web ReadableStream of Uint8Array into a single Buffer.
  */
-export async function streamToBuffer(stream: ReadableStream<Uint8Array>): Promise<Buffer> {
+export async function streamToBuffer(
+  stream: ReadableStream<Uint8Array>,
+): Promise<Buffer> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
   while (true) {
@@ -70,8 +83,11 @@ export function verifyGitBlob(bytes: Buffer, expectedSha: string): void {
  * Accepts labels of length 1-63 without leading/trailing hyphens, capped at 253 chars total.
  */
 export function isValidCanonicalHostname(domain: string): boolean {
-  if (!domain || typeof domain !== "string" || domain.length > 253) return false;
-  return /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(domain);
+  if (!domain || typeof domain !== "string" || domain.length > 253)
+    return false;
+  return /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(
+    domain,
+  );
 }
 
 /**
@@ -107,7 +123,9 @@ export function discoverGitHubTree(
   options?: { branch?: string; timeoutMs?: number },
 ): DiscoveredGitTree {
   if (!isValidRepoSlug(repoName)) {
-    throw new Error(`Invalid GitHub repository slug: "${repoName}". Must match owner/repo pattern.`);
+    throw new Error(
+      `Invalid GitHub repository slug: "${repoName}". Must match owner/repo pattern.`,
+    );
   }
 
   const [owner, repo] = repoName.split("/");
@@ -236,9 +254,15 @@ export function extractJsonFromOutput(stdout: string): any {
 /**
  * Loads environment variables from local config files.
  */
-export function loadLocalEnv(repoRoot = "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id"): Record<string, string> {
+export function loadLocalEnv(
+  repoRoot = "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
+): Record<string, string> {
   const env: Record<string, string> = {};
-  const candidates = [resolve(repoRoot, ".env.selfhost"), resolve(repoRoot, ".env.local"), resolve(repoRoot, ".env")];
+  const candidates = [
+    resolve(repoRoot, ".env.selfhost"),
+    resolve(repoRoot, ".env.local"),
+    resolve(repoRoot, ".env"),
+  ];
   for (const filePath of candidates) {
     if (fs.existsSync(filePath)) {
       try {
@@ -248,7 +272,10 @@ export function loadLocalEnv(repoRoot = "C:/Users/THINKPAD/Documents/GitHub/seo.
           const eqIdx = trimmed.indexOf("=");
           if (eqIdx > 0 && !trimmed.startsWith("#")) {
             const key = trimmed.slice(0, eqIdx).trim();
-            const val = trimmed.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, "");
+            const val = trimmed
+              .slice(eqIdx + 1)
+              .trim()
+              .replace(/^['"]|['"]$/g, "");
             if (!env[key]) env[key] = val;
           }
         }
@@ -282,20 +309,38 @@ export function executeD1SqlBatches(
   if (!statements || statements.length === 0) return [];
   const dbName = isRemote ? "open-seo-db-selfhost" : "DB";
   const flag = isRemote ? "--remote" : "--local";
-  const maxStatements = Math.min(10, Math.max(1, options?.maxStatementsPerBatch ?? 10));
-  const maxBytes = Math.min(15_000, Math.max(100, options?.maxBytesPerBatch ?? 15_000));
-  const defaultRepoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+  const maxStatements = Math.min(
+    10,
+    Math.max(1, options?.maxStatementsPerBatch ?? 10),
+  );
+  const maxBytes = Math.min(
+    15_000,
+    Math.max(100, options?.maxBytesPerBatch ?? 15_000),
+  );
+  const defaultRepoRoot = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    "..",
+  );
   const repoRoot = options?.repoRoot ?? defaultRepoRoot;
 
   const wranglerJs = resolve(repoRoot, "node_modules/wrangler/bin/wrangler.js");
-  const wranglerArgs = [wranglerJs, "d1", "execute", dbName, flag, "--json", "--command"];
+  const wranglerArgs = [
+    wranglerJs,
+    "d1",
+    "execute",
+    dbName,
+    flag,
+    "--json",
+    "--command",
+  ];
 
   function fits(stmts: string[]) {
     const command = stmts.join("\n");
     return (
       stmts.length <= maxStatements &&
       Buffer.byteLength(command, "utf8") <= maxBytes &&
-      (process.platform !== "win32" || windowsCommandUpperBound([...wranglerArgs, command]) <= 30_000)
+      (process.platform !== "win32" ||
+        windowsCommandUpperBound([...wranglerArgs, command]) <= 30_000)
     );
   }
 
@@ -309,7 +354,9 @@ export function executeD1SqlBatches(
 
     if (!fits([stmt])) {
       const stmtBytes = Buffer.byteLength(stmt, "utf8");
-      throw new Error(`D1 statement exceeds maximum batch budget constraints (${stmtBytes} bytes)`);
+      throw new Error(
+        `D1 statement exceeds maximum batch budget constraints (${stmtBytes} bytes)`,
+      );
     }
 
     if (currentBatch.length > 0 && !fits([...currentBatch, stmt])) {
@@ -331,18 +378,14 @@ export function executeD1SqlBatches(
     const combinedSql = batch.join("\n");
     const argv = [...wranglerArgs, combinedSql];
 
-    const result = spawnSync(
-      process.execPath,
-      argv,
-      {
-        cwd: repoRoot,
-        env: { ...process.env, ...localEnv },
-        encoding: "utf8",
-        maxBuffer: 30 * 1024 * 1024,
-        shell: false,
-        timeout: 60_000,
-      },
-    );
+    const result = spawnSync(process.execPath, argv, {
+      cwd: repoRoot,
+      env: { ...process.env, ...localEnv },
+      encoding: "utf8",
+      maxBuffer: 30 * 1024 * 1024,
+      shell: false,
+      timeout: 60_000,
+    });
 
     if (result.error) {
       throw new Error(`Failed to invoke Wrangler D1: ${result.error.message}`);
@@ -441,14 +484,26 @@ export function parseTarHtmlFiles(
     }
     if (isAllZero) break;
 
-    const rawName = header.subarray(0, 100).toString("utf8").replace(/\0.*$/, "").trim();
-    const rawPrefix = header.subarray(345, 500).toString("utf8").replace(/\0.*$/, "").trim();
+    const rawName = header
+      .subarray(0, 100)
+      .toString("utf8")
+      .replace(/\0.*$/, "")
+      .trim();
+    const rawPrefix = header
+      .subarray(345, 500)
+      .toString("utf8")
+      .replace(/\0.*$/, "")
+      .trim();
     const fullName = rawPrefix ? `${rawPrefix}/${rawName}` : rawName;
 
     const slashIdx = fullName.indexOf("/");
     const relPath = slashIdx !== -1 ? fullName.slice(slashIdx + 1) : fullName;
 
-    const sizeStr = header.subarray(124, 136).toString("utf8").replace(/\0.*$/, "").trim();
+    const sizeStr = header
+      .subarray(124, 136)
+      .toString("utf8")
+      .replace(/\0.*$/, "")
+      .trim();
     const size = parseInt(sizeStr, 8);
 
     const typeFlag = header[156];

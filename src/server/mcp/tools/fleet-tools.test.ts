@@ -143,7 +143,7 @@ describe("Fleet MCP Tools", () => {
 
     it("generates execution command for edge workflow mode", async () => {
       const result = await runFleetAuditTool.handler(
-        { mode: "edge_workflow", concurrency: 3 },
+        { mode: "edge_workflow", all: true, concurrency: 3 },
         toolContext,
       );
 
@@ -159,6 +159,12 @@ describe("Fleet MCP Tools", () => {
       expect(data.argv).toContain("--all");
       expect(data.argv).toContain("--concurrency");
       expect(data.argv).toContain("3");
+    });
+
+    it("rejects run_fleet_audit when no scope is provided (no domain, limit, or all)", async () => {
+      await expect(
+        runFleetAuditTool.handler({ mode: "edge_workflow" }, toolContext),
+      ).rejects.toThrow(/An explicit scope is required/);
     });
 
     it("rejects caller outside shared-workspace organization (Sol F6)", async () => {

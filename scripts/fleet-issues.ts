@@ -13,12 +13,18 @@ import fs, { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import Papa from "papaparse";
 import { parseArgs } from "node:util";
-import { isValidCanonicalHostname, executeD1SqlBatches } from "./github-archive-utils";
+import {
+  isValidCanonicalHostname,
+  executeD1SqlBatches,
+} from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
 
 function loadEnv(): Record<string, string> {
-  const env: Record<string, string> = { ...process.env } as Record<string, string>;
+  const env: Record<string, string> = { ...process.env } as Record<
+    string,
+    string
+  >;
   try {
     const content = readFileSync(ENV_FILE, "utf8");
     for (const rawLine of content.split(/\r?\n/)) {
@@ -26,7 +32,10 @@ function loadEnv(): Record<string, string> {
       const eqIdx = line.indexOf("=");
       if (eqIdx > 0 && !line.startsWith("#")) {
         const key = line.slice(0, eqIdx).trim();
-        const val = line.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, "");
+        const val = line
+          .slice(eqIdx + 1)
+          .trim()
+          .replace(/^['"]|['"]$/g, "");
         env[key] = val;
       }
     }
@@ -58,68 +67,8 @@ function runD1Query(query: string, isRemote: boolean): any[] {
   return executeD1SqlBatches([query], isRemote);
 }
 
-export function routeIssueToSkill(issueType: string, url: string = ""): {
-  skill: string;
-  action: string;
-} {
-  const t = (issueType || "").toLowerCase().replace(/-/g, "_");
-  const u = (url || "").toLowerCase();
-
-  if (
-    t.includes("broken_image") ||
-    u.includes(".css") ||
-    u.includes(".js") ||
-    u.includes("wp-content")
-  ) {
-    return {
-      skill: "static-site-css-repair",
-      action: "Repair missing theme assets, unstyled paths, or broken CSS/JS references in static export.",
-    };
-  }
-
-  if (
-    t.includes("orphan") ||
-    t.includes("internal_link") ||
-    t.includes("broken_link") ||
-    t.includes("redirect_chain") ||
-    t.includes("canonical")
-  ) {
-    return {
-      skill: "internal-linking",
-      action: "Establish incoming link mesh from hub pages to money pages and correct canonical references.",
-    };
-  }
-
-  if (
-    t.includes("title") ||
-    t.includes("description") ||
-    t.includes("heading") ||
-    t.includes("thin_content") ||
-    t.includes("duplicate")
-  ) {
-    return {
-      skill: "unslop-seo",
-      action: "Remove AI fluff, inject 40-word direct answers, and write unique meta title/descriptions.",
-    };
-  }
-
-  if (
-    t.includes("slow") ||
-    t.includes("speed") ||
-    t.includes("large_page") ||
-    t.includes("lighthouse")
-  ) {
-    return {
-      skill: "web-perf",
-      action: "Audit Web Vitals, defer non-critical scripts, and optimize image payloads.",
-    };
-  }
-
-  return {
-    skill: "seo-audit",
-    action: "General technical SEO remediation.",
-  };
-}
+import { routeIssueToSkill } from "../src/server/lib/audit/issue-routing";
+export { routeIssueToSkill };
 
 export interface FleetIssueRow {
   projectId: string;
@@ -147,7 +96,10 @@ export async function getAggregatedFleetIssues(options: {
 }): Promise<FleetIssueRow[]> {
   const isRemote = options.remote ?? true;
   const rawLimit = options.limit ?? 200;
-  const limit = Math.max(1, Math.min(1000, Number.isFinite(rawLimit) ? rawLimit : 200));
+  const limit = Math.max(
+    1,
+    Math.min(1000, Number.isFinite(rawLimit) ? rawLimit : 200),
+  );
   const sourceMode = (options.source || "all").toLowerCase().trim();
 
   const whereClauses: string[] = [
@@ -156,13 +108,19 @@ export async function getAggregatedFleetIssues(options: {
   ];
 
   if (options.domain) {
-    whereClauses.push(`p.domain = '${options.domain.toLowerCase().trim().replace(/'/g, "''")}'`);
+    whereClauses.push(
+      `p.domain = '${options.domain.toLowerCase().trim().replace(/'/g, "''")}'`,
+    );
   }
   if (options.severity) {
-    whereClauses.push(`i.severity = '${options.severity.toLowerCase().trim().replace(/'/g, "''")}'`);
+    whereClauses.push(
+      `i.severity = '${options.severity.toLowerCase().trim().replace(/'/g, "''")}'`,
+    );
   }
   if (options.issueType) {
-    whereClauses.push(`i.issue_type = '${options.issueType.trim().replace(/'/g, "''")}'`);
+    whereClauses.push(
+      `i.issue_type = '${options.issueType.trim().replace(/'/g, "''")}'`,
+    );
   }
 
   // Sol F09: Partition by lane or filter by source lane before ranking
@@ -227,17 +185,25 @@ export async function getAggregatedFleetIssues(options: {
     if (r.details_json) {
       try {
         const parsed = JSON.parse(r.details_json);
-        if (parsed && typeof parsed === "object" && typeof parsed.targetUrl === "string") {
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          typeof parsed.targetUrl === "string"
+        ) {
           parsedTargetUrl = parsed.targetUrl;
         }
-        detailsStr = typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed);
+        detailsStr =
+          typeof parsed === "object" ? JSON.stringify(parsed) : String(parsed);
       } catch {
         detailsStr = r.details_json;
       }
     }
 
     const effectivePageUrl = r.page_url || "";
-    const routing = routeIssueToSkill(r.issue_type, parsedTargetUrl || effectivePageUrl);
+    const routing = routeIssueToSkill(
+      r.issue_type,
+      parsedTargetUrl || effectivePageUrl,
+    );
     return {
       projectId: r.project_id,
       domain: r.domain,
@@ -272,7 +238,9 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
   const hasRemoteArg = words.includes("--remote");
   const hasLocalArg = words.includes("--local");
   if (hasRemoteArg && hasLocalArg) {
-    console.error("[ERROR] Conflicting flags: cannot specify both --remote and --local.");
+    console.error(
+      "[ERROR] Conflicting flags: cannot specify both --remote and --local.",
+    );
     process.exit(1);
   }
 
@@ -296,7 +264,9 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
   if (values.domain !== undefined) {
     const trimmedDomain = String(values.domain).toLowerCase().trim();
     if (!isValidCanonicalHostname(trimmedDomain)) {
-      console.error(`[ERROR] Invalid domain format: '${values.domain}'. Must be a canonical hostname.`);
+      console.error(
+        `[ERROR] Invalid domain format: '${values.domain}'. Must be a canonical hostname.`,
+      );
       process.exit(1);
     }
   }
@@ -304,7 +274,9 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
   if (values.severity && typeof values.severity === "string") {
     const validSeverities = new Set(["critical", "warning", "info"]);
     if (!validSeverities.has(values.severity.toLowerCase().trim())) {
-      console.error(`[ERROR] Invalid severity: '${values.severity}'. Must be one of: critical, warning, info.`);
+      console.error(
+        `[ERROR] Invalid severity: '${values.severity}'. Must be one of: critical, warning, info.`,
+      );
       process.exit(1);
     }
   }
@@ -313,7 +285,9 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
   if (values.source) {
     const s = String(values.source).toLowerCase().trim();
     if (!["all", "edge", "repository", "both"].includes(s)) {
-      console.error(`[ERROR] Invalid --source value: '${values.source}'. Must be one of: all, edge, repository, both.`);
+      console.error(
+        `[ERROR] Invalid --source value: '${values.source}'. Must be one of: all, edge, repository, both.`,
+      );
       process.exit(1);
     }
     sourceFilter = s;
@@ -322,7 +296,9 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
   let limit = 200;
   if (values.limit) {
     if (!/^[1-9][0-9]*$/.test(String(values.limit))) {
-      console.error("[ERROR] Invalid --limit value. Must be a positive integer.");
+      console.error(
+        "[ERROR] Invalid --limit value. Must be a positive integer.",
+      );
       process.exit(1);
     }
     limit = Math.min(1000, parseInt(String(values.limit), 10));
@@ -371,10 +347,12 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
               projectId: i.projectId,
             })),
           },
-          { escapeFormulae: true }
+          { escapeFormulae: true },
         );
         writeFileSync(csvTargetFile, csvContent, "utf8");
-        console.log(`[CSV] Exported ${issues.length} fleet issues to ${csvTargetFile} (RFC 4180 with formula escaping)`);
+        console.log(
+          `[CSV] Exported ${issues.length} fleet issues to ${csvTargetFile} (RFC 4180 with formula escaping)`,
+        );
         return;
       }
 
@@ -385,8 +363,12 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
       }
 
       // 3. Human console overview
-      console.log(`\n=== OpenSEO Fleet-Wide Aggregated Issues (FLEET-ISSUE-01) ===`);
-      console.log(`Total sample issues retrieved: ${issues.length} (limit: ${limit}, source: ${sourceFilter})`);
+      console.log(
+        `\n=== OpenSEO Fleet-Wide Aggregated Issues (FLEET-ISSUE-01) ===`,
+      );
+      console.log(
+        `Total sample issues retrieved: ${issues.length} (limit: ${limit}, source: ${sourceFilter})`,
+      );
 
       if (issues.length === 0) {
         console.log("No issues found matching the specified criteria.");
@@ -400,7 +382,8 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
       const bySkill: Record<string, number> = {};
 
       for (const i of issues) {
-        if (i.severity in bySeverity) bySeverity[i.severity as keyof typeof bySeverity]++;
+        if (i.severity in bySeverity)
+          bySeverity[i.severity as keyof typeof bySeverity]++;
         bySource[i.source] = (bySource[i.source] || 0) + 1;
         byType[i.issueType] = (byType[i.issueType] || 0) + 1;
         bySkill[i.skillRoute] = (bySkill[i.skillRoute] || 0) + 1;
@@ -429,7 +412,9 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
 
       console.log(`\nSample Issues (first 5):`);
       issues.slice(0, 5).forEach((i) => {
-        console.log(`  [${i.severity.toUpperCase()}] [${i.source.toUpperCase()}] ${i.domain} - ${i.issueType} on ${i.pageUrl}`);
+        console.log(
+          `  [${i.severity.toUpperCase()}] [${i.source.toUpperCase()}] ${i.domain} - ${i.issueType} on ${i.pageUrl}`,
+        );
         if (i.targetUrl) console.log(`     Target: ${i.targetUrl}`);
         console.log(`     Routing: /${i.skillRoute} -> ${i.recommendedAction}`);
       });

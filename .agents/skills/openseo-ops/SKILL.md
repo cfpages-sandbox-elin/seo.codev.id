@@ -76,12 +76,15 @@ unmapped → exempt → unavailable → terminal partial (fresh_partial or stale
 1. `Unmapped`: Domain exists in `fleet_roster_members`, but `project_id` is NULL.
 2. `Exempt`: Intentionally excluded from automated fleet crawls (e.g. Tier 4 parked domains).
 3. `Unavailable`: Latest attempt failed, crashed, errored, or finalized without an admitted observation snapshot (`status: "unavailable"`). Displays score `—` (distinguished from measured 0%).
-4. `Terminal Partial`: Audit completed with partial evidence coverage between $80\%$ and $<100\%$, displayed as provisional interval $[L, U]$.
+4. `Terminal Partial`: Audit completed with partial evidence coverage between $80\%$ and $<100\%$, displayed as provisional interval $[L, U]$ when reconciled bounds exist from admitted observation evidence.
 5. `Never Audited`: Linked to an active project in `projects`, but no completed audit attempt exists.
 6. `Stale`: Previous audit completed, but results exceed the 10-day TTL freshness window.
 7. `Graded`: Audit completed with 100% evidence coverage within the 10-day TTL window (or provisional when partial coverage reconciles).
 
-**Interval Display Contract**: Provisional interval $[L, U]$ is a rendering presentation rule displayed if and only if reconciled evidence coverage satisfies $80\% \le C < 100\%$. Full point scores require $C = 100\%$. Freshness evaluation (10-day TTL window) and unavailable precedence operate independently of interval display eligibility.
+**Interval Display Contract**: Provisional interval $[L, U]$ is a rendering presentation rule displayed if and only if:
+1. Reconciled evidence coverage satisfies $80\% \le C < 100\%$.
+2. Admitted observation evidence provides reconciled upper and lower bounds.
+If observation evidence is missing, contradictory, or fails to reconcile, the score displays as `—` (unavailable/incomplete). Full point scores require $C = 100\%$. Freshness evaluation (10-day TTL window) and unavailable precedence operate independently of interval display eligibility.
 
 **Critical Incident Cap**: Requires qualified confirmation (`parseIncidentConfirmation` in `fleetEvidence.ts`) with essential failure codes (DNS failure, TLS failure, origin connection drops), verified expected intent, independent corroboration probe, and finite confirmation timestamps. Validated incidents cap the maximum score at **59 (F)** with a critical incident badge.
 
@@ -112,13 +115,14 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **Commit Pinning**: Resolves target branch to an immutable commit SHA (`gh api /repos/:owner/:repo/commits/:branch`). All Git tree queries and blob reads are bound to this commit.
 - **Git Tree Discovery**: Retrieves up to 100,000 files in a single atomic call (`GET /repos/:owner/:repo/git/trees/:commitSha?recursive=1`). Fails fast if `truncated: true`.
 - **Zero Edge Heap Pressure**: HTML parsing, heading extraction, meta tag inspection, and OpenGraph analysis execute host-side in Node.js, completely bypassing Cloudflare Workers Free Tier 128 MB isolate memory ceiling.
-- **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set using unified route indexing and apex/www equivalence to detect broken links and orphan pages with zero network calls.
+- **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/index.htm` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set using unified route indexing and domain host equivalence (supporting HTTP/HTTPS and apex/www pairs on default ports 80/443) to detect broken links and orphan pages with zero network calls.
 - **Staged D1 Persistence**:
-  1. Inserts parent audit in `running` phase with `github-audit-${auditId}` instance ID.
-  2. Ingests pages and issues in bounded $\le 10$-statement chunks ($\le 15,000$ bytes total per batch envelope, strictly respecting Windows CreateProcessW 32,767 character limits).
-  3. Reconciles child row counts in atomic compare-and-set UPDATE with `RETURNING id` (`WHERE id = :id AND status = 'running' AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = :id) = :pages AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = :id) = :issues`).
-  4. On count mismatch or state conflict, throws immediately. Incomplete source acquisition ends with audit status `failed` and an isolated diagnostic item which can be `partial` (they are distinct).
-- **Diagnostic Fleet Series Integration**: Writes `fleet_runs` (`requester_id = 'github-audit-runner'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`), and `fleet_snapshots` (`series_key = 'diagnostic'`, unmeasured pillars `NULL`). Reused audits verify the full exact triple (`fleet_runs`, `fleet_run_items`, `fleet_snapshots`) with deterministic latest ordering and original-ID binding; repair failures abort without falling back to a redundant Git crawl.
+  1. Inserts parent audit in `running` phase with `github-audit-${auditId}` instance ID via atomic conditional insert that prevents concurrent double-reservation and auto-reclaims stale orphaned runs (> 2h old).
+  2. Ingests pages and issues in bounded $\le 10$-statement chunks ($\le 15,000$ bytes total per batch envelope, strictly respecting Windows CreateProcessW 32,767 character limits). Binds string fields to safe byte limits (title 500, metaDescription 1000, canonicalUrl 2000, robotsMeta 200, OG fields 500-2000, detailsJson 4000).
+  3. Guards child writes so that `audit_pages` and `audit_issues` only insert when the parent audit is `status = 'running'`, and validates that issue `page_id` references belong to the same attempt.
+  4. Verifies child row count integrity and asserts zero orphaned page references before the final atomic compare-and-set UPDATE with `RETURNING id`.
+  5. On count mismatch, invalid child references, or state conflict, throws immediately. Incomplete source acquisition ends with audit status `failed` and an isolated diagnostic item which can be `partial` (they are distinct).
+- **Diagnostic Fleet Series Integration**: Writes `fleet_runs` (`requester_id = 'github-audit-runner'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`), and `fleet_snapshots` (`series_key = 'diagnostic'`, unmeasured pillars `NULL`). Reused audits strictly verify the exact triple (`r.status = 'completed'`, `fri.status = 'completed'`, matching `project_id`, matching `member_id`, and exactly 1 verified diagnostic attempt per member) bound to the effective roster version; repair failures abort without falling back to a redundant Git crawl.
 - **Evidence Boundary**: Records source-only evidence. Unmeasured runtime properties (`status_code`, `response_time_ms`, `crawl_depth`) remain `NULL` and `in_sitemap` is `0`. Runtime-only issue reporters (`deep-page`, `slow-response`) are excluded.
 
 ### Lane 2: Edge HTTP Workflow Crawler (`SiteAuditWorkflow`) — Live Runtime & Fleet Grading Lane
@@ -168,6 +172,15 @@ pnpm exec tsx scripts/link-github-fleet.ts --remote
 
 > [!NOTE]
 > The linker's `--dry-run` flag operates as a read-only execution plan preview that computes missing projects and link updates without mutating D1. Full database integrity assertions (zero unmapped, zero invalid links) and post-apply roster supersession checks run on live execution passes to confirm state convergence.
+
+### Playbook 2: Fleet Operations Architecture & Entry Point Matrix
+
+| Entry Point | Backend Engine | Target Population | Scope Selector | Default Destination | Authentication & Credential Lane | Data & Side Effects |
+|---|---|---|---|---|---|---|
+| `run-github-fleet-audit.ts` | Host Node.js | Active Approved Fleet Roster (or `--workspace` for wider inventory) | `--domain <host>`, `--limit <n>`, `--all` | Remote D1 (`open-seo-db-selfhost`) or `--local` | GitHub token (`gh auth token` or `GITHUB_TOKEN`), Cloudflare Wrangler D1 | Inserts `audits`, `audit_pages`, `audit_issues`; writes diagnostic series (`fleet_runs`, `fleet_run_items`, `fleet_snapshots`) |
+| `run-fleet-audits.ts` | Cloudflare Workflows | Active Workspace Projects in `shared-workspace` (with 10-day TTL filter) | `--domain <host>`, `--limit <n>`, `--all` | Remote D1 (`open-seo-db-selfhost`) or `--local` | Wrangler D1 / Cloudflare OAuth | Inserts `audits`, spawns `SiteAuditWorkflow` instances, polls to completion |
+| `get_fleet_issues` (MCP) | Cloudflare Worker MCP Handler | Active Workspace Projects in `shared-workspace` | `domain`, `severity`, `issueType`, `source`, `limit` | Current DB Binding | Cloudflare Access JWT or Google SSO Session | Read-only query; aggregates issues across latest audits and maps to remediation skills |
+| `run_fleet_audit` (MCP) | Cloudflare Worker MCP Handler | Enrolled Roster & Active Projects in `shared-workspace` | `domain`, `limit`, `all`, `mode` | Current DB Binding | Cloudflare Access JWT or Google SSO Session | Read-only planning; outputs executable `pnpm` CLI argv and plan ID |
 
 ### Playbook 2A: Executing Commit-Pinned GitHub Repository Audit (Primary Source Lane)
 Direct audit accepts exactly one execution scope (`--domain <canonical-host>`, `--limit <n>`, or `--all`). By default, bulk audit admits properties from the approved fleet roster; pass `--workspace` to audit wider inventory projects.
@@ -372,9 +385,19 @@ try {
 - **Workflow**:
   1. Create tracker (obtain `projectId` from `list_projects`; capture returned `trackerId`):
      ```ts
-     // Resolve active project ID from list_projects
+     // Resolve target project strictly matching the approved domain and caller organization
+     const targetDomain = "kaca.co.id";
+     const targetOrgId = "shared-workspace";
      const projectsRes = await client.callTool({ name: "list_projects", arguments: {} });
-     const projectId = projectsRes.structuredContent?.projects?.[0]?.id || "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b";
+     const projects = projectsRes.structuredContent?.projects ?? [];
+     const matches = projects.filter((p: any) =>
+       p.domain?.toLowerCase() === targetDomain &&
+       (!p.organizationId || p.organizationId === targetOrgId)
+     );
+     if (matches.length !== 1) {
+       throw new Error(`Expected exactly one project matching domain '${targetDomain}', found ${matches.length}`);
+     }
+     const projectId = matches[0].id;
 
      const createRes = await client.callTool({
        name: "create_rank_tracker",
@@ -460,7 +483,7 @@ try {
      const runNowUsd = quote?.runNowCostUsd;
      ```
   2. Explicit Operator Approval Gate: Require confirmation of nominal per-check and monthly recurring costs before saving or enabling recurring schedules.
-  3. Save tracker (defaults to weekly cadence without running an immediate check; AI project IDs must be valid UUIDs):
+  3. Save tracker (defaults to weekly cadence without running an immediate check; first scheduled check executes approximately one week later; AI project IDs must be valid UUIDs):
      ```ts
      await client.callTool({
        name: "save_ai_visibility_tracker",
@@ -471,7 +494,7 @@ try {
        }
      });
      ```
-  4. Configure and enable recurrence schedule (triggers an immediate initial baseline check upon enabling, nested under `data.run`; subsequent updates leave `data.run` nullable):
+  4. Configure and enable recurrence schedule (triggers initial baseline check if qualifying run doesn't exist, nested under `data.run`; returns `data.run: null` if another run is active or DataForSEO balance is insufficient; subsequent updates leave `data.run` nullable):
      ```ts
      const schedRes = await client.callTool({
        name: "set_ai_visibility_schedule",
@@ -567,9 +590,10 @@ try {
      const projectId = projRes.structuredContent?.project?.id;
      if (!projectId) throw new Error("Project creation did not return an ID");
      ```
-  3. Extract initial brand profile and save reviewed setup (passing required `name`, `domain`, `overview`, `competitors` and optional `suggestedTopics`, `suggestedKeywords`):
+  3. Extract initial brand profile and save reviewed setup (note: `research_project_website` bills actual model/search credits against balance; use the returned draft payload to construct setup arguments instead of discarding it):
      ```ts
-     await client.callTool({ name: "research_project_website", arguments: { projectId, website: "https://toiletcubicle.co.id" } });
+     const researchRes = await client.callTool({ name: "research_project_website", arguments: { projectId, website: "https://toiletcubicle.co.id" } });
+     const draft = researchRes.structuredContent?.draft ?? {};
      await client.callTool({
        name: "save_project_website_setup",
        arguments: {
@@ -638,7 +662,7 @@ try {
 - **UI Route**: Headless MCP capability (integrated with `/p/:projectId/keywords` and `/p/:projectId/domain`)
 - **MCP Tools**: `search_local_businesses`, `get_local_rank_grid`
 - **Workflow**:
-  1. Search and bind target Google Business Profile (requires `projectId` and `near` coordinates/radius):
+  1. Search candidate Google Business Profiles (there is no direct project GBP binding in this flow; prefer returned CID or placeId when targeting):
      ```ts
      const businesses = await client.callTool({
        name: "search_local_businesses",
@@ -649,7 +673,7 @@ try {
        }
      });
      ```
-  2. Dispatch local geo-grid search around target coordinates:
+  2. Dispatch local geo-grid search around target coordinates (bills credits per point for N x N points; repeating identical grid arguments within 1 hour resumes existing collection at no repeat charge):
      ```ts
      const grid = await client.callTool({
        name: "get_local_rank_grid",
@@ -733,7 +757,7 @@ OpenSEO exposes 78 registered MCP tools in `src/server/mcp/server.ts`:
 ### Family 1: Workspace and Project Management (8 tools)
 - `whoami`: Read authenticated identity, returning `userEmail`, `scopes`, `mode`, and `creditsRemaining`.
 - `create_project`: Create a new tracked domain project with language and location configuration.
-- `list_projects`: List all active projects in the caller's organization.
+- `list_projects`: List active projects in caller's organization (can enumerate projects across multiple authorized organizations).
 - `research_project_website`: Crawl and summarize initial project brand data from root page.
 - `save_project_website_setup`: Save initial domain branding and keyword focus during onboarding.
 - `get_project_context`: Retrieve project configuration, target keywords, and brand identity.

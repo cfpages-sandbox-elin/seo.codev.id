@@ -124,6 +124,7 @@ interface RepoMapping {
 
 function loadRepoMappings(): Map<string, RepoMapping> {
   const map = new Map<string, RepoMapping>();
+  const ambiguousHosts = new Set<string>();
 
   // 1. Load from fleetManifest.json (canonical approved mappings take highest precedence)
   try {
@@ -131,13 +132,21 @@ function loadRepoMappings(): Map<string, RepoMapping> {
     const list = JSON.parse(raw);
     for (const item of list) {
       if (item.canonicalHost && item.repoName) {
+        const host = item.canonicalHost.toLowerCase().trim();
         const repoSlug = item.repoName.trim();
         if (isValidRepoSlug(repoSlug)) {
-          map.set(item.canonicalHost.toLowerCase().trim(), {
-            domain: item.canonicalHost.toLowerCase().trim(),
-            repoName: repoSlug,
-            publishRoot: item.publishRoot ?? ".",
-          });
+          if (map.has(host) && map.get(host)!.repoName !== repoSlug) {
+            console.warn(
+              `[MANIFEST] Ambiguous conflicting repository mapping for '${host}': '${map.get(host)!.repoName}' vs '${repoSlug}'. Excluding ambiguous host.`,
+            );
+            ambiguousHosts.add(host);
+          } else {
+            map.set(host, {
+              domain: host,
+              repoName: repoSlug,
+              publishRoot: item.publishRoot ?? ".",
+            });
+          }
         }
       }
     }
@@ -161,13 +170,24 @@ function loadRepoMappings(): Map<string, RepoMapping> {
           .replace(/^https?:\/\//, "")
           .replace(/\/+$/, "");
         const slug = `${owner}/${repo}`;
-        if (owner && repo && site && !map.has(site) && isValidRepoSlug(slug)) {
-          map.set(site, { domain: site, repoName: slug, publishRoot: "." });
+        if (owner && repo && site && isValidRepoSlug(slug)) {
+          if (map.has(site) && map.get(site)!.repoName !== slug) {
+            console.warn(
+              `[MANIFEST] Ambiguous conflicting repository mapping for '${site}': '${map.get(site)!.repoName}' vs '${slug}'. Excluding ambiguous host.`,
+            );
+            ambiguousHosts.add(site);
+          } else if (!map.has(site)) {
+            map.set(site, { domain: site, repoName: slug, publishRoot: "." });
+          }
         }
       }
     }
   } catch (err) {
     console.warn("Could not load PROJECTS_GITHUB.md:", err);
+  }
+
+  for (const ambiguous of ambiguousHosts) {
+    map.delete(ambiguous);
   }
 
   return map;
@@ -196,6 +216,7 @@ async function auditRepository(
   maxPages = 10000,
   useArchive = false,
   isRemote = true,
+  isForce = false,
 ): Promise<boolean> {
   const { domain, repoName, projectId } = mapping;
   if (!projectId) {
@@ -334,11 +355,22 @@ async function auditRepository(
     const physicalKey = normalizeRoute(`${domain}/${encodedPath}`);
 
     if (ambiguousServedUrls.has(pageUrl)) {
-      const allPaths = (htmlBlobsByServedUrl.get(pageUrl) ?? [file]).map(
-        (it) => it.path,
-      );
+      const allItems = htmlBlobsByServedUrl.get(pageUrl) ?? [file];
+      const allPaths = allItems.map((it) => it.path);
       const ambigOwner: RouteOwner = { kind: "ambiguous", gitPaths: allPaths };
-      physicalRoutes.set(physicalKey, ambigOwner);
+      for (const item of allItems) {
+        const itemServedPath = prefix
+          ? item.path.slice(prefix.length)
+          : item.path;
+        const itemEncoded = itemServedPath
+          .split("/")
+          .map(encodeURIComponent)
+          .join("/");
+        physicalRoutes.set(
+          normalizeRoute(`${domain}/${itemEncoded}`),
+          ambigOwner,
+        );
+      }
       addAlias(normalizeRoute(pageUrl), ambigOwner);
     } else {
       const pageOwner: RouteOwner = { kind: "page", gitPath: p, pageUrl };
@@ -393,16 +425,21 @@ async function auditRepository(
     aliasToCanonicalUrl.set(normalizeRoute(`/${encoded}`), pageUrl);
   }
 
-  // Sol P1-01: Check for active running audit on this project to prevent concurrent writers
-  const activeRunning = runD1Query(
-    `SELECT id FROM audits WHERE project_id = '${projectId}' AND status = 'running';`,
-    isRemote,
-  );
-  if (activeRunning.length > 0) {
-    console.warn(
-      `[CONFLICT] Project ${projectId} already has an active running audit (${activeRunning[0].id}). Skipping concurrent execution.`,
+  // Handle force restart or stale recovery (> 2 hours old without completion)
+  if (isForce) {
+    executeD1SqlStatements(
+      [
+        `UPDATE audits SET status = 'failed', error_code = 'force_restarted', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running';`,
+      ],
+      isRemote,
     );
-    return false;
+  } else {
+    executeD1SqlStatements(
+      [
+        `UPDATE audits SET status = 'failed', error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running' AND (julianday('now') - julianday(started_at)) * 24 >= 2;`,
+      ],
+      isRemote,
+    );
   }
 
   // Sol P1-01, P2-07: Generate unique attempt ID (v4 UUID) and reserve row before acquiring blobs or archive
@@ -421,21 +458,36 @@ async function auditRepository(
     treeTruncated: isTreeTruncated,
   }).replace(/'/g, "''");
 
-  // Reserve audit attempt in D1 with status = 'running', current_phase = 'analyzing'
+  // Reserve audit attempt in D1 conditionally — fails atomically if an active running audit already exists
   executeD1SqlStatements(
     [
       `INSERT INTO audits (
       id, project_id, started_by_user_id, start_url,
       workflow_instance_id, config, status, pages_crawled,
       pages_total, lighthouse_total, current_phase, started_at
-    ) VALUES (
+    )
+    SELECT
       '${auditId}', '${projectId}', 'system', 'https://${domain}',
       'github-audit-${auditId}', '${configJson}', 'running', 0,
       ${htmlFiles.length}, 0, 'analyzing', '${startedAtIso}'
+    WHERE NOT EXISTS (
+      SELECT 1 FROM audits
+      WHERE project_id = '${projectId}' AND status = 'running'
     );`,
     ],
     isRemote,
   );
+
+  const reserved = runD1Query(
+    `SELECT id FROM audits WHERE id = '${auditId}';`,
+    isRemote,
+  );
+  if (reserved.length === 0) {
+    console.warn(
+      `[CONFLICT] Project ${projectId} already has an active running audit or was reserved by another runner. Skipping concurrent execution.`,
+    );
+    return false;
+  }
 
   // 3. Fetch and analyze HTML files with paced concurrency
   const crawledPages: CrawledPageResult[] = [];
@@ -575,17 +627,18 @@ async function auditRepository(
           }
 
           for (const link of analysis.links) {
-            if (link.isInternal && link.targetUrl) {
+            if (link.targetUrl) {
               try {
-                const target = new URL(link.targetUrl, effectiveBaseUrl);
-                // Recognize same origin including www <-> apex pairs and default port http/https (Sol F02)
+                const target = new URL(link.targetUrl);
+                const targetHost = target.hostname
+                  .toLowerCase()
+                  .replace(/^www\./, "");
+                const domainHost = domain.toLowerCase().replace(/^www\./, "");
                 const isInternal =
-                  isSameOrigin(target.href, pageUrl) ||
-                  (target.hostname.toLowerCase().replace(/^www\./, "") ===
-                    domain.toLowerCase().replace(/^www\./, "") &&
-                    (target.port === "" ||
-                      target.port === "80" ||
-                      target.port === "443"));
+                  targetHost === domainHost &&
+                  (target.port === "" ||
+                    target.port === "80" ||
+                    target.port === "443");
 
                 if (isInternal) {
                   const normTarget = normalizeRoute(
@@ -699,7 +752,16 @@ async function auditRepository(
       `[STAGE 1] Ingesting child evidence into reserved audit ${auditId}...`,
     );
 
-    // Stage 2: Insert audit pages (preserving source provenance, NULL unmeasured runtime evidence, including OpenGraph — Sol P1-03)
+    const boundText = (
+      s: string | null | undefined,
+      maxChars: number,
+    ): string | null => {
+      if (!s) return null;
+      const trimmed = s.trim();
+      return trimmed.length <= maxChars ? trimmed : trimmed.slice(0, maxChars);
+    };
+
+    // Stage 2: Insert audit pages with guarded parent check and bounded text fields (Sol V1-03, V1-06)
     const pageSqlLines: string[] = [];
     for (const p of crawledPages) {
       const esc = (s: string | null | undefined) =>
@@ -711,22 +773,24 @@ async function auditRepository(
           h1_count, h2_count, h3_count, h4_count, h5_count, h6_count,
           word_count, content_hash, images_total, images_missing_alt, internal_link_count,
           external_link_count, has_structured_data, is_indexable, crawl_depth, in_sitemap, response_time_ms
-        ) VALUES (
+        )
+        SELECT
           '${p.id}', '${auditId}', '${p.url.replace(/'/g, "''")}', NULL, '${p.fetchClass}',
-          ${esc(p.title)}, ${esc(p.metaDescription)}, ${esc(p.canonicalUrl)}, ${esc(p.robotsMeta)},
-          ${esc(p.ogTitle)}, ${esc(p.ogDescription)}, ${esc(p.ogImage)},
+          ${esc(boundText(p.title, 500))}, ${esc(boundText(p.metaDescription, 1000))}, ${esc(boundText(p.canonicalUrl, 2000))}, ${esc(boundText(p.robotsMeta, 200))},
+          ${esc(boundText(p.ogTitle, 500))}, ${esc(boundText(p.ogDescription, 1000))}, ${esc(boundText(p.ogImage, 2000))},
           ${p.h1Count}, ${p.h2Count}, ${p.h3Count}, ${p.h4Count}, ${p.h5Count}, ${p.h6Count},
           ${p.wordCount}, ${esc(p.contentHash)}, ${p.imagesTotal}, ${p.imagesMissingAlt},
           ${p.links.filter((l) => l.isInternal).length}, ${p.links.filter((l) => !l.isInternal).length},
           ${p.hasStructuredData ? 1 : 0}, ${p.isIndexable ? 1 : 0}, NULL, 0, NULL
-        ) ON CONFLICT(id) DO NOTHING;
+        WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${auditId}' AND status = 'running')
+        ON CONFLICT(id) DO NOTHING;
       `);
     }
     if (pageSqlLines.length > 0) {
       executeD1SqlStatements(pageSqlLines, isRemote);
     }
 
-    // Stage 3: Insert audit issues with stable row IDs derived from auditId, pageUrl, issueType, dedupeKey (Sol P2-07)
+    // Stage 3: Insert audit issues guarded by parent attempt and page relationship (Sol V1-03, V1-06)
     const issueSqlLines: string[] = [];
     for (const issue of detectedIssues) {
       const issueId = await deterministicAuditRowId(
@@ -736,20 +800,47 @@ async function auditRepository(
         issue.dedupeKey ?? "",
       );
       const severity = getIssueDescriptor(issue.issueType)?.severity || "info";
-      const detailsJson = issue.details
+      const rawDetails = issue.details
         ? JSON.stringify(issue.details).replace(/'/g, "''")
         : "NULL";
+      const detailsJson =
+        rawDetails === "NULL" ? "NULL" : boundText(rawDetails, 4000);
       issueSqlLines.push(`
         INSERT INTO audit_issues (
           id, audit_id, issue_type, severity, page_id, page_url, details_json
-        ) VALUES (
+        )
+        SELECT
           '${issueId}', '${auditId}', '${issue.issueType}', '${severity}', ${issue.pageId ? `'${issue.pageId}'` : "NULL"},
           '${issue.pageUrl.replace(/'/g, "''")}', ${detailsJson === "NULL" ? "NULL" : `'${detailsJson}'`}
-        ) ON CONFLICT(id) DO NOTHING;
+        WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${auditId}' AND status = 'running')
+          AND (${issue.pageId ? `EXISTS (SELECT 1 FROM audit_pages WHERE id = '${issue.pageId}' AND audit_id = '${auditId}')` : "1=1"})
+        ON CONFLICT(id) DO NOTHING;
       `);
     }
     if (issueSqlLines.length > 0) {
       executeD1SqlStatements(issueSqlLines, isRemote);
+    }
+
+    // Pre-CAS: Verify child row count integrity and ensure zero orphaned page references (Sol V1-03)
+    const integrity = runD1Query(
+      `SELECT
+         (SELECT COUNT(*) FROM audit_pages WHERE audit_id = '${auditId}') AS pages,
+         (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') AS issues,
+         (SELECT COUNT(*) FROM audit_issues ai LEFT JOIN audit_pages ap ON ai.page_id = ap.id AND ap.audit_id = '${auditId}' WHERE ai.audit_id = '${auditId}' AND ai.page_id IS NOT NULL AND ap.id IS NULL) AS invalid_refs;`,
+      isRemote,
+    );
+    const actualPages = Number(integrity[0]?.pages ?? 0);
+    const actualIssues = Number(integrity[0]?.issues ?? 0);
+    const invalidRefs = Number(integrity[0]?.invalid_refs ?? 0);
+
+    if (
+      invalidRefs > 0 ||
+      actualPages !== crawledPages.length ||
+      actualIssues !== detectedIssues.length
+    ) {
+      throw new Error(
+        `Audit child integrity verification failed for ${auditId}: pages=${actualPages}/${crawledPages.length}, issues=${actualIssues}/${detectedIssues.length}, invalid_page_refs=${invalidRefs}`,
+      );
     }
 
     // Stage 4: Atomic compare-and-set flip to final status with child row count reconciliation and RETURNING assertion (Sol P1-01, P1-05)
@@ -1291,6 +1382,7 @@ async function main() {
                       AND lower(trim(p.domain)) = lower(trim(m.canonical_host))
        WHERE v.id = '${effectiveRoster.id}'
          AND v.organization_id = 'shared-workspace'
+         AND m.enrollment_state = 'active'
          AND m.project_id IS NOT NULL;`,
       isRemote,
     );
@@ -1340,6 +1432,8 @@ async function main() {
                 AND fri.status = 'completed'
                 AND fri.project_id = ra.project_id
                 AND fs.project_id = ra.project_id
+                AND fs.member_id = fri.member_id
+                AND rm.project_id = ra.project_id
                 AND fs.canonical_host = rm.canonical_host
                 AND r.organization_id = 'shared-workspace'
                 ${effectiveRoster ? `AND r.roster_version_id = '${effectiveRoster.id}' AND rm.version_id = '${effectiveRoster.id}'` : ""}
@@ -1355,7 +1449,7 @@ async function main() {
   for (const a of completedAudits) {
     auditByProjectId.set(a.project_id, {
       id: a.id,
-      hasDiagnostic: Number(a.has_verified_triple ?? 0) > 0,
+      hasDiagnostic: Number(a.has_verified_triple ?? 0) === 1,
     });
   }
 
@@ -1481,6 +1575,7 @@ async function main() {
           maxPages,
           !!args.values.archive,
           isRemote,
+          force,
         );
         if (ok) successCount++;
         else failCount++;

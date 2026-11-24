@@ -105,11 +105,11 @@ async function failAudit(
     errorDetail: string;
     failedPhase: string | null;
   },
-) {
+): Promise<boolean> {
   // Only a running audit can transition to failed: the getStatus reconciler
   // races the workflow's own finalize, and without this guard it could flip
   // a just-completed audit to failed.
-  await db
+  const updated = await db
     .update(audits)
     .set({
       status: "failed",
@@ -127,7 +127,10 @@ async function failAudit(
         eq(audits.workflowInstanceId, workflowInstanceId),
         eq(audits.status, "running"),
       ),
-    );
+    )
+    .returning({ id: audits.id });
+
+  return updated.length > 0;
 }
 
 async function getAuditForWorkflow(

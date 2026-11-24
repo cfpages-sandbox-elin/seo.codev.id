@@ -1,4 +1,4 @@
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { getDatabaseProvider } from "@/db/provider";
@@ -8,24 +8,7 @@ import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { formatMcpTable, type McpTableColumn } from "@/server/mcp/table";
 import { FLEET_MANIFEST_MEMBERS } from "@/server/features/fleet/data/fleetManifest";
-
-function routeIssueToSkill(issueType: string, url = ""): { skill: string; action: string } {
-  const t = (issueType || "").toLowerCase().replace(/-/g, "_");
-  const u = (url || "").toLowerCase();
-  if (t.includes("broken_image") || u.includes(".css") || u.includes(".js") || u.includes("wp-content")) {
-    return { skill: "static-site-css-repair", action: "Repair missing theme assets, unstyled paths, or broken CSS/JS references in static export." };
-  }
-  if (t.includes("orphan") || t.includes("internal_link") || t.includes("broken_link") || t.includes("redirect_chain") || t.includes("canonical")) {
-    return { skill: "internal-linking", action: "Establish incoming link mesh from hub pages to money pages and correct canonical references." };
-  }
-  if (t.includes("title") || t.includes("description") || t.includes("heading") || t.includes("thin_content") || t.includes("duplicate")) {
-    return { skill: "unslop-seo", action: "Remove AI fluff, inject 40-word direct answers, and write unique meta title/descriptions." };
-  }
-  if (t.includes("slow") || t.includes("speed") || t.includes("large_page") || t.includes("lighthouse")) {
-    return { skill: "web-perf", action: "Audit Web Vitals, defer non-critical scripts, and optimize image payloads." };
-  }
-  return { skill: "seo-audit", action: "General technical SEO remediation." };
-}
+import { routeIssueToSkill } from "@/server/lib/audit/issue-routing";
 
 interface EnrichedFleetIssue {
   id: string;
@@ -40,61 +23,117 @@ interface EnrichedFleetIssue {
   recommendedAction: string;
 }
 
-const CANONICAL_DOMAIN_REGEX = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+const CANONICAL_DOMAIN_REGEX =
+  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 
 function isValidCanonicalHostname(domain: string): boolean {
-  if (!domain || typeof domain !== "string" || domain.length > 253) return false;
+  if (!domain || typeof domain !== "string" || domain.length > 253)
+    return false;
   return CANONICAL_DOMAIN_REGEX.test(domain);
 }
 
 const getFleetIssuesInputSchema = {
-  domain: z.string().trim().max(253).regex(CANONICAL_DOMAIN_REGEX, "Must be a valid canonical hostname without protocol, path, or port").optional().describe("Optional domain to filter issues by (e.g. 'kaca.co.id')."),
-  severity: z.enum(["critical", "warning", "info"]).optional().describe("Optional severity level to filter by ('critical', 'warning', 'info')."),
-  issueType: z.string().trim().optional().describe("Optional issue type filter (e.g. 'broken_link', 'missing_meta_description')."),
-  source: z.enum(["all", "edge", "repository", "both"]).optional().describe("Audit source lane filter: 'all' or 'both', 'edge', or 'repository'."),
-  limit: z.number().int().min(1).max(200).optional().default(50).describe("Maximum number of issues to return (default 50, max 200)."),
+  domain: z
+    .string()
+    .trim()
+    .max(253)
+    .regex(
+      CANONICAL_DOMAIN_REGEX,
+      "Must be a valid canonical hostname without protocol, path, or port",
+    )
+    .optional()
+    .describe("Optional domain to filter issues by (e.g. 'kaca.co.id')."),
+  severity: z
+    .enum(["critical", "warning", "info"])
+    .optional()
+    .describe(
+      "Optional severity level to filter by ('critical', 'warning', 'info').",
+    ),
+  issueType: z
+    .string()
+    .trim()
+    .optional()
+    .describe(
+      "Optional issue type filter (e.g. 'broken_link', 'missing-meta-description').",
+    ),
+  source: z
+    .enum(["all", "edge", "repository", "both"])
+    .optional()
+    .describe(
+      "Audit source lane filter: 'all' or 'both', 'edge', or 'repository'.",
+    ),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(200)
+    .optional()
+    .default(50)
+    .describe("Maximum number of issues to return (default 50, max 200)."),
 } as const;
 
-type GetFleetIssuesArgs = z.infer<z.ZodObject<typeof getFleetIssuesInputSchema>>;
+type GetFleetIssuesArgs = z.infer<
+  z.ZodObject<typeof getFleetIssuesInputSchema>
+>;
 
 export const getFleetIssuesTool = {
   name: "get_fleet_issues",
   config: {
     title: "Get fleet issues",
-    description: "Query aggregated technical SEO issues across the enrolled fleet in OpenSEO. Returns bounded sample with severity, skill routing, and source lane provenance.",
+    description:
+      "Retrieve detected SEO issues across enrolled fleet properties in OpenSEO. Supports filtering by domain, severity, issue type, and audit source ('edge', 'repository', 'all', or 'both'). Automatically maps issues to remediation skills.",
     inputSchema: getFleetIssuesInputSchema,
-    outputSchema: z.object({
-      totalIssues: z.number(),
-      severityBreakdown: z.object({ critical: z.number(), warning: z.number(), info: z.number() }).passthrough(),
-      skillRoutingBreakdown: z.record(z.string(), z.number()),
-      issues: z.array(z.object({
-        id: z.string(), domain: z.string(), auditId: z.string(), source: z.string(),
-        issueType: z.string(), severity: z.string(), pageUrl: z.string(),
-        targetUrl: z.string().nullable(), skillRoute: z.string(), recommendedAction: z.string(),
-      }).passthrough()),
-      ...optionalMetaOutputSchema,
-    }).passthrough(),
+    outputSchema: z
+      .object({
+        totalIssues: z.number(),
+        severityBreakdown: z.object({
+          critical: z.number(),
+          warning: z.number(),
+          info: z.number(),
+        }),
+        skillRoutingBreakdown: z.record(z.string(), z.number()),
+        issues: z.array(
+          z.object({
+            id: z.string(),
+            domain: z.string(),
+            auditId: z.string(),
+            source: z.string(),
+            issueType: z.string(),
+            severity: z.string(),
+            pageUrl: z.string(),
+            targetUrl: z.string().nullable(),
+            skillRoute: z.string(),
+            recommendedAction: z.string(),
+          }),
+        ),
+        ...optionalMetaOutputSchema,
+      })
+      .passthrough(),
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   handler: async (args: GetFleetIssuesArgs, context: ToolContext) => {
     const orgId = context.auth?.organizationId;
     if (!orgId || orgId !== "shared-workspace") {
-      throw new Error(`Fleet tools are currently constrained to the 'shared-workspace' organization; caller organization '${orgId ?? "unauthenticated"}' is not supported.`);
+      throw new Error(
+        `Fleet operations are currently constrained to the 'shared-workspace' organization; caller organization '${orgId ?? "unauthenticated"}' is not supported.`,
+      );
     }
 
-    const limit = Math.max(1, Math.min(200, args.limit || 50));
-    const sourceFilter = args.source || "all";
+    const source = args.source ?? "all";
+    const limit = args.limit ?? 50;
     const isPg = getDatabaseProvider() === "postgres";
     const completedTimeFor = (alias: string) =>
-      isPg ? sql.raw(`${alias}.completed_at::timestamp AT TIME ZONE 'UTC'`) : sql.raw(`julianday(${alias}.completed_at)`);
+      isPg
+        ? sql.raw(`${alias}.completed_at::timestamp AT TIME ZONE 'UTC'`)
+        : sql.raw(`julianday(${alias}.completed_at)`);
 
     let auditSelectorCondition;
-    if (sourceFilter === "edge") {
+    if (source === "edge") {
       auditSelectorCondition = eq(
         audits.id,
         sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' AND (a2.workflow_instance_id NOT LIKE 'github-audit-%' OR a2.workflow_instance_id IS NULL) ORDER BY ${completedTimeFor("a2")} DESC NULLS LAST, a2.id DESC LIMIT 1)`,
       );
-    } else if (sourceFilter === "repository") {
+    } else if (source === "repository") {
       auditSelectorCondition = eq(
         audits.id,
         sql`(SELECT a2.id FROM audits a2 WHERE a2.project_id = ${projects.id} AND a2.status = 'completed' AND a2.workflow_instance_id LIKE 'github-audit-%' ORDER BY ${completedTimeFor("a2")} DESC NULLS LAST, a2.id DESC LIMIT 1)`,
@@ -120,7 +159,18 @@ export const getFleetIssuesTool = {
       conditions.push(eq(projects.domain, args.domain.toLowerCase().trim()));
     }
     if (args.severity) conditions.push(eq(auditIssues.severity, args.severity));
-    if (args.issueType) conditions.push(eq(auditIssues.issueType, args.issueType));
+    if (args.issueType) {
+      const raw = args.issueType.trim();
+      const hyphenated = raw.toLowerCase().replace(/_/g, "-");
+      const underscored = raw.toLowerCase().replace(/-/g, "_");
+      conditions.push(
+        or(
+          eq(auditIssues.issueType, raw),
+          eq(auditIssues.issueType, hyphenated),
+          eq(auditIssues.issueType, underscored),
+        )!,
+      );
+    }
 
     const severityOrder = sql`CASE ${auditIssues.severity} WHEN 'critical' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END`;
 
@@ -150,19 +200,36 @@ export const getFleetIssuesTool = {
       let parsedTargetUrl: string | null = null;
       if (r.detailsJson) {
         try {
-          const parsed = detailSchema.safeParse(JSON.parse(r.detailsJson) as unknown);
-          if (parsed.success && parsed.data.targetUrl) parsedTargetUrl = parsed.data.targetUrl;
+          const parsed = detailSchema.safeParse(
+            JSON.parse(r.detailsJson) as unknown,
+          );
+          if (parsed.success && parsed.data.targetUrl)
+            parsedTargetUrl = parsed.data.targetUrl;
         } catch {}
       }
       if (r.severity in severityBreakdown) severityBreakdown[r.severity]++;
-      const routing = routeIssueToSkill(r.issueType, parsedTargetUrl || r.pageUrl || "");
-      skillRoutingBreakdown[routing.skill] = (skillRoutingBreakdown[routing.skill] || 0) + 1;
-      const source = r.workflowInstanceId && r.workflowInstanceId.startsWith("github-audit-") ? "repository" : "edge";
+      const routing = routeIssueToSkill(
+        r.issueType,
+        parsedTargetUrl || r.pageUrl || "",
+      );
+      skillRoutingBreakdown[routing.skill] =
+        (skillRoutingBreakdown[routing.skill] || 0) + 1;
+      const issueSource =
+        r.workflowInstanceId && r.workflowInstanceId.startsWith("github-audit-")
+          ? "repository"
+          : "edge";
 
       return {
-        id: r.id, domain: r.domain || "", auditId: r.auditId, source,
-        issueType: r.issueType, severity: r.severity, pageUrl: r.pageUrl || "",
-        targetUrl: parsedTargetUrl, skillRoute: routing.skill, recommendedAction: routing.action,
+        id: r.id,
+        domain: r.domain || "",
+        auditId: r.auditId,
+        source: issueSource,
+        issueType: r.issueType,
+        severity: r.severity,
+        pageUrl: r.pageUrl || "",
+        targetUrl: parsedTargetUrl,
+        skillRoute: routing.skill,
+        recommendedAction: routing.action,
       };
     });
 
@@ -191,10 +258,45 @@ export const getFleetIssuesTool = {
 };
 
 const runFleetAuditInputSchema = {
-  domain: z.string().trim().max(253, "Must be at most 253 characters").regex(CANONICAL_DOMAIN_REGEX, "Must be a valid canonical hostname (e.g. 'toiletcubicle.co.id')").optional().describe("Optional target domain to audit."),
-  mode: z.enum(["edge_workflow", "repository_direct"]).optional().describe("Execution mode: 'repository_direct' or 'edge_workflow'."),
-  maxPages: z.number().int().min(10).max(10000).optional().describe("Maximum pages to crawl or inspect (default 2000)."),
-  concurrency: z.number().int().min(1).max(5).optional().describe("Paced concurrency for workflow crawler batches (default 2)."),
+  domain: z
+    .string()
+    .trim()
+    .max(253, "Must be at most 253 characters")
+    .regex(
+      CANONICAL_DOMAIN_REGEX,
+      "Must be a valid canonical hostname (e.g. 'toiletcubicle.co.id')",
+    )
+    .optional()
+    .describe("Optional target domain to audit."),
+  all: z
+    .boolean()
+    .optional()
+    .describe("Explicitly plan audits for all enrolled fleet properties."),
+  limit: z
+    .number()
+    .int()
+    .min(1)
+    .max(100)
+    .optional()
+    .describe("Optional limit for number of properties to plan."),
+  mode: z
+    .enum(["edge_workflow", "repository_direct"])
+    .optional()
+    .describe("Execution mode: 'repository_direct' or 'edge_workflow'."),
+  maxPages: z
+    .number()
+    .int()
+    .min(10)
+    .max(10000)
+    .optional()
+    .describe("Maximum pages to crawl or inspect (default 2000)."),
+  concurrency: z
+    .number()
+    .int()
+    .min(1)
+    .max(5)
+    .optional()
+    .describe("Paced concurrency for workflow crawler batches (default 2)."),
 } as const;
 
 type RunFleetAuditArgs = z.infer<z.ZodObject<typeof runFleetAuditInputSchema>>;
@@ -203,52 +305,121 @@ export const runFleetAuditTool = {
   name: "run_fleet_audit",
   config: {
     title: "Run fleet audit",
-    description: "Plan and configure fleet-wide site audits across enrolled properties in OpenSEO. Read-only planning tool: outputs executable CLI argv and command without launching background processes.",
+    description:
+      "Plan and configure fleet-wide site audits across enrolled properties in OpenSEO. Read-only planning tool: outputs executable CLI argv and command without launching background processes.",
     inputSchema: runFleetAuditInputSchema,
-    outputSchema: z.object({
-      status: z.string(), planId: z.string(), runId: z.string().optional(),
-      organizationId: z.string(), mode: z.string(), targetDomain: z.string().nullable().optional(),
-      message: z.string(), executable: z.string(), argv: z.array(z.string()),
-      executionCommand: z.string(), ...optionalMetaOutputSchema,
-    }).passthrough(),
+    outputSchema: z
+      .object({
+        status: z.string(),
+        planId: z.string(),
+        organizationId: z.string(),
+        mode: z.string(),
+        targetDomain: z.string().nullable().optional(),
+        message: z.string(),
+        executable: z.string(),
+        argv: z.array(z.string()),
+        executionCommand: z.string(),
+        ...optionalMetaOutputSchema,
+      })
+      .passthrough(),
     annotations: { readOnlyHint: true, openWorldHint: false },
   },
   handler: async (args: RunFleetAuditArgs, context: ToolContext) => {
     const orgId = context.auth?.organizationId;
     if (!orgId || orgId !== "shared-workspace") {
-      throw new Error(`Fleet runners are currently constrained to the 'shared-workspace' organization; caller organization '${orgId ?? "unauthenticated"}' is not supported.`);
+      throw new Error(
+        `Fleet runners are currently constrained to the 'shared-workspace' organization; caller organization '${orgId ?? "unauthenticated"}' is not supported.`,
+      );
+    }
+
+    const domain = args.domain?.toLowerCase().trim();
+    if (!domain && !args.all && !args.limit) {
+      throw new Error(
+        "An explicit scope is required: provide a target domain, specify --limit, or pass all=true.",
+      );
     }
 
     const mode = args.mode ?? "repository_direct";
-    const domain = args.domain?.toLowerCase().trim();
     const maxPages = args.maxPages || 2000;
     const concurrency = args.concurrency || 2;
 
     if (domain) {
-      const proj = await db.select({ id: projects.id }).from(projects).where(and(eq(projects.organizationId, orgId), eq(projects.domain, domain), isNull(projects.archivedAt))).limit(1);
-      if (proj.length === 0) throw new Error(`Domain '${domain}' is not enrolled in organization '${orgId}'.`);
+      const proj = await db
+        .select({ id: projects.id })
+        .from(projects)
+        .where(
+          and(
+            eq(projects.organizationId, orgId),
+            eq(projects.domain, domain),
+            isNull(projects.archivedAt),
+          ),
+        )
+        .limit(1);
+      if (proj.length === 0)
+        throw new Error(
+          `Domain '${domain}' is not enrolled in organization '${orgId}'.`,
+        );
 
       if (mode === "repository_direct") {
-        const manifestMember = FLEET_MANIFEST_MEMBERS.find((m) => m.canonicalHost.toLowerCase() === domain);
-        if (!manifestMember?.repoName) throw new Error(`Domain '${domain}' does not have an approved repository mapping for repository_direct mode. Use edge_workflow mode or link a repository in the fleet manifest.`);
+        const manifestMember = FLEET_MANIFEST_MEMBERS.find(
+          (m) => m.canonicalHost.toLowerCase() === domain,
+        );
+        if (!manifestMember?.repoName)
+          throw new Error(
+            `Domain '${domain}' does not have an approved repository mapping for repository_direct mode. Use edge_workflow mode or link a repository in the fleet manifest.`,
+          );
       }
     }
 
     const planId = "plan_" + crypto.randomUUID();
+    const scopeArgs: string[] = [];
+    if (domain) {
+      scopeArgs.push("--domain", domain);
+    } else if (args.limit) {
+      scopeArgs.push("--limit", String(args.limit));
+    } else if (args.all) {
+      scopeArgs.push("--all");
+    }
+
     let argv: string[] = [];
     if (mode === "repository_direct") {
-      argv = ["exec", "tsx", "scripts/run-github-fleet-audit.ts", ...(domain ? ["--domain", domain] : ["--all"]), "--max-pages", String(maxPages)];
+      argv = [
+        "exec",
+        "tsx",
+        "scripts/run-github-fleet-audit.ts",
+        ...scopeArgs,
+        "--max-pages",
+        String(maxPages),
+      ];
     } else {
-      argv = ["exec", "tsx", "scripts/run-fleet-audits.ts", ...(domain ? ["--domain", domain] : ["--all"]), "--max-pages", String(maxPages), "--concurrency", String(concurrency)];
+      argv = [
+        "exec",
+        "tsx",
+        "scripts/run-fleet-audits.ts",
+        ...scopeArgs,
+        "--max-pages",
+        String(maxPages),
+        "--concurrency",
+        String(concurrency),
+      ];
     }
 
     const executionCommand = `pnpm ${argv.join(" ")}`;
-    const message = domain ? `Fleet audit plan configured for ${domain} in ${mode} mode.` : `Fleet-wide audit plan configured across enrolled properties in ${mode} mode.`;
+    const message = domain
+      ? `Fleet audit plan configured for ${domain} in ${mode} mode.`
+      : `Fleet audit plan configured across enrolled properties in ${mode} mode.`;
 
     return mcpResponse({
       structuredContent: {
-        status: "planned", planId, runId: planId, organizationId: orgId, mode,
-        targetDomain: domain ?? null, message, executable: "pnpm", argv, executionCommand,
+        status: "planned",
+        planId,
+        organizationId: orgId,
+        mode,
+        targetDomain: domain ?? null,
+        message,
+        executable: "pnpm",
+        argv,
+        executionCommand,
       },
       text: `${message}\nRead-only Execution Plan: \`${executionCommand}\`\nNote: To execute, run this command in a terminal or workflow.`,
     });
