@@ -62,6 +62,20 @@ export function analyzeHtml(
   let noscriptDepth = 0;
   let metaDescription: string | null = null;
   let canonical: string | null = null;
+  let baseHref: string | null = null;
+  let effectiveBaseUrl = pageUrl;
+
+  const updateEffectiveBase = (rawHref: string | undefined) => {
+    if (baseHref !== null || !rawHref) return;
+    const trimmed = rawHref.trim();
+    if (!trimmed) return;
+    baseHref = trimmed;
+    try {
+      effectiveBaseUrl = new URL(trimmed, pageUrl).href;
+    } catch {
+      effectiveBaseUrl = pageUrl;
+    }
+  };
   let robotsMeta: string | null = null;
   let ogTitle: string | null = null;
   let ogDescription: string | null = null;
@@ -119,7 +133,7 @@ export function analyzeHtml(
     if (!openAnchor) return;
     const { href, rel, text } = openAnchor;
     openAnchor = null;
-    const resolved = normalizeUrl(href, pageUrl);
+    const resolved = normalizeUrl(href, effectiveBaseUrl);
     if (!resolved || linksByTarget.has(resolved)) return;
     if (linksByTarget.size >= MAX_EXTRACTED_LINKS) {
       truncatedLinks = true;
@@ -163,6 +177,9 @@ export function analyzeHtml(
           case "body":
             bodyDepth += 1;
             sawBody = true;
+            break;
+          case "base":
+            updateEffectiveBase(attribs["href"]);
             break;
           case "meta":
             handleMetaTag(attribs);
@@ -264,6 +281,7 @@ export function analyzeHtml(
     title: (title ?? "").trim(),
     metaDescription: metaDescription ?? "",
     canonical,
+    baseHref,
     robotsMeta,
     ogTitle,
     ogDescription,

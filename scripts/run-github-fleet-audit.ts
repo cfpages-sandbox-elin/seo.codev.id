@@ -324,7 +324,8 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   }
 
   // 3. Fetch and analyze HTML files with paced concurrency
-  const auditId = crypto.randomUUID();
+  const auditSeed = `${projectId}:shared-workspace:${repoName}:${commitSha}:${mapping.publishRoot ?? "."}:v1`;
+  const auditId = deterministicUuid(auditSeed);
   const startTime = Date.now();
   const crawledPages: CrawledPageResult[] = [];
   const detectedIssues: DetectedIssue[] = [];
@@ -561,7 +562,12 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
         '${auditId}', '${projectId}', 'system', 'https://${domain}',
         'github-audit-${auditId}', '${configJson}', 'running', ${processedCount},
         ${htmlFiles.length}, 0, 'analyzing', datetime('now', '-${durationSec} seconds')
-      );`,
+      ) ON CONFLICT(id) DO UPDATE SET
+        config = excluded.config,
+        status = 'running',
+        pages_crawled = excluded.pages_crawled,
+        pages_total = excluded.pages_total,
+        current_phase = 'analyzing';`,
     ], isRemote);
 
     // Stage 2: Insert audit pages (preserving source provenance, NULL unmeasured runtime evidence, including OpenGraph — Sol P1-03)
@@ -593,7 +599,8 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
     // Stage 3: Insert audit issues
     const issueSqlLines: string[] = [];
     for (const issue of detectedIssues) {
-      const issueId = crypto.randomUUID();
+      const issueSeed = `${auditId}:${issue.pageId || "global"}:${issue.issueType}:${issue.pageUrl}:${issue.details ? JSON.stringify(issue.details) : ""}`;
+      const issueId = deterministicUuid(issueSeed);
       const severity = getIssueDescriptor(issue.issueType)?.severity || "info";
       const detailsJson = issue.details ? JSON.stringify(issue.details).replace(/'/g, "''") : "NULL";
       issueSqlLines.push(`
@@ -602,7 +609,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
         ) VALUES (
           '${issueId}', '${auditId}', '${issue.issueType}', '${severity}', ${issue.pageId ? `'${issue.pageId}'` : "NULL"},
           '${issue.pageUrl.replace(/'/g, "''")}', ${detailsJson === "NULL" ? "NULL" : `'${detailsJson}'`}
-        );
+        ) ON CONFLICT(id) DO NOTHING;
       `);
     }
     if (issueSqlLines.length > 0) {
@@ -653,10 +660,10 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
 
         if (rosterRows.length > 0) {
           const { member_id, version_id, organization_id } = rosterRows[0];
-          // Deterministic IDs derived from auditId (Sol P1-02)
-          const runId = "run_" + crypto.createHash("sha256").update(auditId + ":run").digest("hex").slice(0, 16);
-          const runItemId = "item_" + crypto.createHash("sha256").update(auditId + ":item").digest("hex").slice(0, 16);
-          const snapshotId = "snap_" + crypto.createHash("sha256").update(auditId + ":snap").digest("hex").slice(0, 16);
+          // Deterministic IDs derived from auditId, version, and member (Sol F02)
+          const runId = "run_" + crypto.createHash("sha256").update(`${auditId}:${version_id}:${member_id}:run`).digest("hex").slice(0, 16);
+          const runItemId = "item_" + crypto.createHash("sha256").update(`${auditId}:${version_id}:${member_id}:item`).digest("hex").slice(0, 16);
+          const snapshotId = "snap_" + crypto.createHash("sha256").update(`${auditId}:${version_id}:${member_id}:snap`).digest("hex").slice(0, 16);
 
           const score = Math.max(
             10,
@@ -682,7 +689,7 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
           ];
           executeD1SqlStatements(diagnosticSql, isRemote);
 
-          // Verify exact triple persisted with full identities (Sol F07)
+          // Verify exact triple persisted with full identities (Sol F02, F07)
           const isVerified = verifyDiagnosticTriple(
             runId,
             runItemId,
@@ -693,6 +700,8 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
             member_id,
             projectId,
             domain,
+            runStatus,
+            itemStatus,
             isRemote,
           );
           if (!isVerified) {
@@ -742,6 +751,17 @@ async function auditRepository(mapping: RepoMapping, maxPages = 10000, useArchiv
   }
 }
 
+function deterministicUuid(seed: string): string {
+  const hash = crypto.createHash("sha256").update(seed).digest("hex");
+  return [
+    hash.slice(0, 8),
+    hash.slice(8, 12),
+    "4" + hash.slice(13, 16),
+    ((parseInt(hash.slice(16, 18), 16) & 0x3f) | 0x80).toString(16).padStart(2, "0") + hash.slice(18, 20),
+    hash.slice(20, 32),
+  ].join("-");
+}
+
 function verifyDiagnosticTriple(
   runId: string,
   runItemId: string,
@@ -752,6 +772,8 @@ function verifyDiagnosticTriple(
   memberId: string,
   projectId: string,
   canonicalHost: string,
+  expectedRunStatus = "completed",
+  expectedItemStatus = "completed",
   isRemote = true,
 ): boolean {
   const query = `
@@ -772,8 +794,8 @@ function verifyDiagnosticTriple(
       AND s.canonical_host = '${canonicalHost.replace(/'/g, "''")}'
       AND i.primary_series_key = 'diagnostic'
       AND s.series_key = 'diagnostic'
-      AND r.status = 'completed'
-      AND i.status = 'completed'
+      AND r.status = '${expectedRunStatus}'
+      AND i.status = '${expectedItemStatus}'
       AND 1 = (SELECT count(*) FROM fleet_run_items WHERE audit_id = '${auditId}' AND primary_series_key = 'diagnostic');
   `;
   const res = runD1Query(query, isRemote);
@@ -810,9 +832,9 @@ function repairDiagnosticObservation(
     if (rosterRows.length === 0) return false;
 
     const { member_id, version_id, organization_id } = rosterRows[0];
-    const runId = "run_" + crypto.createHash("sha256").update(auditId + ":run").digest("hex").slice(0, 16);
-    const runItemId = "item_" + crypto.createHash("sha256").update(auditId + ":item").digest("hex").slice(0, 16);
-    const snapshotId = "snap_" + crypto.createHash("sha256").update(auditId + ":snap").digest("hex").slice(0, 16);
+    const runId = "run_" + crypto.createHash("sha256").update(`${auditId}:${version_id}:${member_id}:run`).digest("hex").slice(0, 16);
+    const runItemId = "item_" + crypto.createHash("sha256").update(`${auditId}:${version_id}:${member_id}:item`).digest("hex").slice(0, 16);
+    const snapshotId = "snap_" + crypto.createHash("sha256").update(`${auditId}:${version_id}:${member_id}:snap`).digest("hex").slice(0, 16);
 
     const counts = runD1Query(
       `SELECT a.pages_crawled, a.pages_total, a.completed_at,
@@ -844,7 +866,7 @@ function repairDiagnosticObservation(
     ];
     executeD1SqlStatements(diagnosticSql, isRemote);
 
-    // Strict full exact triple verification (Sol F07)
+    // Strict full exact triple verification (Sol F02, F07)
     const isVerified = verifyDiagnosticTriple(
       runId,
       runItemId,
@@ -855,6 +877,8 @@ function repairDiagnosticObservation(
       member_id,
       projectId,
       domain,
+      "completed",
+      "completed",
       isRemote,
     );
     if (isVerified) {
@@ -965,10 +989,16 @@ async function main() {
     isRemote
   );
   const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
+  if (!isWorkspace && !effectiveRoster) {
+    console.error("[ERROR] No effective approved roster found for organization 'shared-workspace'. Pass --workspace to audit wider inventory or approve a roster.");
+    process.exit(1);
+  }
+
   const approvedHosts = new Set<string>();
+  const approvedMembersByHost = new Map<string, { memberId: string; versionId: string; projectId: string; canonicalHost: string }>();
   if (effectiveRoster) {
     const rosterRows = runD1Query(
-      `SELECT m.canonical_host, m.project_id
+      `SELECT m.id AS member_id, m.version_id, m.canonical_host, m.project_id
        FROM fleet_roster_members m
        JOIN fleet_roster_versions v ON v.id = m.version_id
        WHERE v.id = '${effectiveRoster.id}'
@@ -977,11 +1007,18 @@ async function main() {
       isRemote
     );
     for (const r of rosterRows) {
-      approvedHosts.add(r.canonical_host.toLowerCase().trim());
+      const host = r.canonical_host.toLowerCase().trim();
+      approvedMembersByHost.set(host, {
+        memberId: r.member_id,
+        versionId: r.version_id,
+        projectId: r.project_id,
+        canonicalHost: host,
+      });
+      approvedHosts.add(host);
     }
   }
 
-  // Load deterministic latest completed source audits with verified diagnostic triple (Sol F07, F10)
+  // Load deterministic latest completed source audits with verified diagnostic triple (Sol F02, F07, F10)
   const completedAudits = runD1Query(
     `WITH ranked_audits AS (
        SELECT a.id, a.project_id, a.completed_at,
@@ -1004,12 +1041,13 @@ async function main() {
               WHERE fri.audit_id = ra.id
                 AND fri.primary_series_key = 'diagnostic'
                 AND fs.series_key = 'diagnostic'
-                AND r.status = 'completed'
-                AND fri.status = 'completed'
+                AND r.status IN ('completed', 'partial')
+                AND fri.status IN ('completed', 'partial')
                 AND fri.project_id = ra.project_id
                 AND fs.project_id = ra.project_id
                 AND fs.canonical_host = rm.canonical_host
                 AND r.organization_id = 'shared-workspace'
+                ${effectiveRoster ? `AND r.roster_version_id = '${effectiveRoster.id}' AND rm.version_id = '${effectiveRoster.id}'` : ""}
             ) AS has_verified_triple
      FROM ranked_audits ra
      WHERE ra.audit_rank = 1;`,
@@ -1026,11 +1064,12 @@ async function main() {
   const repoMappings = loadRepoMappings();
   console.log(`Loaded ${repoMappings.size} repository mappings from manifest & PROJECTS_GITHUB.md.`);
 
-  // Build deterministic planned actions list (Sol F01, F2: respects approved roster vs workspace scope)
+  // Build deterministic planned actions list (Sol F01, F02: respects approved roster vs workspace scope)
   const plannedActions: FleetAction[] = [];
 
   if (targetDomain) {
-    const projId = projectIdByDomain.get(targetDomain);
+    const approvedMember = approvedMembersByHost.get(targetDomain);
+    const projId = !isWorkspace && approvedMember ? approvedMember.projectId : projectIdByDomain.get(targetDomain);
     const repoMeta = repoMappings.get(targetDomain);
     if (!projId || !repoMeta) {
       console.error(`[ERROR] Domain '${targetDomain}' is not found among enrolled projects or repository mappings.`);
@@ -1042,10 +1081,11 @@ async function main() {
     }
     const existingAudit = auditByProjectId.get(projId);
     if (!force && existingAudit) {
-      if (!existingAudit.hasDiagnostic) {
+      const isRosterMember = approvedHosts.has(targetDomain);
+      if (isRosterMember && !existingAudit.hasDiagnostic) {
         plannedActions.push({ kind: "repair", domain: targetDomain, projectId: projId, auditId: existingAudit.id });
       } else {
-        console.log(`[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit with verified diagnostic observation. Use --force to re-audit.`);
+        console.log(`[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit. Use --force to re-audit.`);
         return;
       }
     } else {
@@ -1053,15 +1093,17 @@ async function main() {
     }
   } else {
     for (const [dom, m] of repoMappings.entries()) {
-      const projId = projectIdByDomain.get(dom);
+      const approvedMember = approvedMembersByHost.get(dom);
       const isEligible = isWorkspace || approvedHosts.has(dom);
+      const projId = !isWorkspace && approvedMember ? approvedMember.projectId : projectIdByDomain.get(dom);
       if (projId && isEligible) {
         const existingAudit = auditByProjectId.get(projId);
         if (!force && existingAudit) {
-          if (!existingAudit.hasDiagnostic) {
+          const isRosterMember = approvedHosts.has(dom);
+          if (isRosterMember && !existingAudit.hasDiagnostic) {
             plannedActions.push({ kind: "repair", domain: dom, projectId: projId, auditId: existingAudit.id });
           } else {
-            continue; // Already audited with verified diagnostic triple
+            continue; // Reused
           }
         } else {
           plannedActions.push({ kind: "audit", mapping: { ...m, projectId: projId } });

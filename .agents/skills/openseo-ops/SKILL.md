@@ -37,7 +37,7 @@ flowchart LR
 - Handles incoming user requests, TanStack Router server-side rendering, and `/onsite` Aggregated Fleet View.
 - Serves the native MCP endpoint at `https://seo.codev.id/mcp` with **78 registered tools** across 8 capability families.
 - Authenticated at the edge:
-  - **Self-Hosted Production (`AUTH_MODE=cloudflare_access`)**: Protected by Cloudflare Zero Trust Access Google SSO (Tier 1 Owner-Only). Browser users sign in via Google OAuth. Headless MCP clients authenticate by passing an authenticated session token via cookie (`Cookie: CF_Authorization=<token>`). Cloudflare Access edge verifies this session and passes the signed JWT assertion (`Cf-Access-Jwt-Assertion` containing valid `sub` and `email` principals) to the origin Worker. Cloudflare Access Service Tokens (`CF-Access-Client-Id` / `CF-Access-Client-Secret`) are accepted when a dedicated Service Auth policy and user-principal mapping are enabled.
+  - **Self-Hosted Production (`AUTH_MODE=cloudflare_access`)**: Protected by Cloudflare Zero Trust Access Google SSO (Tier 1 Owner-Only). Browser users sign in via Google OAuth. Headless MCP clients authenticate by passing an authenticated session token via cookie (`Cookie: CF_Authorization=<token>`). Cloudflare Access edge verifies this session and passes the signed JWT assertion (`Cf-Access-Jwt-Assertion` containing valid nonempty `sub` and `email` identity claims) to the origin Worker. The repository origin verifier requires these explicit `sub` and `email` claims; Service Token authentication workflows require a dedicated Service Auth policy and separately configured/verified Stage 2 identity admission.
   - **Local Development / Test Runner (`AUTH_MODE=local_noauth`)**: Trusted local no-auth environment on `localhost:3000` or in-memory mocks.
   - **Hosted Production Mode**: Authenticated via personal API keys (`oseo_...` via `Authorization: Bearer <key>` or `x-api-key`) or OAuth bearer tokens.
 - App worker exclusively binds `OAUTH_KV` (`open-seo-oauth-kv-selfhost`) for MCP client registrations and OAuth refresh tokens.
@@ -134,8 +134,12 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 ### Playbook 1: Roster Enrollment & Turnkey Linking
 **Prerequisites**:
 - The parent organization row (`id = 'shared-workspace'`) must exist in D1 before importing rosters to satisfy foreign key constraints.
-- Approval JSON requires canonical schema fields: `organizationId`, `versionTag`, `rosterPlanSha256`, and `approvedBy`.
-- Roster importing (`import-fleet-roster.ts`) targets local D1 via `--approval`. Remote fleet linking (`link-github-fleet.ts`) requires an existing effective approved roster. Always run `--dry-run` to preview plans before live execution.
+- Approval JSON requires canonical schema fields: `organizationId`, `versionTag`, `rosterPlanSha256`, `approvedBy`, and optional `approvedAt` (ISO timestamp).
+- Importer execution (`import-fleet-roster.ts`) has local-only semantics (runs against local D1 `DB`). To compute the canonical roster plan SHA-256 for the approval file without mutating D1:
+  ```powershell
+  node --import tsx --input-type=module -e 'import {hashCanonicalRosterPlan} from "./scripts/import-fleet-roster.ts"; import {FLEET_MANIFEST_MEMBERS} from "./src/server/features/fleet/data/fleetManifest.ts"; console.log(hashCanonicalRosterPlan("shared-workspace", FLEET_MANIFEST_MEMBERS))'
+  ```
+- Fleet linking (`link-github-fleet.ts`) operates against either `--local` (local D1 `DB`) or default `--remote` (`open-seo-db-selfhost`), scoped via `--org-id` (default `shared-workspace`). It requires an existing effective approved roster in D1 (`approved_at IS NOT NULL AND julianday(approved_at) <= julianday('now')`). Always preview mutations with `--dry-run` before applying live. (Note: legacy `generate-fleet-linking-sql.ts` is retired).
 
 For fresh **local development** (`localhost:3000` / `wrangler dev`):
 ```powershell
@@ -163,10 +167,14 @@ pnpm exec tsx scripts/link-github-fleet.ts --remote
 ```
 
 > [!NOTE]
-> The linker's `--dry-run` flag operates as an execution plan preview that computes missing projects and link updates without mutating D1. Full database integrity assertions (zero unmapped, zero invalid links) and post-apply roster supersession checks run on live execution passes to confirm state convergence.
+> The linker's `--dry-run` flag operates as a read-only execution plan preview that computes missing projects and link updates without mutating D1. Full database integrity assertions (zero unmapped, zero invalid links) and post-apply roster supersession checks run on live execution passes to confirm state convergence.
 
 ### Playbook 2A: Executing Commit-Pinned GitHub Repository Audit (Primary Source Lane)
-Direct audit accepts exactly one execution scope (`--domain <canonical-host>`, `--limit <n>`, or `--all`). By default, bulk audit admits properties from the approved fleet roster; pass `--workspace` to audit wider inventory projects. Use `--force` to run a fresh source audit at the repository's current pinned revision; without it, completed source audits with verified diagnostic observations are reused or scheduled for diagnostic repair. D1 target defaults to `--remote` (`open-seo-db-selfhost`); pass `--local` for local D1 (`DB`).
+Direct audit accepts exactly one execution scope (`--domain <canonical-host>`, `--limit <n>`, or `--all`). By default, bulk audit admits properties from the approved fleet roster; pass `--workspace` to audit wider inventory projects.
+- **Max Pages Parameter (`--max-pages <n>`)**: Allowed range 1–10,000, default 10,000. Setting a cap below the total eligible pages yields incomplete source coverage.
+- **Audit Reuse vs. Repair**: When auditing without `--force`, completed source audits with valid diagnostic triples (`fleet_runs`, `fleet_run_items`, `fleet_snapshots`) bound to the effective roster version are reused; if diagnostic rows are missing for an approved roster member, a targeted diagnostic repair occurs without re-crawling Git. Workspace audits outside the approved roster bypass diagnostic repair requirements.
+- **Archive Benchmark (`benchmark-archive-audit.ts`)**: Supports `--domain <host>` (manifest-backed lookup), `--repo <owner/repo>`, and `--root <path>` (publish root, defaults to manifest or `.`), with default target `cfpages-adistyputriharli/Concrete.co.id`. Measures true cryptographic candidate parity, selective blob vs. tarball response body bytes, and peak RSS.
+- D1 target defaults to `--remote` (`open-seo-db-selfhost`); pass `--local` for local D1 (`DB`).
 ```powershell
 # Audit a single property by exact domain directly from its GitHub repository (Selective Blob Lane)
 pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --force
@@ -179,12 +187,12 @@ pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --archiv
 pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --local --force
 
 # Benchmark Selective Blob vs. Tarball Archive lane performance with verified blob acquisition
-# (Covers archive acquisition, entry extraction, and raw fallback recovery with verified wire bytes)
+# (Covers archive acquisition, candidate extraction under publish root, and raw fallback recovery)
 pnpm exec tsx scripts/benchmark-archive-audit.ts --domain concrete.co.id
-pnpm exec tsx scripts/benchmark-archive-audit.ts --repo cfpages-adistyputriharli/Concrete.co.id
+pnpm exec tsx scripts/benchmark-archive-audit.ts --repo cfpages-adistyputriharli/Concrete.co.id --root .
 
 # Audit a bounded slice of candidate portfolio properties (limits both repairs and fresh audits)
-pnpm exec tsx scripts/run-github-fleet-audit.ts --limit 20
+pnpm exec tsx scripts/run-github-fleet-audit.ts --limit 20 --max-pages 10000
 
 # Audit wider workspace inventory outside approved fleet roster
 pnpm exec tsx scripts/run-github-fleet-audit.ts --all --workspace
@@ -194,8 +202,12 @@ pnpm exec tsx scripts/run-github-fleet-audit.ts --all --workspace
 For live HTTP validation across deployed sites, dispatch via the CLI edge runner, `AuditService.startAudit`, or MCP `run_site_audit`:
 
 > [!NOTE]
-> The edge runner (`run-fleet-audits.ts`) creates site-audit rows and dispatches the live crawler workflow. Output from edge crawls represents site-audit instances; official weekly baseline grading (`weekly-baseline` series) is reserved for dedicated aggregate grading publishers.
-> Edge defaults: 500 pages, concurrency 2 (allowed range 1–5), exactly one scope. When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots until workflows terminate. When running locally, `--local` requires a running local dev session (`wrangler dev`). `--no-skip-recent` overrides the 10-day recency cutoff filter.
+> The edge runner (`run-fleet-audits.ts`) creates site-audit rows and dispatches the live crawler workflow (`SiteAuditWorkflow`). Output from edge crawls represents site-audit instances; official weekly baseline grading (`weekly-baseline` series) is reserved for dedicated aggregate grading publishers.
+> **Lifecycle, Defaults & Drain**:
+> - Directly invoked edge CLI defaults to 500 pages (max 10,000 for self-hosted instances) and selects `auto` Lighthouse, with concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`).
+> - In contrast, the single-site MCP tool (`run_site_audit`) defaults to 50 pages and leaves Lighthouse off.
+> - **Drain & Pause Window**: When in-flight audits exceed the 15-minute deadline, new admissions pause. The runner executes a bounded 20-minute drain; if active workflows fail to terminate within the drain limit, the command logs active and undispatched counts and exits with failure code 1.
+> - **Local Operation**: When running locally, `--local` requires a running local dev session (`wrangler dev` on port `8787`). `--no-skip-recent` overrides the 10-day recency cutoff filter.
 
 ```powershell
 # Run Cloudflare Workflows live HTTP crawler across target domain
@@ -204,7 +216,7 @@ pnpm exec tsx scripts/run-fleet-audits.ts --domain concrete.co.id --max-pages 50
 # Run workflow crawler across candidate fleet projects with concurrency window (override recency check)
 pnpm exec tsx scripts/run-fleet-audits.ts --limit 10 --concurrency 2 --no-skip-recent
 
-# Local development dispatch (requires local dev session running)
+# Local development dispatch (requires local dev session running on port 8787)
 pnpm exec tsx scripts/run-fleet-audits.ts --domain concrete.co.id --local
 ```
 
@@ -234,7 +246,7 @@ await AuditService.startAudit({
 {
   "projectId": "<project-uuid>",
   "url": "https://<domain>/",
-  "maxPages": 2000,
+  "maxPages": 50,
   "renderJavaScript": false,
   "runLighthouse": false
 }
@@ -248,8 +260,8 @@ Queries the latest completed audit per active project, ordering by severity prio
 pnpm exec tsx scripts/fleet-issues.ts --limit 50
 pnpm exec tsx scripts/fleet-issues.ts --local --limit 50
 
-# Filter issues by exact domain, severity, and issue type
-pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --severity critical --type broken-internal-link
+# Filter issues by exact domain, severity, issue type, and source lane (--source all|edge|repository|both)
+pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --severity critical --type broken-internal-link --source all
 
 # Output formats: JSON payload or RFC 4180 CSV with formula escaping (when both --csv and --json are passed, --csv takes precedence)
 pnpm exec tsx scripts/fleet-issues.ts --domain concrete.co.id --json
@@ -258,19 +270,21 @@ pnpm exec tsx scripts/fleet-issues.ts --csv fleet-issues.csv
 
 ### Playbook 2D: Programmatic Fleet Operations via MCP
 ```typescript
-// Query fleet aggregated issues with skill routing (evaluates latest completed audit per active project)
-// Limit parameter: default 50, permitted 1–200. Total issues and breakdowns count the returned, filtered sample.
+// Query fleet aggregated issues with skill routing (evaluates latest completed audit per active project, partitioned by source)
+// Limit parameter: default 50, permitted 1–200. Filter by source lane: 'all' | 'edge' | 'repository' | 'both'.
 const issuesResult = await client.callTool({
   name: "get_fleet_issues",
-  arguments: { domain: "concrete.co.id", severity: "critical", issueType: "broken-internal-link", limit: 20 },
+  arguments: { domain: "concrete.co.id", severity: "critical", issueType: "broken-internal-link", source: "all", limit: 20 },
 });
 
-// Generate execution plan for fleet audit (emits structured argv; does not dispatch directly)
-// Repository direct mode defaults to maxPages: 2000; Edge workflow mode forwards maxPages (default 500) and concurrency (1–5, default 2)
+// Generate execution plan for fleet audit (read-only planning tool; emits structured argv and planId without dispatching)
+// Planner defaults to maxPages: 2000 for both modes (allowed range 10–10,000). Omitting domain implicitly emits --all.
+// Concurrency (1–5, default 2) is emitted only in edge_workflow argv. The emitted command targets default remote D1.
 const auditPlan = await client.callTool({
   name: "run_fleet_audit",
-  arguments: { domain: "concrete.co.id", mode: "edge_workflow", maxPages: 500, concurrency: 2 },
+  arguments: { domain: "concrete.co.id", mode: "edge_workflow", maxPages: 2000, concurrency: 2 },
 });
+console.log("Plan ID:", auditPlan.structuredContent?.planId);
 console.log("Execution argv:", auditPlan.structuredContent?.argv);
 ```
 
@@ -281,7 +295,8 @@ console.log("Execution argv:", auditPlan.structuredContent?.argv);
 pnpm exec tsx scripts/fleet-status.ts
 pnpm exec tsx scripts/fleet-status.ts --local
 
-# Check repository presence and default branch across all portfolio entries
+# Reconcile local manifest and external inventory mappings against workspace projects and completed audit IDs queried via remote D1
+# (Remote inventory coverage report; does not make live GitHub API queries)
 pnpm exec tsx scripts/check-fleet-repos.ts
 ```
 > [!NOTE]
@@ -302,9 +317,9 @@ npx wrangler d1 execute open-seo-db-selfhost --remote --command "
 ```
 
 ### Playbook 4: Self-Host Deployment Pipeline (Alchemy v2)
-Every code mutation must be deployed to live production via the canonical package script:
+Scope `deploy:selfhost` to an authorized live production release. The package script builds and deploys through Alchemy; Stage 1 code review and unit test fixtures have no reason to execute it:
 ```powershell
-# Executes preflight validation, vite build --mode selfhost, typecheck, and alchemy deploy
+# Executes preflight validation, vite build --mode selfhost, typecheck, and alchemy deploy to live production
 pnpm run deploy:selfhost
 ```
 
@@ -380,10 +395,11 @@ try {
        }
      });
      // Quote fields reside strictly in structuredContent envelope (not SDK root)
+     // Distinguishes one live run from nominal scheduled estimate, with additional separately billed live fallback possible.
      const costCredits = estResult.structuredContent?.costCredits;
      const scheduledCredits = estResult.structuredContent?.scheduledEstimate?.costCredits;
      ```
-  3. Enroll keywords with operator approval for recurring scheduled check credits:
+  3. Enroll keywords with operator approval (recurring estimate is conditional on an enabled schedule; only send scheduled ceiling when a scheduled quote exists):
      ```ts
      await client.callTool({
        name: "add_rank_tracking_keywords",
@@ -391,7 +407,7 @@ try {
          projectId: "00000000-0000-0000-0000-000000000001",
          trackerId,
          keywords: ["kaca tempered surabaya", "partisi kaca"],
-         maxEstimatedScheduledCheckCredits: scheduledCredits
+         ...(scheduledCredits ? { maxEstimatedScheduledCheckCredits: scheduledCredits } : {})
        }
      });
      ```
@@ -691,7 +707,7 @@ try {
 OpenSEO exposes 78 registered MCP tools in `src/server/mcp/server.ts`:
 
 ### Family 1: Workspace and Project Management (8 tools)
-- `whoami`: Read authenticated identity, user email, and active organization ID.
+- `whoami`: Read authenticated identity, returning `userEmail`, `scopes`, `mode`, and `creditsRemaining`.
 - `create_project`: Create a new tracked domain project with language and location configuration.
 - `list_projects`: List all active projects in the caller's organization.
 - `research_project_website`: Crawl and summarize initial project brand data from root page.

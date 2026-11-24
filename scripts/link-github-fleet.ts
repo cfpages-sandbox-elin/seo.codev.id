@@ -294,6 +294,8 @@ export async function linkFleet(options: {
         AND m.version_id = (
           SELECT id FROM fleet_roster_versions
           WHERE organization_id = '${orgId}'
+            AND approved_at IS NOT NULL
+            AND julianday(approved_at) <= julianday('now')
           ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
           LIMIT 1
         )
@@ -319,7 +321,7 @@ function verifyRosterIntegrity(
     SELECT
       COUNT(m.id) AS member_count,
       COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.project_id IS NULL THEN 1 ELSE 0 END), 0) AS unmapped,
-      COALESCE(SUM(CASE WHEN m.project_id IS NOT NULL AND (p.id IS NULL OR p.organization_id <> v.organization_id OR p.archived_at IS NOT NULL) THEN 1 ELSE 0 END), 0) AS invalid_links
+      COALESCE(SUM(CASE WHEN m.project_id IS NOT NULL AND (p.id IS NULL OR p.organization_id <> v.organization_id OR p.archived_at IS NOT NULL OR lower(trim(p.domain)) <> m.canonical_host) THEN 1 ELSE 0 END), 0) AS invalid_links
     FROM fleet_roster_versions v
     LEFT JOIN fleet_roster_members m ON m.version_id = v.id
     LEFT JOIN projects p ON p.id = m.project_id
@@ -349,6 +351,16 @@ function verifyRosterIntegrity(
 
   if (sqlStatements.length === 0) {
     if (!isDryRun) {
+      const liveVersions = runD1Query(
+        `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = '${orgId}';`,
+        isRemote,
+      );
+      const currentEffective = selectEffectiveRosterVersion(liveVersions);
+      if (currentEffective?.id !== approvedRoster.id) {
+        throw new Error(
+          `Effective roster version supersession detected on no-change path: was ${approvedRoster.id}, now ${currentEffective?.id ?? "none"}. Aborting.`
+        );
+      }
       verifyRosterIntegrity(approvedRoster.id, orgId, approvedRoster.domain_count ?? existingMembers.length, isRemote);
       console.log(`Live verification: All portfolio projects and fleet roster members in ${approvedRoster.id} are 100% mapped! Zero updates required.`);
     } else {

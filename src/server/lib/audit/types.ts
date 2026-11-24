@@ -69,6 +69,7 @@ export interface PageAnalysis {
   title: string;
   metaDescription: string;
   canonical: string | null;
+  baseHref?: string | null;
   robotsMeta: string | null;
   ogTitle: string | null;
   ogDescription: string | null;
@@ -171,6 +172,8 @@ export interface CrawledPageResult {
   imagesMissingAlt: number;
   images: Array<{ src: string | null; alt: string | null }>;
   links: PageLink[];
+  /** Whether internal links were truncated due to exceeding link cap */
+  truncatedLinks?: boolean;
   hasStructuredData: boolean;
   hreflangTags: string[];
   isIndexable: boolean;

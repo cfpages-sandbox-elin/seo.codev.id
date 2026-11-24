@@ -420,16 +420,17 @@ async function persistCrawledPages(input: {
 
   const links: ScratchpadPageLinksRow[] = [];
   const discovered = new Map<string, number | null>();
+  let hasTruncatedLinks = false;
   for (const page of pages) {
     const pageDepth = depthByUrl.get(page.url) ?? null;
     const childDepth = pageDepth === null ? null : pageDepth + 1;
 
+    const allInternal = page.links.filter((link) => link.isInternal);
+    hasTruncatedLinks ||= !!page.truncatedLinks || allInternal.length > MAX_STORED_LINKS_PER_PAGE;
+
     const targets: string[] = [];
-    for (const link of page.links) {
-      if (!link.isInternal) continue;
-      if (targets.length < MAX_STORED_LINKS_PER_PAGE) {
-        targets.push(link.targetUrl);
-      }
+    for (const link of allInternal.slice(0, MAX_STORED_LINKS_PER_PAGE)) {
+      targets.push(link.targetUrl);
       if (
         discovered.size < MAX_DISCOVERED_PER_BATCH &&
         !discovered.has(link.targetUrl) &&
@@ -438,9 +439,8 @@ async function persistCrawledPages(input: {
         discovered.set(link.targetUrl, childDepth);
       }
     }
-    if (targets.length > 0) {
-      links.push({ pageId: page.id, url: page.url, targets });
-    }
+    // Write explicit row even if targets is empty so modern crawl row supersedes legacy rows in scratchpad-sql.ts
+    links.push({ pageId: page.id, url: page.url, targets });
 
     // Redirect targets continue the same navigation path: same depth.
     if (
@@ -463,6 +463,7 @@ async function persistCrawledPages(input: {
     })),
     links,
     discovered: Array.from(discovered, ([url, depth]) => ({ url, depth })),
+    hasTruncatedLinks,
   });
 
   await AuditRepository.updateAuditProgress(auditId, input.workflowInstanceId, {

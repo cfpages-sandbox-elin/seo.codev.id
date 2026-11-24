@@ -127,7 +127,7 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
 
   console.log(`Lane 1 Complete:`);
   console.log(`  - Files fetched: ${lane1Results.size}/${htmlBlobs.length}`);
-  console.log(`  - Wire bytes transferred: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB`);
+  console.log(`  - Response body bytes transferred: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`  - Elapsed time: ${lane1DurationMs} ms (${(lane1DurationMs / 1000).toFixed(2)}s)`);
   console.log(`  - RSS end-minus-start: ${lane1MemMb} MB`);
 
@@ -173,7 +173,10 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
   const expandedArchiveBytes = decompressed.length;
   const tDecompress_lane2 = performance.now();
 
-  const lane2Results = parseTarHtmlFiles(decompressed);
+  const rawArchiveMap = parseTarHtmlFiles(decompressed);
+
+  // Sol F12: Filter extracted archive candidates strictly by publishRoot before comparing maps so external HTML files do not fail parity.
+  const lane2Results = new Map<string, Buffer>();
 
   // Cryptographically verify every file in Lane 2 using shared acquireVerifiedBlob with raw fallback (Sol F09)
   let archiveHits = 0;
@@ -185,7 +188,7 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
       file,
       repoName,
       commitSha,
-      lane2Results,
+      rawArchiveMap,
       GITHUB_TOKEN,
     );
     if (fromArchive) {
@@ -208,11 +211,11 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
 
   console.log(`Lane 2 Complete:`);
   console.log(`  - Files extracted: ${lane2Results.size}/${htmlBlobs.length} (Archive hits: ${archiveHits}, Fallback: ${fallbackFiles})`);
-  console.log(`  - Compressed wire bytes: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB`);
+  console.log(`  - Compressed response body bytes: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB`);
   if (fallbackBytes > 0) {
-    console.log(`  - Fallback wire bytes: ${(fallbackBytes / (1024 * 1024)).toFixed(2)} MB`);
+    console.log(`  - Fallback response body bytes: ${(fallbackBytes / (1024 * 1024)).toFixed(2)} MB (${fallbackFiles} requests)`);
   }
-  console.log(`  - Total transferred response bytes: ${(totalTransferredWireBytes / (1024 * 1024)).toFixed(2)} MB`);
+  console.log(`  - Total transferred response body bytes: ${(totalTransferredWireBytes / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`  - Expanded tarball payload: ${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB`);
   console.log(`  - Download & gzip decompression time: ${decompressDurationMs} ms`);
   console.log(`  - Tar parse, verification & fallback time: ${parseDurationMs} ms`);
@@ -245,14 +248,20 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
   }
 
   console.log(`\nWorkload Tradeoff Assessment:`);
-  console.log(`  - Selective Blob Lane: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB wire payload, ${lane1DurationMs} ms`);
-  console.log(`  - Archive Tarball Lane: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB wire payload (${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB expanded), ${lane2DurationMs} ms`);
+  console.log(`  - Selective Blob Lane: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB response body payload, ${lane1DurationMs} ms`);
+  console.log(`  - Archive Tarball Lane: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB compressed response payload + ${(fallbackBytes / (1024 * 1024)).toFixed(2)} MB fallback (${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB expanded), ${lane2DurationMs} ms (${fallbackFiles} fallback requests)`);
   return {
     lane1DurationMs,
     lane2DurationMs,
+    lane1ResponseBodyBytes: lane1TotalBytes,
     lane1TotalBytes,
+    compressedResponseBodyBytes: compressedWireBytes,
     compressedWireBytes,
     expandedArchiveBytes,
+    fallbackResponseBodyBytes: fallbackBytes,
+    fallbackRequestCount: fallbackFiles,
+    archiveHits,
+    totalTransferredResponseBodyBytes: totalTransferredWireBytes,
     fileCount: htmlBlobs.length,
     parity: true,
   };

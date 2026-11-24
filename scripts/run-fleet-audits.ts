@@ -167,11 +167,13 @@ async function main() {
   console.log(`Max Pages Per Site: ${maxPages} (Full Depth Crawl)`);
   if (targetDomainFilter) console.log(`Target Domain Filter: ${targetDomainFilter}`);
 
-  // Query enrolled projects in shared-workspace with normalized UTC epoch (Sol F4)
+  // Query enrolled projects in shared-workspace with normalized UTC epoch of completed edge crawls (Sol F05)
   const sql = `
-    SELECT p.id, p.name, p.domain, MAX(unixepoch(a.started_at)) AS last_audited_epoch
+    SELECT p.id, p.name, p.domain, MAX(unixepoch(a.completed_at)) AS last_audited_epoch
     FROM projects p
     LEFT JOIN audits a ON p.id = a.project_id
+      AND a.status = 'completed'
+      AND (a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL)
     WHERE p.organization_id = 'shared-workspace'
       AND p.domain IS NOT NULL
       AND p.archived_at IS NULL
@@ -289,8 +291,16 @@ async function main() {
     if (overdue.length === 0) {
       while (activeAudits.size < concurrency && queueIndex < candidates.length) {
         const project = candidates[queueIndex++];
+        const cleanHost = project.domain.trim().toLowerCase();
+        if (!isValidCanonicalHostname(cleanHost)) {
+          console.error(
+            `[ERROR] Stored domain '${project.domain}' for project ${project.id} is invalid. Skipping dispatch.`,
+          );
+          failedCount++;
+          continue;
+        }
         const auditId = crypto.randomUUID();
-        const startUrl = `https://${project.domain}`;
+        const startUrl = `https://${cleanHost}`;
 
         const config = {
           maxPages,

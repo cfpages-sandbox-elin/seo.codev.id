@@ -125,6 +125,7 @@ export interface FleetIssueRow {
   projectId: string;
   domain: string;
   auditId: string;
+  source: string;
   issueId: string;
   issueType: string;
   severity: string;
@@ -141,11 +142,13 @@ export async function getAggregatedFleetIssues(options: {
   domain?: string;
   severity?: string;
   issueType?: string;
+  source?: "all" | "edge" | "repository" | "both" | string;
   limit?: number;
 }): Promise<FleetIssueRow[]> {
   const isRemote = options.remote ?? true;
   const rawLimit = options.limit ?? 200;
   const limit = Math.max(1, Math.min(1000, Number.isFinite(rawLimit) ? rawLimit : 200));
+  const sourceMode = (options.source || "all").toLowerCase().trim();
 
   const whereClauses: string[] = [
     "p.organization_id = 'shared-workspace'",
@@ -162,12 +165,25 @@ export async function getAggregatedFleetIssues(options: {
     whereClauses.push(`i.issue_type = '${options.issueType.trim().replace(/'/g, "''")}'`);
   }
 
-  // Sol F10: Query latest completed audit per active project, ordering by fractional julianday(completed_at)
+  // Sol F09: Partition by lane or filter by source lane before ranking
+  const sourceFilterCondition =
+    sourceMode === "edge"
+      ? "AND (a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL)"
+      : sourceMode === "repository"
+        ? "AND a.workflow_instance_id LIKE 'github-audit-%'"
+        : "";
+
+  const partitionClause =
+    sourceMode === "edge" || sourceMode === "repository"
+      ? "a.project_id"
+      : "a.project_id, CASE WHEN a.workflow_instance_id LIKE 'github-audit-%' THEN 'repository' ELSE 'edge' END";
+
   const query = `
     WITH ranked_audits AS (
       SELECT a.id, a.project_id,
+             CASE WHEN a.workflow_instance_id LIKE 'github-audit-%' THEN 'repository' ELSE 'edge' END AS source,
              ROW_NUMBER() OVER (
-               PARTITION BY a.project_id
+               PARTITION BY ${partitionClause}
                ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
              ) AS audit_rank
       FROM audits a
@@ -175,11 +191,13 @@ export async function getAggregatedFleetIssues(options: {
       WHERE a.status = 'completed'
         AND p.organization_id = 'shared-workspace'
         AND p.archived_at IS NULL
+        ${sourceFilterCondition}
     )
     SELECT 
       p.id AS project_id,
       p.domain AS domain,
       ra.id AS audit_id,
+      ra.source AS source,
       i.id AS issue_id,
       i.issue_type AS issue_type,
       i.severity AS severity,
@@ -224,6 +242,7 @@ export async function getAggregatedFleetIssues(options: {
       projectId: r.project_id,
       domain: r.domain,
       auditId: r.audit_id,
+      source: r.source || "edge",
       issueId: r.issue_id,
       issueType: r.issue_type,
       severity: r.severity,
@@ -265,6 +284,7 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
       domain: { type: "string" },
       severity: { type: "string" },
       type: { type: "string" },
+      source: { type: "string", default: "all" },
       limit: { type: "string", default: "200" },
       json: { type: "boolean", default: false },
     },
@@ -289,6 +309,16 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
     }
   }
 
+  let sourceFilter = "all";
+  if (values.source) {
+    const s = String(values.source).toLowerCase().trim();
+    if (!["all", "edge", "repository", "both"].includes(s)) {
+      console.error(`[ERROR] Invalid --source value: '${values.source}'. Must be one of: all, edge, repository, both.`);
+      process.exit(1);
+    }
+    sourceFilter = s;
+  }
+
   let limit = 200;
   if (values.limit) {
     if (!/^[1-9][0-9]*$/.test(String(values.limit))) {
@@ -303,6 +333,7 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
     domain: values.domain as string | undefined,
     severity: values.severity as string | undefined,
     issueType: values.type as string | undefined,
+    source: sourceFilter,
     limit,
   })
     .then((issues) => {
@@ -310,6 +341,7 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
       if (csvTargetFile) {
         const fields = [
           "domain",
+          "source",
           "severity",
           "issueType",
           "pageUrl",
@@ -326,6 +358,7 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
             fields,
             data: issues.map((i) => ({
               domain: i.domain,
+              source: i.source,
               severity: i.severity,
               issueType: i.issueType,
               pageUrl: i.pageUrl,
@@ -353,20 +386,22 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
 
       // 3. Human console overview
       console.log(`\n=== OpenSEO Fleet-Wide Aggregated Issues (FLEET-ISSUE-01) ===`);
-      console.log(`Total sample issues retrieved: ${issues.length} (limit: ${limit})`);
+      console.log(`Total sample issues retrieved: ${issues.length} (limit: ${limit}, source: ${sourceFilter})`);
 
       if (issues.length === 0) {
         console.log("No issues found matching the specified criteria.");
         return;
       }
 
-      // Rollup by severity
+      // Rollup by severity and source
       const bySeverity = { critical: 0, warning: 0, info: 0 };
+      const bySource: Record<string, number> = {};
       const byType: Record<string, number> = {};
       const bySkill: Record<string, number> = {};
 
       for (const i of issues) {
         if (i.severity in bySeverity) bySeverity[i.severity as keyof typeof bySeverity]++;
+        bySource[i.source] = (bySource[i.source] || 0) + 1;
         byType[i.issueType] = (byType[i.issueType] || 0) + 1;
         bySkill[i.skillRoute] = (bySkill[i.skillRoute] || 0) + 1;
       }
@@ -375,6 +410,11 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
       console.log(`  - Critical: ${bySeverity.critical}`);
       console.log(`  - Warning:  ${bySeverity.warning}`);
       console.log(`  - Info:     ${bySeverity.info}`);
+
+      console.log(`\nSource Lane Provenance:`);
+      Object.entries(bySource).forEach(([src, count]) => {
+        console.log(`  - ${src}: ${count}`);
+      });
 
       console.log(`\nTop Issue Types:`);
       Object.entries(byType)
@@ -389,7 +429,7 @@ if (process.argv[1] && process.argv[1].includes("fleet-issues")) {
 
       console.log(`\nSample Issues (first 5):`);
       issues.slice(0, 5).forEach((i) => {
-        console.log(`  [${i.severity.toUpperCase()}] ${i.domain} - ${i.issueType} on ${i.pageUrl}`);
+        console.log(`  [${i.severity.toUpperCase()}] [${i.source.toUpperCase()}] ${i.domain} - ${i.issueType} on ${i.pageUrl}`);
         if (i.targetUrl) console.log(`     Target: ${i.targetUrl}`);
         console.log(`     Routing: /${i.skillRoute} -> ${i.recommendedAction}`);
       });

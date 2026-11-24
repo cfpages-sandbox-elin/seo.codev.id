@@ -15,6 +15,8 @@ vi.mock("@/db", () => {
     limit: () => [
       {
         id: "issue_1",
+        auditId: "audit_1",
+        workflowInstanceId: null,
         issueType: "broken_link",
         severity: "critical",
         detailsJson: JSON.stringify({ targetUrl: "/missing-style.css" }),
@@ -23,6 +25,8 @@ vi.mock("@/db", () => {
       },
       {
         id: "issue_2",
+        auditId: "audit_2",
+        workflowInstanceId: "github-audit-123",
         issueType: "missing_meta_description",
         severity: "warning",
         detailsJson: null,
@@ -56,7 +60,11 @@ describe("Fleet MCP Tools", () => {
       expect(data.severityBreakdown.warning).toBe(1);
       expect(data.issues).toHaveLength(2);
       expect(data.issues[0].skillRoute).toBe("static-site-css-repair");
+      expect(data.issues[0].source).toBe("edge");
+      expect(data.issues[0].auditId).toBe("audit_1");
       expect(data.issues[1].skillRoute).toBe("unslop-seo");
+      expect(data.issues[1].source).toBe("repository");
+      expect(data.issues[1].auditId).toBe("audit_2");
     });
 
     it("validates canonical domain input in get_fleet_issues schema (Sol P2-08)", () => {
@@ -95,7 +103,9 @@ describe("Fleet MCP Tools", () => {
       );
 
       const data = runFleetAuditTool.config.outputSchema.parse(result.structuredContent);
-      expect(data.status).toBe("configured");
+      expect(data.status).toBe("planned");
+      expect(data.planId).toBeDefined();
+      expect(data.planId).toMatch(/^plan_/);
       expect(data.mode).toBe("repository_direct");
       expect(data.executable).toBe("pnpm");
       expect(data.argv).toEqual([
@@ -117,7 +127,8 @@ describe("Fleet MCP Tools", () => {
       );
 
       const data = runFleetAuditTool.config.outputSchema.parse(result.structuredContent);
-      expect(data.status).toBe("configured");
+      expect(data.status).toBe("planned");
+      expect(data.planId).toBeDefined();
       expect(data.mode).toBe("edge_workflow");
       expect(data.executionCommand).toContain("run-fleet-audits.ts");
       expect(data.executionCommand).toContain("--all");
