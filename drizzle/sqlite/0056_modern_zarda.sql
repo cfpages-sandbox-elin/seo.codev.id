@@ -154,6 +154,7 @@ CREATE TABLE `fleet_runs` (
 );
 --> statement-breakpoint
 CREATE INDEX `fleet_runs_org_started_idx` ON `fleet_runs` (`organization_id`,`started_at`);--> statement-breakpoint
+CREATE INDEX `fleet_runs_org_roster_idx` ON `fleet_runs` (`organization_id`,`roster_version_id`);--> statement-breakpoint
 CREATE TABLE `fleet_snapshots` (
 	`id` text PRIMARY KEY NOT NULL,
 	`run_item_id` text NOT NULL,

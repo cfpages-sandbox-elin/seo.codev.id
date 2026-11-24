@@ -38,7 +38,7 @@ flowchart LR
 - Serves the native MCP endpoint at `https://seo.codev.id/mcp` with **78 registered tools** across 8 capability families.
 - Authenticated at the edge:
   - **Self-Hosted Production (`AUTH_MODE=cloudflare_access`)**: Protected by Cloudflare Zero Trust Access Google SSO (Tier 1 Owner-Only). Browser users sign in via Google OAuth. Headless MCP clients authenticate by passing an authenticated session token via cookie (`Cookie: CF_Authorization=<token>`). Cloudflare Access edge verifies this session and passes the signed JWT assertion (`Cf-Access-Jwt-Assertion` containing valid nonempty `sub` and `email` identity claims) to the origin Worker. The repository origin verifier requires these explicit `sub` and `email` claims; Service Token authentication workflows require a dedicated Service Auth policy and separately configured/verified Stage 2 identity admission.
-  - **Local Development / Test Runner (`AUTH_MODE=local_noauth`)**: Trusted local no-auth environment on `localhost:3000` or in-memory mocks.
+  - **Local Development / Test Runner (`AUTH_MODE=local_noauth`)**: Trusted local no-auth environment on `localhost:3001` (Vite dev server default) or in-memory mocks. Local Wrangler workflow dispatch defaults to port `8787`.
   - **Hosted Production Mode**: Authenticated via personal API keys (`oseo_...` via `Authorization: Bearer <key>` or `x-api-key`) or OAuth bearer tokens.
 - App worker exclusively binds `OAUTH_KV` (`open-seo-oauth-kv-selfhost`) for MCP client registrations and OAuth refresh tokens.
 
@@ -118,7 +118,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/index.htm` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set using unified route indexing and domain host equivalence (supporting HTTP/HTTPS and apex/www pairs on default ports 80/443) to detect broken links and orphan pages with zero network calls.
 - **Staged D1 Persistence**:
   1. Inserts parent audit in `running` phase with `github-audit-${auditId}` instance ID via atomic conditional insert that prevents concurrent double-reservation and auto-reclaims stale orphaned runs (> 2h old).
-  2. Ingests pages and issues in bounded $\le 10$-statement chunks ($\le 15,000$ bytes total per batch envelope, strictly respecting Windows CreateProcessW 32,767 character limits). Binds string fields to safe byte limits (title 500, metaDescription 1000, canonicalUrl 2000, robotsMeta 200, OG fields 500-2000, detailsJson 4000).
+  2. Ingests pages and issues in bounded $\le 10$-statement chunks ($\le 15,000$ UTF-8 bytes total per batch envelope, strictly respecting Windows CreateProcessW 32,767 character limits). Binds string fields to safe character limits (title 500, metaDescription 1000, canonicalUrl 2000, robotsMeta 200, OG fields 500-2000) and detailsJson to bounded UTF-8 bytes (max 3500) preserving valid structured JSON.
   3. Guards child writes so that `audit_pages` and `audit_issues` only insert when the parent audit is `status = 'running'`, and validates that issue `page_id` references belong to the same attempt.
   4. Verifies child row count integrity and asserts zero orphaned page references before the final atomic compare-and-set UPDATE with `RETURNING id`.
   5. On count mismatch, invalid child references, or state conflict, throws immediately. Incomplete source acquisition ends with audit status `failed` and an isolated diagnostic item which can be `partial` (they are distinct).
@@ -145,7 +145,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
   ```
 - Fleet linking (`link-github-fleet.ts`) defaults to local D1 (`DB`); pass `--remote` for remote production D1 (`open-seo-db-selfhost`), scoped via `--org-id` (default `shared-workspace`). It requires an existing effective approved roster in D1 (`approved_at IS NOT NULL AND julianday(approved_at) <= julianday('now')`). Always preview mutations with `--dry-run` before applying live. (Note: legacy `generate-fleet-linking-sql.ts` is retired).
 
-For fresh **local development** (`localhost:3000` / `wrangler dev`):
+For fresh **local development** (`localhost:3001` / `wrangler dev` on `8787`):
 ```powershell
 # 1. Apply local migrations to local D1 (DB)
 pnpm exec wrangler d1 migrations apply DB --local
@@ -190,14 +190,17 @@ Direct audit accepts exactly one execution scope (`--domain <canonical-host>`, `
 - D1 target defaults to `--remote` (`open-seo-db-selfhost`); pass `--local` for local D1 (`DB`).
 ```powershell
 # Audit a single property by exact domain directly from its GitHub repository (Selective Blob Lane)
-pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --force
+pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id
 
 # Streamed tarball archive mode for repositories without heavy binary assets
 # (Enforces 100 MiB compressed, 250 MiB expanded, and 10 MiB per-entry caps with verified raw fallback)
-pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --archive --force
+pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --archive
 
 # Local D1 execution pass
-pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --local --force
+pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --local
+
+# Force re-audit bypassing source reuse on identical commit
+pnpm exec tsx scripts/run-github-fleet-audit.ts --domain concrete.co.id --force
 
 # Benchmark Selective Blob vs. Tarball Archive lane performance with verified blob acquisition
 # (Covers archive acquisition, candidate extraction under publish root, and raw fallback recovery)

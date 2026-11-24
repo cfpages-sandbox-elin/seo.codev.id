@@ -7,21 +7,7 @@ import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { formatMcpTable, type McpTableColumn } from "@/server/mcp/table";
-import { FLEET_MANIFEST_MEMBERS } from "@/server/features/fleet/data/fleetManifest";
 import { routeIssueToSkill } from "@/server/lib/audit/issue-routing";
-
-interface EnrichedFleetIssue {
-  id: string;
-  domain: string;
-  auditId: string;
-  source: string;
-  issueType: string;
-  severity: string;
-  pageUrl: string;
-  targetUrl: string | null;
-  skillRoute: string;
-  recommendedAction: string;
-}
 
 const CANONICAL_DOMAIN_REGEX =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
@@ -31,6 +17,21 @@ function isValidCanonicalHostname(domain: string): boolean {
     return false;
   return CANONICAL_DOMAIN_REGEX.test(domain);
 }
+
+const fleetIssueItemShape = {
+  id: z.string(),
+  domain: z.string(),
+  auditId: z.string(),
+  source: z.string(),
+  issueType: z.string(),
+  severity: z.string(),
+  pageUrl: z.string(),
+  targetUrl: z.string().nullable(),
+  skillRoute: z.string(),
+  recommendedAction: z.string(),
+};
+
+type EnrichedFleetIssue = z.infer<z.ZodObject<typeof fleetIssueItemShape>>;
 
 const getFleetIssuesInputSchema = {
   domain: z
@@ -86,26 +87,15 @@ export const getFleetIssuesTool = {
     outputSchema: z
       .object({
         totalIssues: z.number(),
-        severityBreakdown: z.object({
-          critical: z.number(),
-          warning: z.number(),
-          info: z.number(),
-        }),
+        severityBreakdown: z
+          .object({
+            critical: z.number(),
+            warning: z.number(),
+            info: z.number(),
+          })
+          .passthrough(),
         skillRoutingBreakdown: z.record(z.string(), z.number()),
-        issues: z.array(
-          z.object({
-            id: z.string(),
-            domain: z.string(),
-            auditId: z.string(),
-            source: z.string(),
-            issueType: z.string(),
-            severity: z.string(),
-            pageUrl: z.string(),
-            targetUrl: z.string().nullable(),
-            skillRoute: z.string(),
-            recommendedAction: z.string(),
-          }),
-        ),
+        issues: z.array(z.object(fleetIssueItemShape).passthrough()),
         ...optionalMetaOutputSchema,
       })
       .passthrough(),
@@ -234,12 +224,12 @@ export const getFleetIssuesTool = {
     });
 
     const columns: McpTableColumn<EnrichedFleetIssue>[] = [
-      { header: "Domain", value: (row) => row.domain },
-      { header: "Source", value: (row) => row.source },
-      { header: "Severity", value: (row) => row.severity },
-      { header: "Issue Type", value: (row) => row.issueType },
-      { header: "Page URL", value: (row) => row.pageUrl },
-      { header: "Skill Route", value: (row) => row.skillRoute },
+      { header: "Domain", value: (r) => r.domain },
+      { header: "Source", value: (r) => r.source },
+      { header: "Severity", value: (r) => r.severity },
+      { header: "Issue Type", value: (r) => r.issueType },
+      { header: "Page URL", value: (r) => r.pageUrl },
+      { header: "Skill Route", value: (r) => r.skillRoute },
     ];
 
     const textTable = formatMcpTable(enrichedIssues, columns);
@@ -257,171 +247,4 @@ export const getFleetIssuesTool = {
   },
 };
 
-const runFleetAuditInputSchema = {
-  domain: z
-    .string()
-    .trim()
-    .max(253, "Must be at most 253 characters")
-    .regex(
-      CANONICAL_DOMAIN_REGEX,
-      "Must be a valid canonical hostname (e.g. 'toiletcubicle.co.id')",
-    )
-    .optional()
-    .describe("Optional target domain to audit."),
-  all: z
-    .boolean()
-    .optional()
-    .describe("Explicitly plan audits for all enrolled fleet properties."),
-  limit: z
-    .number()
-    .int()
-    .min(1)
-    .max(100)
-    .optional()
-    .describe("Optional limit for number of properties to plan."),
-  mode: z
-    .enum(["edge_workflow", "repository_direct"])
-    .optional()
-    .describe("Execution mode: 'repository_direct' or 'edge_workflow'."),
-  maxPages: z
-    .number()
-    .int()
-    .min(10)
-    .max(10000)
-    .optional()
-    .describe("Maximum pages to crawl or inspect (default 2000)."),
-  concurrency: z
-    .number()
-    .int()
-    .min(1)
-    .max(5)
-    .optional()
-    .describe("Paced concurrency for workflow crawler batches (default 2)."),
-} as const;
-
-type RunFleetAuditArgs = z.infer<z.ZodObject<typeof runFleetAuditInputSchema>>;
-
-export const runFleetAuditTool = {
-  name: "run_fleet_audit",
-  config: {
-    title: "Run fleet audit",
-    description:
-      "Plan and configure fleet-wide site audits across enrolled properties in OpenSEO. Read-only planning tool: outputs executable CLI argv and command without launching background processes.",
-    inputSchema: runFleetAuditInputSchema,
-    outputSchema: z
-      .object({
-        status: z.string(),
-        planId: z.string(),
-        organizationId: z.string(),
-        mode: z.string(),
-        targetDomain: z.string().nullable().optional(),
-        message: z.string(),
-        executable: z.string(),
-        argv: z.array(z.string()),
-        executionCommand: z.string(),
-        ...optionalMetaOutputSchema,
-      })
-      .passthrough(),
-    annotations: { readOnlyHint: true, openWorldHint: false },
-  },
-  handler: async (args: RunFleetAuditArgs, context: ToolContext) => {
-    const orgId = context.auth?.organizationId;
-    if (!orgId || orgId !== "shared-workspace") {
-      throw new Error(
-        `Fleet runners are currently constrained to the 'shared-workspace' organization; caller organization '${orgId ?? "unauthenticated"}' is not supported.`,
-      );
-    }
-
-    const domain = args.domain?.toLowerCase().trim();
-    if (!domain && !args.all && !args.limit) {
-      throw new Error(
-        "An explicit scope is required: provide a target domain, specify --limit, or pass all=true.",
-      );
-    }
-
-    const mode = args.mode ?? "repository_direct";
-    const maxPages = args.maxPages || 2000;
-    const concurrency = args.concurrency || 2;
-
-    if (domain) {
-      const proj = await db
-        .select({ id: projects.id })
-        .from(projects)
-        .where(
-          and(
-            eq(projects.organizationId, orgId),
-            eq(projects.domain, domain),
-            isNull(projects.archivedAt),
-          ),
-        )
-        .limit(1);
-      if (proj.length === 0)
-        throw new Error(
-          `Domain '${domain}' is not enrolled in organization '${orgId}'.`,
-        );
-
-      if (mode === "repository_direct") {
-        const manifestMember = FLEET_MANIFEST_MEMBERS.find(
-          (m) => m.canonicalHost.toLowerCase() === domain,
-        );
-        if (!manifestMember?.repoName)
-          throw new Error(
-            `Domain '${domain}' does not have an approved repository mapping for repository_direct mode. Use edge_workflow mode or link a repository in the fleet manifest.`,
-          );
-      }
-    }
-
-    const planId = "plan_" + crypto.randomUUID();
-    const scopeArgs: string[] = [];
-    if (domain) {
-      scopeArgs.push("--domain", domain);
-    } else if (args.limit) {
-      scopeArgs.push("--limit", String(args.limit));
-    } else if (args.all) {
-      scopeArgs.push("--all");
-    }
-
-    let argv: string[] = [];
-    if (mode === "repository_direct") {
-      argv = [
-        "exec",
-        "tsx",
-        "scripts/run-github-fleet-audit.ts",
-        ...scopeArgs,
-        "--max-pages",
-        String(maxPages),
-      ];
-    } else {
-      argv = [
-        "exec",
-        "tsx",
-        "scripts/run-fleet-audits.ts",
-        ...scopeArgs,
-        "--max-pages",
-        String(maxPages),
-        "--concurrency",
-        String(concurrency),
-      ];
-    }
-
-    const executionCommand = `pnpm ${argv.join(" ")}`;
-    const message = domain
-      ? `Fleet audit plan configured for ${domain} in ${mode} mode.`
-      : `Fleet audit plan configured across enrolled properties in ${mode} mode.`;
-
-    return mcpResponse({
-      structuredContent: {
-        status: "planned",
-        planId,
-        organizationId: orgId,
-        mode,
-        targetDomain: domain ?? null,
-        message,
-        executable: "pnpm",
-        argv,
-        executionCommand,
-      },
-      text: `${message}\nRead-only Execution Plan: \`${executionCommand}\`\nNote: To execute, run this command in a terminal or workflow.`,
-    });
-  },
-};
+export { runFleetAuditTool } from "./run-fleet-audit";

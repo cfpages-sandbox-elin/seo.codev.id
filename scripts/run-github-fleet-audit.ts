@@ -211,6 +211,32 @@ const normalizeRoute = (urlOrPath: string): string => {
   return `${host}${path}`;
 };
 
+function boundIssueDetails(details: any, maxBytes = 3500): string | null {
+  if (!details || typeof details !== "object") return null;
+  const candidate = JSON.stringify(details);
+  if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
+    return candidate;
+  }
+  const targetUrl =
+    typeof details.targetUrl === "string"
+      ? details.targetUrl.slice(0, 1000)
+      : undefined;
+  const message =
+    typeof details.message === "string"
+      ? details.message.slice(0, 500)
+      : undefined;
+  const fallback = JSON.stringify({
+    ...details,
+    targetUrl,
+    message,
+    _truncated: true,
+  });
+  if (Buffer.byteLength(fallback, "utf8") <= maxBytes) {
+    return fallback;
+  }
+  return JSON.stringify({ targetUrl, _truncated: true });
+}
+
 async function auditRepository(
   mapping: RepoMapping,
   maxPages = 10000,
@@ -242,6 +268,19 @@ async function auditRepository(
     console.log(
       `Pinned commit: ${commitSha.slice(0, 10)} (branch: ${defaultBranch})`,
     );
+
+    if (!isForce) {
+      const existingSameCommit = runD1Query(
+        `SELECT id FROM audits WHERE project_id = '${projectId}' AND status = 'completed' AND workflow_instance_id LIKE 'github-audit-%' AND config LIKE '%"${commitSha}"%' AND pages_total > 0 AND pages_crawled >= pages_total LIMIT 1;`,
+        isRemote,
+      );
+      if (existingSameCommit.length > 0) {
+        console.log(
+          `[REUSED] Project ${domain} already has a completed audit for commit ${commitSha.slice(0, 10)}. Use --force to re-audit.`,
+        );
+        return true;
+      }
+    }
   } catch (err: any) {
     console.error(
       `Failed to fetch git tree for ${repoName}:`,
@@ -425,18 +464,18 @@ async function auditRepository(
     aliasToCanonicalUrl.set(normalizeRoute(`/${encoded}`), pageUrl);
   }
 
-  // Handle force restart or stale recovery (> 2 hours old without completion)
+  // Handle force restart or stale recovery (> 2 hours old without completion) strictly for repository-lane audits
   if (isForce) {
     executeD1SqlStatements(
       [
-        `UPDATE audits SET status = 'failed', error_code = 'force_restarted', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running';`,
+        `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'force_restarted', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%';`,
       ],
       isRemote,
     );
   } else {
     executeD1SqlStatements(
       [
-        `UPDATE audits SET status = 'failed', error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running' AND (julianday('now') - julianday(started_at)) * 24 >= 2;`,
+        `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = '${projectId}' AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2;`,
       ],
       isRemote,
     );
@@ -458,7 +497,7 @@ async function auditRepository(
     treeTruncated: isTreeTruncated,
   }).replace(/'/g, "''");
 
-  // Reserve audit attempt in D1 conditionally — fails atomically if an active running audit already exists
+  // Reserve audit attempt in D1 conditionally — fails atomically if an active running repository audit already exists
   executeD1SqlStatements(
     [
       `INSERT INTO audits (
@@ -473,6 +512,7 @@ async function auditRepository(
     WHERE NOT EXISTS (
       SELECT 1 FROM audits
       WHERE project_id = '${projectId}' AND status = 'running'
+        AND workflow_instance_id LIKE 'github-audit-%'
     );`,
     ],
     isRemote,
@@ -800,18 +840,17 @@ async function auditRepository(
         issue.dedupeKey ?? "",
       );
       const severity = getIssueDescriptor(issue.issueType)?.severity || "info";
-      const rawDetails = issue.details
-        ? JSON.stringify(issue.details).replace(/'/g, "''")
+      const boundedDetails = boundIssueDetails(issue.details, 3500);
+      const detailsSql = boundedDetails
+        ? `'${boundedDetails.replace(/'/g, "''")}'`
         : "NULL";
-      const detailsJson =
-        rawDetails === "NULL" ? "NULL" : boundText(rawDetails, 4000);
       issueSqlLines.push(`
         INSERT INTO audit_issues (
           id, audit_id, issue_type, severity, page_id, page_url, details_json
         )
         SELECT
           '${issueId}', '${auditId}', '${issue.issueType}', '${severity}', ${issue.pageId ? `'${issue.pageId}'` : "NULL"},
-          '${issue.pageUrl.replace(/'/g, "''")}', ${detailsJson === "NULL" ? "NULL" : `'${detailsJson}'`}
+          '${issue.pageUrl.replace(/'/g, "''")}', ${detailsSql}
         WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${auditId}' AND status = 'running')
           AND (${issue.pageId ? `EXISTS (SELECT 1 FROM audit_pages WHERE id = '${issue.pageId}' AND audit_id = '${auditId}')` : "1=1"})
         ON CONFLICT(id) DO NOTHING;
@@ -854,6 +893,14 @@ async function auditRepository(
          AND status = 'running'
          AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = '${auditId}') = ${crawledPages.length}
          AND (SELECT COUNT(*) FROM audit_issues WHERE audit_id = '${auditId}') = ${detectedIssues.length}
+         AND NOT EXISTS (
+           SELECT 1 FROM audit_issues i
+           WHERE i.audit_id = '${auditId}' AND i.page_id IS NOT NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM audit_pages p
+               WHERE p.id = i.page_id AND p.audit_id = '${auditId}'
+             )
+         )
        RETURNING id;`;
     const casResult = runD1Query(casSql, isRemote);
     if (!casResult || casResult.length !== 1 || casResult[0].id !== auditId) {
@@ -1405,10 +1452,10 @@ async function main() {
     }
   }
 
-  // Load deterministic latest completed source audits with verified diagnostic triple (Sol F02, F07, F10)
+  // Load deterministic latest completed source audits with verified diagnostic triple (Sol F02, F07, F10, A2)
   const completedAudits = runD1Query(
     `WITH ranked_audits AS (
-       SELECT a.id, a.project_id, a.completed_at,
+       SELECT a.id, a.project_id, a.completed_at, a.config, a.pages_total, a.pages_crawled,
               ROW_NUMBER() OVER (
                 PARTITION BY a.project_id
                 ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
@@ -1416,9 +1463,10 @@ async function main() {
        FROM audits a
        WHERE a.status = 'completed'
          AND a.workflow_instance_id LIKE 'github-audit-%'
+         AND a.pages_total > 0
          AND a.pages_crawled >= a.pages_total
      )
-     SELECT ra.id, ra.project_id,
+     SELECT ra.id, ra.project_id, ra.config, ra.pages_total, ra.pages_crawled,
             (
               SELECT COUNT(*)
               FROM fleet_runs r
@@ -1444,11 +1492,28 @@ async function main() {
   );
   const auditByProjectId = new Map<
     string,
-    { id: string; hasDiagnostic: boolean }
+    {
+      id: string;
+      repoName: string | null;
+      commitSha: string | null;
+      publishRoot: string | null;
+      pagesTotal: number;
+      pagesCrawled: number;
+      hasDiagnostic: boolean;
+    }
   >();
   for (const a of completedAudits) {
+    let cfg: any = null;
+    try {
+      cfg = a.config ? JSON.parse(a.config) : null;
+    } catch {}
     auditByProjectId.set(a.project_id, {
       id: a.id,
+      repoName: cfg?.repoName ?? null,
+      commitSha: cfg?.commitSha ?? null,
+      publishRoot: cfg?.publishRoot ?? null,
+      pagesTotal: Number(a.pages_total ?? 0),
+      pagesCrawled: Number(a.pages_crawled ?? 0),
       hasDiagnostic: Number(a.has_verified_triple ?? 0) === 1,
     });
   }
@@ -1481,7 +1546,14 @@ async function main() {
       process.exit(1);
     }
     const existingAudit = auditByProjectId.get(projId);
-    if (!force && existingAudit) {
+    const isMatchingSource =
+      existingAudit !== undefined &&
+      existingAudit.pagesTotal > 0 &&
+      existingAudit.pagesCrawled >= existingAudit.pagesTotal &&
+      existingAudit.repoName === repoMeta.repoName &&
+      (existingAudit.publishRoot ?? ".") === (repoMeta.publishRoot ?? ".");
+
+    if (!force && isMatchingSource) {
       const isRosterMember = approvedHosts.has(targetDomain);
       if (isRosterMember && !existingAudit.hasDiagnostic) {
         plannedActions.push({
@@ -1492,7 +1564,7 @@ async function main() {
         });
       } else {
         console.log(
-          `[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit. Use --force to re-audit.`,
+          `[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit matching ${repoMeta.repoName}. Use --force to re-audit.`,
         );
         return;
       }
@@ -1512,7 +1584,14 @@ async function main() {
           : projectIdByDomain.get(dom);
       if (projId && isEligible) {
         const existingAudit = auditByProjectId.get(projId);
-        if (!force && existingAudit) {
+        const isMatchingSource =
+          existingAudit !== undefined &&
+          existingAudit.pagesTotal > 0 &&
+          existingAudit.pagesCrawled >= existingAudit.pagesTotal &&
+          existingAudit.repoName === m.repoName &&
+          (existingAudit.publishRoot ?? ".") === (m.publishRoot ?? ".");
+
+        if (!force && isMatchingSource) {
           const isRosterMember = approvedHosts.has(dom);
           if (isRosterMember && !existingAudit.hasDiagnostic) {
             plannedActions.push({

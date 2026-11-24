@@ -16,8 +16,6 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
   const title = $("title").first().text().trim();
   const metaDescription =
     $('meta[name="description"]').first().attr("content")?.trim() ?? "";
-  const rawCanonical =
-    $('link[rel="canonical"]').first().attr("href")?.trim() ?? null;
   const robotsMeta = $('meta[name="robots"]').first().attr("content") ?? null;
   const ogTitle =
     $('meta[property="og:title"]').first().attr("content") ?? null;
@@ -65,9 +63,23 @@ function analyzeHtmlWithCheerio(html: string, pageUrl: string): PageAnalysis {
     }
   }
 
-  const canonical = rawCanonical
-    ? (normalizeUrl(rawCanonical, effectiveBaseUrl) ?? rawCanonical)
-    : null;
+  const canonicalTag = $("head > link[rel], body link[rel], link[rel]")
+    .not("template link, noscript link")
+    .filter((_, el) => {
+      const rel = ($(el).attr("rel") ?? "").toLowerCase().split(/[\t\n\f\r ]+/);
+      return rel.includes("canonical");
+    })
+    .first();
+  const rawCanonical = canonicalTag.attr("href");
+  let canonical: string | null = null;
+  if (rawCanonical && rawCanonical.trim()) {
+    try {
+      const parsed = new URL(rawCanonical.trim(), effectiveBaseUrl);
+      if (parsed.protocol === "http:" || parsed.protocol === "https:") {
+        canonical = parsed.href;
+      }
+    } catch {}
+  }
 
   const images: Array<{ src: string | null; alt: string | null }> = [];
   $("img").each((_, el) => {
@@ -382,5 +394,42 @@ describe("Document effective base resolution & WHATWG semantics", () => {
     const res = analyzeHtml(html, "https://example.com/root/", 200, 0);
     expect(res.links[0]?.targetUrl).toBe("https://example.com/catalog/first");
     expect(res.links[1]?.targetUrl).toBe("https://example.com/catalog/second");
+  });
+
+  it("ignores canonical declarations inside inert <template> elements and respects the real document canonical", () => {
+    const html = `
+      <html>
+        <head>
+          <template><link rel="canonical" href="/inert"></template>
+          <link rel="canonical" href="/real">
+        </head>
+      </html>
+    `;
+    const res = analyzeHtml(html, "https://example.com/root/", 200, 0);
+    expect(res.canonical).toBe("https://example.com/real");
+  });
+
+  it("resolves mixed-case whitespace-delimited rel tokens (e.g. rel='alternate CANONICAL')", () => {
+    const html = `
+      <html>
+        <head>
+          <link rel="alternate CANONICAL" href="/real-page">
+        </head>
+      </html>
+    `;
+    const res = analyzeHtml(html, "https://example.com/dir/", 200, 0);
+    expect(res.canonical).toBe("https://example.com/real-page");
+  });
+
+  it("rejects non-http canonical schemes and resolves to null", () => {
+    const html = `
+      <html>
+        <head>
+          <link rel="canonical" href="javascript:void(0)">
+        </head>
+      </html>
+    `;
+    const res = analyzeHtml(html, "https://example.com/dir/", 200, 0);
+    expect(res.canonical).toBeNull();
   });
 });

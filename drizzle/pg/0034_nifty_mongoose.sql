@@ -184,6 +184,7 @@ CREATE INDEX "fleet_rule_results_snapshot_pillar_idx" ON "fleet_rule_results" US
 CREATE UNIQUE INDEX "fleet_run_items_run_member_idx" ON "fleet_run_items" USING btree ("run_id","member_id");--> statement-breakpoint
 CREATE INDEX "fleet_run_items_audit_id_idx" ON "fleet_run_items" USING btree ("audit_id");--> statement-breakpoint
 CREATE INDEX "fleet_runs_org_started_idx" ON "fleet_runs" USING btree ("organization_id","started_at");--> statement-breakpoint
+CREATE INDEX "fleet_runs_org_roster_idx" ON "fleet_runs" USING btree ("organization_id","roster_version_id");--> statement-breakpoint
 CREATE UNIQUE INDEX "fleet_snapshots_item_series_idx" ON "fleet_snapshots" USING btree ("run_item_id","series_key");--> statement-breakpoint
 CREATE INDEX "fleet_snapshots_member_observed_idx" ON "fleet_snapshots" USING btree ("member_id","observed_at");--> statement-breakpoint
 CREATE INDEX "fleet_snapshots_host_idx" ON "fleet_snapshots" USING btree ("canonical_host");

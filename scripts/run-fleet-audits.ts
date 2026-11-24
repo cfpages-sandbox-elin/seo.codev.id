@@ -408,19 +408,35 @@ async function main() {
           `[DISPATCH] Launching audit on ${project.domain} (${startUrl}) [ID: ${auditId}]`,
         );
 
-        // 1. Insert audit row in D1
+        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits for the same project
         const insertSql = `
           INSERT INTO audits (
             id, project_id, started_by_user_id, start_url,
             workflow_instance_id, config, status, pages_crawled,
             pages_total, lighthouse_total, current_phase, started_at
-          ) VALUES (
+          )
+          SELECT
             '${auditId}', '${project.id}', 'system', '${startUrl}',
             '${auditId}', '${JSON.stringify(config).replace(/'/g, "''")}', 'running', 0,
             ${maxPages}, 20, 'discovery', datetime('now')
+          WHERE NOT EXISTS (
+            SELECT 1 FROM audits
+            WHERE project_id = '${project.id}' AND status = 'running'
+              AND (workflow_instance_id NOT LIKE 'github-audit-%' OR workflow_instance_id IS NULL)
           );
         `;
         runD1Query(insertSql, isRemote);
+
+        const reserved = runD1Query(
+          `SELECT id FROM audits WHERE id = '${auditId}';`,
+          isRemote,
+        );
+        if (!reserved || reserved.length === 0) {
+          console.warn(
+            `[SKIP] Project ${project.domain} (${project.id}) already has an active running edge audit. Skipping concurrent dispatch.`,
+          );
+          continue;
+        }
 
         // 2. Trigger workflow instance
         const params = {
@@ -449,7 +465,7 @@ async function main() {
           console.error(
             `[ERROR] Failed to start workflow for ${project.domain}`,
           );
-          const failSql = `UPDATE audits SET status = 'failed', error_code = 'DISPATCH_ERROR', completed_at = datetime('now') WHERE id = '${auditId}' AND status = 'running' RETURNING id;`;
+          const failSql = `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = 'discovery', error_code = 'DISPATCH_ERROR', completed_at = datetime('now') WHERE id = '${auditId}' AND status = 'running' RETURNING id;`;
           const failedRows = runD1Query(failSql, isRemote);
           if (!failedRows || failedRows.length === 0) {
             console.warn(

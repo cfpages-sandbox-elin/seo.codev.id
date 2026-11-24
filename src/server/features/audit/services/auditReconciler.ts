@@ -71,6 +71,12 @@ export async function reconcileRunningAudit(
             errorCode: "unknown",
             errorDetail: `Workflow instance ${status.status}`,
           };
+    } else if (status.status === "complete") {
+      errorInfo = {
+        errorCode: "workflow_completed_without_finalization",
+        errorDetail:
+          "Workflow instance completed without marking audit record terminal",
+      };
     }
   } catch (error) {
     // Instance not found (never created, or expired from Workflows
@@ -161,7 +167,9 @@ async function getStaleRunningAudits(cutoff: Date, limit: number) {
       notLike(audits.workflowInstanceId, "github-audit-%"),
       timestampPredicate,
     ),
-    orderBy: audits.startedAt,
+    orderBy: isPg
+      ? sql`${audits.startedAt}::timestamptz ASC`
+      : sql`julianday(${audits.startedAt}) ASC`,
     columns: {
       id: true,
       workflowInstanceId: true,

@@ -60,6 +60,24 @@ function resolveCandidateBase(raw: string, pageUrl: string): string | null {
   return null;
 }
 
+function resolveHttpUrl(
+  href: string | undefined | null,
+  base: string,
+): string | null {
+  if (!href) return null;
+  const raw = href.trim();
+  if (!raw) return null;
+  try {
+    const candidate = new URL(raw, base);
+    if (candidate.protocol === "http:" || candidate.protocol === "https:") {
+      return candidate.href;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Determine the first document-effective base URL with WHATWG browser semantics:
  * - The first <base href> defines the document base URL for all elements.
@@ -177,13 +195,15 @@ export function analyzeHtml(
   };
 
   const handleLinkTag = (attribs: Record<string, string>) => {
-    if (attribs["rel"] === "canonical") {
-      const rawCanonical = attribs["href"]?.trim();
-      if (rawCanonical && canonical === null) {
-        canonical =
-          normalizeUrl(rawCanonical, effectiveBaseUrl) ?? rawCanonical;
+    if (suppressDepth > 0 || noscriptDepth > 0) return;
+    const relTokens = (attribs["rel"] ?? "")
+      .toLowerCase()
+      .split(/[\t\n\f\r ]+/);
+    if (relTokens.includes("canonical")) {
+      if (canonical === null) {
+        canonical = resolveHttpUrl(attribs["href"], effectiveBaseUrl);
       }
-    } else if (attribs["rel"] === "alternate" && attribs["hreflang"]) {
+    } else if (relTokens.includes("alternate") && attribs["hreflang"]) {
       hreflangTags.push(attribs["hreflang"]);
     }
   };

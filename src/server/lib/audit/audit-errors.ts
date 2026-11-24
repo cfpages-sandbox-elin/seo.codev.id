@@ -25,6 +25,8 @@ const AUDIT_ERROR_CODES = [
   // The workflow instance no longer exists (expired from retention or never
   // created) while the audit row still said "running".
   "instance_lost",
+  // The workflow instance completed without durable record finalization.
+  "workflow_completed_without_finalization",
   // Anything we could not classify.
   "unknown",
 ] as const;

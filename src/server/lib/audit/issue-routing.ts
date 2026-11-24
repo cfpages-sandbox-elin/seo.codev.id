@@ -6,7 +6,7 @@ export function routeIssueToSkill(
   issueType: string,
   url: string = "",
 ): { skill: string; action: string } {
-  const t = (issueType || "").toLowerCase().replace(/-/g, "_");
+  const code = (issueType || "").toLowerCase().replace(/_/g, "-");
   let pathname = "";
   try {
     pathname = new URL(url).pathname.toLowerCase();
@@ -25,7 +25,43 @@ export function routeIssueToSkill(
     pathname.endsWith(".svg") ||
     pathname.includes("/wp-content/");
 
-  if (t.includes("broken_image") || isStaticAsset) {
+  // High-value specific routes by descriptor
+  if (code === "canonical-conflict" || code.includes("canonical")) {
+    return {
+      skill: "internal-linking",
+      action:
+        "Inspect the final page and canonical target, then align the canonical with the intended indexable URL.",
+    };
+  }
+
+  if (code === "redirect-loop" || code === "redirect-chain") {
+    return {
+      skill: "seo-audit",
+      action:
+        "Identify the mutually redirecting URLs and make the intended destination return directly.",
+    };
+  }
+
+  if (code === "broken-link") {
+    if (isStaticAsset) {
+      return {
+        skill: "static-site-css-repair",
+        action:
+          "Repair missing theme assets, unstyled paths, or broken CSS/JS references in static export.",
+      };
+    }
+    return {
+      skill: "internal-linking",
+      action:
+        "Update or replace broken internal links with valid, live indexable target URLs.",
+    };
+  }
+
+  if (
+    code.includes("broken-image") ||
+    code.includes("broken-resource") ||
+    (isStaticAsset && !code.includes("canonical"))
+  ) {
     return {
       skill: "static-site-css-repair",
       action:
@@ -33,26 +69,20 @@ export function routeIssueToSkill(
     };
   }
 
-  if (
-    t.includes("orphan") ||
-    t.includes("internal_link") ||
-    t.includes("broken_link") ||
-    t.includes("redirect_chain") ||
-    t.includes("canonical")
-  ) {
+  if (code.includes("orphan") || code.includes("internal-link")) {
     return {
       skill: "internal-linking",
       action:
-        "Establish incoming link mesh from hub pages to money pages and correct canonical references.",
+        "Establish incoming link mesh from hub pages to money pages and correct internal link hierarchy.",
     };
   }
 
   if (
-    t.includes("title") ||
-    t.includes("description") ||
-    t.includes("heading") ||
-    t.includes("thin_content") ||
-    t.includes("duplicate")
+    code.includes("title") ||
+    code.includes("description") ||
+    code.includes("heading") ||
+    code.includes("thin-content") ||
+    code.includes("duplicate")
   ) {
     return {
       skill: "unslop-seo",
@@ -62,10 +92,10 @@ export function routeIssueToSkill(
   }
 
   if (
-    t.includes("slow") ||
-    t.includes("speed") ||
-    t.includes("large_page") ||
-    t.includes("lighthouse")
+    code.includes("slow") ||
+    code.includes("speed") ||
+    code.includes("large-page") ||
+    code.includes("lighthouse")
   ) {
     return {
       skill: "web-perf",
