@@ -256,27 +256,40 @@ async function finalizeAudit(args: {
       },
     );
     if (commitResult.kind !== "committed") {
-      console.warn("Audit completion conflict or lost CAS race", {
+      // Replay proof: check if this exact workflowInstanceId already committed this audit (Sol Round 18 F5)
+      const existing = await AuditRepository.getAuditForWorkflow(
         auditId,
         workflowInstanceId,
+      );
+      const isReplay = existing?.status === "completed";
+      if (!isReplay) {
+        console.warn("Audit completion conflict or lost CAS race", {
+          auditId,
+          workflowInstanceId,
+        });
+        return;
+      }
+      console.info(
+        "Audit completion step replaying on already committed audit",
+        { auditId, workflowInstanceId },
+      );
+    } else {
+      await captureServerEvent({
+        distinctId: billingCustomer.userId,
+        event: "site_audit:complete",
+        organizationId: billingCustomer.organizationId,
+        properties: {
+          project_id: projectId,
+          status: "completed",
+          pages_crawled: crawl.pagesCrawled,
+          pages_total: crawl.pagesCrawled,
+          crawl_completed: crawl.completed,
+          pages_blocked: blockedPages,
+          pages_rate_limited: rateLimitedPages,
+          run_lighthouse: config.lighthouseStrategy !== "none",
+        },
       });
-      return;
     }
-    await captureServerEvent({
-      distinctId: billingCustomer.userId,
-      event: "site_audit:complete",
-      organizationId: billingCustomer.organizationId,
-      properties: {
-        project_id: projectId,
-        status: "completed",
-        pages_crawled: crawl.pagesCrawled,
-        pages_total: crawl.pagesCrawled,
-        crawl_completed: crawl.completed,
-        pages_blocked: blockedPages,
-        pages_rate_limited: rateLimitedPages,
-        run_lighthouse: config.lighthouseStrategy !== "none",
-      },
-    });
     await AuditProgressKV.clear(auditId);
     // Crawl scratch state (frontier, links, mirror) is no longer needed.
     await getAuditScratchpad(auditId).destroy();

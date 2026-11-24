@@ -85,7 +85,8 @@ export function checkFleetCoverage(options?: {
                          AND p.organization_id = 'shared-workspace'
                          AND p.archived_at IS NULL
                          AND lower(trim(p.domain)) = lower(trim(rm.canonical_host))
-     WHERE rm.version_id = '${effectiveRoster.id}';`,
+     WHERE rm.version_id = '${effectiveRoster.id}'
+       AND rm.enrollment_state = 'active';`,
     isRemote,
   ) as RosterMemberRow[];
 
@@ -141,7 +142,8 @@ export function checkFleetCoverage(options?: {
      JOIN audits a ON a.project_id = p.id
                   AND a.status = 'completed'
                   AND (a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL)
-     WHERE rm.version_id = '${effectiveRoster.id}';`,
+     WHERE rm.version_id = '${effectiveRoster.id}'
+       AND rm.enrollment_state = 'active';`,
     isRemote,
   );
   const edgeAuditedMemberIds = new Set(
@@ -173,7 +175,8 @@ export function checkFleetCoverage(options?: {
                            AND s.project_id = p.id
                            AND s.canonical_host = rm.canonical_host
                            AND s.series_key = 'diagnostic'
-     WHERE rm.version_id = '${effectiveRoster.id}';`,
+     WHERE rm.version_id = '${effectiveRoster.id}'
+       AND rm.enrollment_state = 'active';`,
     isRemote,
   );
   const repoQualifiedMemberIds = new Set(
@@ -252,6 +255,19 @@ async function main() {
     },
     allowPositionals: true,
   });
+
+  if (args.values.local && process.argv.includes("--remote")) {
+    console.error(
+      "[ERROR] Conflicting flags: cannot specify both --remote and --local.",
+    );
+    process.exit(1);
+  }
+  if (args.positionals.length > 0) {
+    console.error(
+      `[ERROR] Unexpected positional arguments: ${args.positionals.join(" ")}`,
+    );
+    process.exit(1);
+  }
 
   const isRemote = args.values.local ? false : (args.values.remote ?? true);
   const result = checkFleetCoverage({ remote: isRemote });

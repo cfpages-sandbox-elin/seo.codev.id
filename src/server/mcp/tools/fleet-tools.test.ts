@@ -23,6 +23,16 @@ vi.mock("@/db", () => {
       ]);
     },
     limit: (count?: number) => {
+      if (count === 1) {
+        return [
+          {
+            id: "member_1",
+            enrollmentState: "active",
+            projectId: "proj_1",
+            repoName: "cfpages-syamsulalam-net/kaca-co-id",
+          },
+        ];
+      }
       if (count === 2) {
         return [{ id: "proj_1", domain: "kaca.co.id" }];
       }

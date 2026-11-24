@@ -128,25 +128,32 @@ export class SiteAuditWorkflow extends WorkflowEntrypoint<Env, AuditParams> {
           auditId,
           event.instanceId,
         );
-        await AuditRepository.failAudit(auditId, event.instanceId, {
-          ...errorInfo,
-          failedPhase: runningAudit?.currentPhase ?? null,
-        });
-
-        await captureServerEvent({
-          distinctId: billingCustomer.userId,
-          event: "site_audit:complete",
-          organizationId: billingCustomer.organizationId,
-          properties: {
-            project_id: projectId,
-            status: "failed",
-            error_code: errorInfo.errorCode,
-            failed_phase: runningAudit?.currentPhase,
-            pages_crawled: runningAudit?.pagesCrawled,
-            pages_total: runningAudit?.pagesTotal,
-            run_lighthouse: config.lighthouseStrategy !== "none",
+        const failed = await AuditRepository.failAudit(
+          auditId,
+          event.instanceId,
+          {
+            ...errorInfo,
+            failedPhase: runningAudit?.currentPhase ?? null,
           },
-        });
+        );
+
+        // Gate failed telemetry on winning the failure CAS (Sol Round 18 F5)
+        if (failed) {
+          await captureServerEvent({
+            distinctId: billingCustomer.userId,
+            event: "site_audit:complete",
+            organizationId: billingCustomer.organizationId,
+            properties: {
+              project_id: projectId,
+              status: "failed",
+              error_code: errorInfo.errorCode,
+              failed_phase: runningAudit?.currentPhase,
+              pages_crawled: runningAudit?.pagesCrawled,
+              pages_total: runningAudit?.pagesTotal,
+              run_lighthouse: config.lighthouseStrategy !== "none",
+            },
+          });
+        }
       });
       throw error;
     } finally {

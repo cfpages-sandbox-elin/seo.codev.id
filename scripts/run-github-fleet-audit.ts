@@ -33,6 +33,7 @@ import {
   fetchGitHubTree,
   type GitHubHeadDescriptor,
   sqlText,
+  normalizeGitRelativePath,
   selectEffectiveRosterVersion,
   executeD1SqlBatches,
   acquireVerifiedBlob,
@@ -124,6 +125,8 @@ interface RepoMapping {
   repoName: string;
   projectId?: string;
   publishRoot?: string;
+  expectedRosterVersionId?: string;
+  expectedMemberId?: string;
 }
 
 function loadRepoMappings(): Map<string, RepoMapping> {
@@ -139,16 +142,22 @@ function loadRepoMappings(): Map<string, RepoMapping> {
         const host = item.canonicalHost.toLowerCase().trim();
         const repoSlug = item.repoName.trim();
         if (isValidRepoSlug(repoSlug)) {
-          if (map.has(host) && map.get(host)!.repoName !== repoSlug) {
+          const normRoot = normalizeGitRelativePath(item.publishRoot ?? ".");
+          const currentMapping = map.get(host);
+          if (
+            currentMapping &&
+            (currentMapping.repoName !== repoSlug ||
+              currentMapping.publishRoot !== normRoot)
+          ) {
             console.warn(
-              `[MANIFEST] Ambiguous conflicting repository mapping for '${host}': '${map.get(host)!.repoName}' vs '${repoSlug}'. Excluding ambiguous host.`,
+              `[MANIFEST] Ambiguous conflicting repository/root mapping for '${host}': '${currentMapping.repoName}' (${currentMapping.publishRoot}) vs '${repoSlug}' (${normRoot}). Excluding ambiguous host.`,
             );
             ambiguousHosts.add(host);
           } else {
             map.set(host, {
               domain: host,
               repoName: repoSlug,
-              publishRoot: item.publishRoot ?? ".",
+              publishRoot: normRoot,
             });
           }
         }
@@ -175,13 +184,19 @@ function loadRepoMappings(): Map<string, RepoMapping> {
           .replace(/\/+$/, "");
         const slug = `${owner}/${repo}`;
         if (owner && repo && site && isValidRepoSlug(slug)) {
-          if (map.has(site) && map.get(site)!.repoName !== slug) {
+          const normRoot = ".";
+          const currentMapping = map.get(site);
+          if (
+            currentMapping &&
+            (currentMapping.repoName !== slug ||
+              currentMapping.publishRoot !== normRoot)
+          ) {
             console.warn(
-              `[MANIFEST] Ambiguous conflicting repository mapping for '${site}': '${map.get(site)!.repoName}' vs '${slug}'. Excluding ambiguous host.`,
+              `[MANIFEST] Ambiguous conflicting repository/root mapping for '${site}': '${currentMapping.repoName}' (${currentMapping.publishRoot}) vs '${slug}' (${normRoot}). Excluding ambiguous host.`,
             );
             ambiguousHosts.add(site);
           } else if (!map.has(site)) {
-            map.set(site, { domain: site, repoName: slug, publishRoot: "." });
+            map.set(site, { domain: site, repoName: slug, publishRoot: normRoot });
           }
         }
       }
@@ -280,7 +295,7 @@ export function findMatchingCompletedAudit(
   effectiveRosterId: string | null,
   isRemote = true,
 ): CompletedAuditMatch | null {
-  const normalizedRoot = publishRoot || ".";
+  const normalizedRoot = normalizeGitRelativePath(publishRoot || ".");
   const rows = runD1Query(
     `SELECT a.id, a.config,
             (
@@ -300,18 +315,18 @@ export function findMatchingCompletedAudit(
                 AND rm.project_id = a.project_id
                 AND fs.canonical_host = rm.canonical_host
                 AND r.organization_id = 'shared-workspace'
-                ${effectiveRosterId ? `AND r.roster_version_id = '${effectiveRosterId}' AND rm.version_id = '${effectiveRosterId}'` : ""}
+                ${effectiveRosterId ? `AND r.roster_version_id = ${sqlText(effectiveRosterId)} AND rm.version_id = ${sqlText(effectiveRosterId)}` : ""}
             ) AS has_verified_triple
      FROM audits a
-     WHERE a.project_id = '${projectId}'
+     WHERE a.project_id = ${sqlText(projectId)}
        AND a.status = 'completed'
        AND a.workflow_instance_id LIKE 'github-audit-%'
        AND a.pages_total > 0
        AND a.pages_crawled >= a.pages_total
        AND json_extract(a.config, '$.source') = 'github_repository_direct'
-       AND json_extract(a.config, '$.commitSha') = '${commitSha}'
-       AND json_extract(a.config, '$.repoName') = '${repoName}'
-       AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = '${normalizedRoot}'
+       AND json_extract(a.config, '$.commitSha') = ${sqlText(commitSha)}
+       AND json_extract(a.config, '$.repoName') = ${sqlText(repoName)}
+       AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = ${sqlText(normalizedRoot)}
      ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
      LIMIT 1;`,
     isRemote,
@@ -1096,12 +1111,17 @@ async function auditRepository(
            FROM fleet_roster_members m
            JOIN fleet_roster_versions v ON v.id = m.version_id
            JOIN projects p ON p.id = m.project_id
-           WHERE v.id = '${effectiveRoster.id}'
+           WHERE v.id = ${sqlText(effectiveRoster.id)}
              AND v.organization_id = 'shared-workspace'
-             AND m.canonical_host = '${domain.replace(/'/g, "''")}'
-             AND p.id = '${projectId}'
+             AND m.canonical_host = ${sqlText(domain)}
+             AND m.enrollment_state = 'active'
+             AND m.repo_name = ${sqlText(mapping.repoName)}
+             AND coalesce(m.publish_root, '.') = ${sqlText(normalizeGitRelativePath(mapping.publishRoot || "."))}
+             AND p.id = ${sqlText(projectId)}
              AND p.organization_id = v.organization_id
-             AND p.archived_at IS NULL;`,
+             AND p.archived_at IS NULL
+             ${mapping.expectedMemberId ? `AND m.id = ${sqlText(mapping.expectedMemberId)}` : ""}
+             ${mapping.expectedRosterVersionId ? `AND v.id = ${sqlText(mapping.expectedRosterVersionId)}` : ""};`,
           isRemote,
         );
 
@@ -1165,14 +1185,14 @@ async function auditRepository(
 
           const diagnosticSql = [
             `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-             VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', '${runStatus}', 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, '${nowIso}', '${nowIso}')
-             ON CONFLICT(id) DO UPDATE SET status = '${runStatus}', completed_at = '${nowIso}';`,
+             VALUES (${sqlText(runId)}, ${sqlText(organization_id)}, ${sqlText(version_id)}, 'v1', 'manual', 'github-audit-runner', ${sqlText(runStatus)}, 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, ${sqlText(nowIso)}, ${sqlText(nowIso)})
+             ON CONFLICT(id) DO UPDATE SET status = ${sqlText(runStatus)}, completed_at = ${sqlText(nowIso)};`,
             `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-             VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', '${itemStatus}', 1, '${nowIso}', '${nowIso}')
-             ON CONFLICT(id) DO UPDATE SET status = '${itemStatus}', completed_at = '${nowIso}';`,
+             VALUES (${sqlText(runItemId)}, ${sqlText(runId)}, ${sqlText(member_id)}, ${sqlText(projectId)}, ${sqlText(auditId)}, 'diagnostic', ${sqlText(itemStatus)}, 1, ${sqlText(nowIso)}, ${sqlText(nowIso)})
+             ON CONFLICT(id) DO UPDATE SET status = ${sqlText(itemStatus)}, completed_at = ${sqlText(nowIso)};`,
             `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-             VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, '${nowIso}')
-             ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = '${grade}', coverage = ${coverage}, observed_at = '${nowIso}';`,
+             VALUES (${sqlText(snapshotId)}, ${sqlText(runItemId)}, ${sqlText(member_id)}, ${sqlText(projectId)}, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(nowIso)})
+             ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(nowIso)};`,
           ];
           executeD1SqlStatements(diagnosticSql, isRemote);
 
@@ -1332,6 +1352,12 @@ function repairDiagnosticObservation(
   auditId: string,
   projectId: string,
   domain: string,
+  expectedSource?: {
+    repoName: string;
+    publishRoot: string;
+    expectedVersionId?: string;
+    expectedMemberId?: string;
+  },
   isRemote = true,
 ): boolean {
   try {
@@ -1343,16 +1369,21 @@ function repairDiagnosticObservation(
     if (!effectiveRoster) return false;
 
     const rosterRows = runD1Query(
-      `SELECT m.id AS member_id, m.version_id, v.organization_id
+      `SELECT m.id AS member_id, m.version_id, v.organization_id, m.repo_name, m.publish_root
        FROM fleet_roster_members m
        JOIN fleet_roster_versions v ON v.id = m.version_id
        JOIN projects p ON p.id = m.project_id
-       WHERE v.id = '${effectiveRoster.id}'
+       WHERE v.id = ${sqlText(effectiveRoster.id)}
          AND v.organization_id = 'shared-workspace'
-         AND m.canonical_host = '${domain.replace(/'/g, "''")}'
-         AND p.id = '${projectId}'
+         AND m.canonical_host = ${sqlText(domain)}
+         AND m.enrollment_state = 'active'
+         AND p.id = ${sqlText(projectId)}
          AND p.organization_id = v.organization_id
-         AND p.archived_at IS NULL;`,
+         AND p.archived_at IS NULL
+         ${expectedSource?.expectedMemberId ? `AND m.id = ${sqlText(expectedSource.expectedMemberId)}` : ""}
+         ${expectedSource?.expectedVersionId ? `AND v.id = ${sqlText(expectedSource.expectedVersionId)}` : ""}
+         ${expectedSource?.repoName ? `AND m.repo_name = ${sqlText(expectedSource.repoName)}` : ""}
+         ${expectedSource?.publishRoot ? `AND coalesce(m.publish_root, '.') = ${sqlText(normalizeGitRelativePath(expectedSource.publishRoot))}` : ""};`,
       isRemote,
     );
     if (rosterRows.length === 0) return false;
@@ -1381,11 +1412,11 @@ function repairDiagnosticObservation(
         .slice(0, 16);
 
     const counts = runD1Query(
-      `SELECT a.pages_crawled, a.pages_total, a.completed_at, a.status,
+      `SELECT a.pages_crawled, a.pages_total, a.completed_at, a.status, a.config,
               (SELECT COUNT(*) FROM audit_issues WHERE audit_id = a.id) as issue_count,
               (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) as page_count,
               (SELECT COUNT(*) FROM audit_issues i WHERE i.audit_id = a.id AND i.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages p WHERE p.id = i.page_id AND p.audit_id = a.id)) as orphaned_count
-       FROM audits a WHERE a.id = '${auditId}' AND a.project_id = '${projectId}';`,
+       FROM audits a WHERE a.id = ${sqlText(auditId)} AND a.project_id = ${sqlText(projectId)};`,
       isRemote,
     );
     if (counts.length === 0) return false;
@@ -1397,6 +1428,7 @@ function repairDiagnosticObservation(
       page_count,
       orphaned_count,
       status,
+      config: rawConfig,
     } = counts[0];
     if (status !== "completed") return false;
     const crawled = Number(pages_crawled || 0);
@@ -1404,6 +1436,21 @@ function repairDiagnosticObservation(
     if (total === 0 || crawled < total) return false;
     if (Number(page_count || 0) < total) return false;
     if (Number(orphaned_count || 0) > 0) return false;
+
+    // Sol F1: Validate audit config source tuple matches expectedSource
+    if (expectedSource) {
+      try {
+        const cfg = JSON.parse(rawConfig || "{}");
+        if (cfg.source !== "github_repository_direct") return false;
+        if (cfg.repoName !== expectedSource.repoName) return false;
+        const auditRoot = normalizeGitRelativePath(cfg.publishRoot || ".");
+        const expectedRoot = normalizeGitRelativePath(expectedSource.publishRoot || ".");
+        if (auditRoot !== expectedRoot) return false;
+      } catch {
+        return false;
+      }
+    }
+
     const issues = Number(issue_count || 0);
 
     const score = Math.max(
@@ -1426,14 +1473,14 @@ function repairDiagnosticObservation(
 
     const diagnosticSql = [
       `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-       VALUES ('${runId}', '${organization_id}', '${version_id}', 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, '${observedAt}', '${observedAt}')
-       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = '${observedAt}';`,
+       VALUES (${sqlText(runId)}, ${sqlText(organization_id)}, ${sqlText(version_id)}, 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, ${sqlText(observedAt)}, ${sqlText(observedAt)})
+       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = ${sqlText(observedAt)};`,
       `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-       VALUES ('${runItemId}', '${runId}', '${member_id}', '${projectId}', '${auditId}', 'diagnostic', 'completed', 1, '${observedAt}', '${observedAt}')
-       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = '${observedAt}';`,
+       VALUES (${sqlText(runItemId)}, ${sqlText(runId)}, ${sqlText(member_id)}, ${sqlText(projectId)}, ${sqlText(auditId)}, 'diagnostic', 'completed', 1, ${sqlText(observedAt)}, ${sqlText(observedAt)})
+       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = ${sqlText(observedAt)};`,
       `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-       VALUES ('${snapshotId}', '${runItemId}', '${member_id}', '${projectId}', '${domain.replace(/'/g, "''")}', ${score}, '${grade}', ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, '${observedAt}')
-       ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = '${grade}', coverage = ${coverage}, observed_at = '${observedAt}';`,
+       VALUES (${sqlText(snapshotId)}, ${sqlText(runItemId)}, ${sqlText(member_id)}, ${sqlText(projectId)}, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(observedAt)})
+       ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(observedAt)};`,
     ];
     executeD1SqlStatements(diagnosticSql, isRemote);
 
@@ -1468,12 +1515,22 @@ function repairDiagnosticObservation(
 }
 
 type FleetAction =
-  | { kind: "repair"; domain: string; projectId: string; auditId: string }
+  | {
+      kind: "repair";
+      domain: string;
+      projectId: string;
+      auditId: string;
+      expectedSource?: {
+        repoName: string;
+        publishRoot: string;
+        expectedVersionId?: string;
+        expectedMemberId?: string;
+      };
+    }
   | {
       kind: "audit";
       mapping: RepoMapping;
       head: GitHubHeadDescriptor;
-      tree: GitTreeItem[];
     };
 
 async function main() {
@@ -1608,18 +1665,20 @@ async function main() {
       versionId: string;
       projectId: string;
       canonicalHost: string;
+      repoName: string | null;
+      publishRoot: string;
     }
   >();
   if (effectiveRoster) {
     const rosterRows = runD1Query(
-      `SELECT m.id AS member_id, m.version_id, m.canonical_host, m.project_id
+      `SELECT m.id AS member_id, m.version_id, m.canonical_host, m.project_id, m.repo_name, m.publish_root
        FROM fleet_roster_members m
        JOIN fleet_roster_versions v ON v.id = m.version_id
        JOIN projects p ON p.id = m.project_id
                       AND p.organization_id = v.organization_id
                       AND p.archived_at IS NULL
                       AND lower(trim(p.domain)) = lower(trim(m.canonical_host))
-       WHERE v.id = '${effectiveRoster.id}'
+       WHERE v.id = ${sqlText(effectiveRoster.id)}
          AND v.organization_id = 'shared-workspace'
          AND m.enrollment_state = 'active'
          AND m.project_id IS NOT NULL;`,
@@ -1639,6 +1698,8 @@ async function main() {
         versionId: r.version_id,
         projectId: activeProjId,
         canonicalHost: host,
+        repoName: r.repo_name ? String(r.repo_name).trim() : null,
+        publishRoot: r.publish_root ? normalizeGitRelativePath(String(r.publish_root)) : ".",
       });
       approvedHosts.add(host);
     }
@@ -1651,20 +1712,10 @@ async function main() {
 
   // Build deterministic planned actions list (Sol F01, F02: respects approved roster vs workspace scope)
   const plannedActions: FleetAction[] = [];
+  let discoveryFailures = 0;
 
   if (targetDomain) {
     const approvedMember = approvedMembersByHost.get(targetDomain);
-    const projId =
-      !isWorkspace && approvedMember
-        ? approvedMember.projectId
-        : projectIdByDomain.get(targetDomain);
-    const repoMeta = repoMappings.get(targetDomain);
-    if (!projId || !repoMeta) {
-      console.error(
-        `[ERROR] Domain '${targetDomain}' is not found among enrolled projects or repository mappings.`,
-      );
-      process.exit(1);
-    }
     if (!isWorkspace && effectiveRoster && !approvedHosts.has(targetDomain)) {
       console.error(
         `[ERROR] Domain '${targetDomain}' is not in approved fleet roster '${effectiveRoster.id}'. Pass --workspace to audit wider inventory.`,
@@ -1672,12 +1723,34 @@ async function main() {
       process.exit(1);
     }
 
-    const head = resolveGitHubHead(repoMeta.repoName);
+    const projId =
+      !isWorkspace && approvedMember
+        ? approvedMember.projectId
+        : projectIdByDomain.get(targetDomain);
+
+    const fallbackRepo = repoMappings.get(targetDomain);
+    const repoName =
+      !isWorkspace && approvedMember?.repoName
+        ? approvedMember.repoName
+        : fallbackRepo?.repoName;
+    const publishRoot =
+      !isWorkspace && approvedMember
+        ? approvedMember.publishRoot
+        : (fallbackRepo?.publishRoot ?? ".");
+
+    if (!projId || !repoName) {
+      console.error(
+        `[ERROR] Domain '${targetDomain}' is not found among enrolled projects or repository mappings.`,
+      );
+      process.exit(1);
+    }
+
+    const head = resolveGitHubHead(repoName);
     const matchingAudit = !force
       ? findMatchingCompletedAudit(
           projId,
-          repoMeta.repoName,
-          repoMeta.publishRoot ?? ".",
+          repoName,
+          publishRoot,
           head.commitSha,
           effectiveRoster?.id ?? null,
           isRemote,
@@ -1692,41 +1765,69 @@ async function main() {
           domain: targetDomain,
           projectId: projId,
           auditId: matchingAudit.id,
+          expectedSource: {
+            repoName,
+            publishRoot,
+            expectedVersionId: effectiveRoster?.id,
+            expectedMemberId: approvedMember?.memberId,
+          },
         });
       } else {
         console.log(
-          `[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit matching ${repoMeta.repoName} at commit ${head.commitSha.slice(0, 10)}. Use --force to re-audit.`,
+          `[REUSED] Project for domain '${targetDomain}' already has a completed GitHub source audit matching ${repoName} at commit ${head.commitSha.slice(0, 10)}. Use --force to re-audit.`,
         );
         return;
       }
     } else {
-      const discovered = fetchGitHubTree(head);
       plannedActions.push({
         kind: "audit",
-        mapping: { ...repoMeta, projectId: projId },
+        mapping: {
+          domain: targetDomain,
+          repoName,
+          publishRoot,
+          projectId: projId,
+          expectedRosterVersionId: effectiveRoster?.id,
+          expectedMemberId: approvedMember?.memberId,
+        },
         head,
-        tree: discovered.tree,
       });
     }
   } else {
-    for (const [dom, m] of repoMappings.entries()) {
+    const candidateDomains =
+      !isWorkspace && effectiveRoster
+        ? Array.from(approvedHosts)
+        : Array.from(repoMappings.keys());
+
+    for (const dom of candidateDomains) {
       if (limit !== undefined && plannedActions.length >= limit) {
         break;
       }
       const approvedMember = approvedMembersByHost.get(dom);
       const isEligible = isWorkspace || approvedHosts.has(dom);
+      if (!isEligible) continue;
+
       const projId =
         !isWorkspace && approvedMember
           ? approvedMember.projectId
           : projectIdByDomain.get(dom);
-      if (projId && isEligible) {
+      const fallbackRepo = repoMappings.get(dom);
+      const repoName =
+        !isWorkspace && approvedMember?.repoName
+          ? approvedMember.repoName
+          : fallbackRepo?.repoName;
+      const publishRoot =
+        !isWorkspace && approvedMember
+          ? approvedMember.publishRoot
+          : (fallbackRepo?.publishRoot ?? ".");
+
+      if (projId && repoName) {
         try {
-          const head = resolveGitHubHead(m.repoName);
+          const head = resolveGitHubHead(repoName);
           const matchingAudit = !force
             ? findMatchingCompletedAudit(
                 projId,
-                m.repoName,
-                m.publishRoot ?? ".",
+                repoName,
+                publishRoot,
                 head.commitSha,
                 effectiveRoster?.id ?? null,
                 isRemote,
@@ -1741,21 +1842,35 @@ async function main() {
                 domain: dom,
                 projectId: projId,
                 auditId: matchingAudit.id,
+                expectedSource: {
+                  repoName,
+                  publishRoot,
+                  expectedVersionId: effectiveRoster?.id,
+                  expectedMemberId: approvedMember?.memberId,
+                },
               });
             } else {
               continue; // Reused
             }
           } else {
-            const discovered = fetchGitHubTree(head);
             plannedActions.push({
               kind: "audit",
-              mapping: { ...m, projectId: projId },
+              mapping: {
+                domain: dom,
+                repoName,
+                publishRoot,
+                projectId: projId,
+                expectedRosterVersionId: effectiveRoster?.id,
+                expectedMemberId: approvedMember?.memberId,
+              },
               head,
-              tree: discovered.tree,
             });
           }
         } catch (e: any) {
-          console.warn(`[DISCOVERY SKIP] Skipping ${dom} (${m.repoName}): ${e?.message}`);
+          discoveryFailures++;
+          console.warn(
+            `[DISCOVERY SKIP] Skipping ${dom} (${repoName}): ${e?.message}`,
+          );
         }
       }
     }
@@ -1781,6 +1896,7 @@ async function main() {
         action.auditId,
         action.projectId,
         action.domain,
+        action.expectedSource,
         isRemote,
       );
       if (ok) {
@@ -1797,10 +1913,11 @@ async function main() {
         `\n[${i + 1}/${selectedActions.length}] [AUDIT] Starting audit for ${c.domain} (${c.repoName})...`,
       );
       try {
+        const discovered = fetchGitHubTree(action.head);
         const ok = await auditRepository(
           c,
           action.head,
-          action.tree,
+          discovered.tree,
           maxPages,
           !!args.values.archive,
           isRemote,
@@ -1816,11 +1933,11 @@ async function main() {
 
   console.log(`\n======================================================`);
   console.log(
-    `GitHub Fleet Audit Completed! Success: ${successCount}, Failed: ${failCount}`,
+    `GitHub Fleet Audit Completed! Success: ${successCount}, Failed: ${failCount}, Discovery Failures: ${discoveryFailures}`,
   );
   console.log(`======================================================`);
 
-  if (failCount > 0) {
+  if (failCount > 0 || discoveryFailures > 0) {
     process.exit(1);
   }
 }

@@ -22,6 +22,7 @@ import {
   FLEET_MANIFEST_VERSION,
 } from "../src/server/features/fleet/data/fleetManifest";
 import { parseUtcTimestampMs } from "../src/server/features/fleet/services/fleetConstants";
+import { normalizeGitRelativePath } from "./github-archive-utils";
 
 const USAGE =
   "Usage: pnpm exec tsx scripts/import-fleet-roster.ts <orgId> --approval <file>";
@@ -45,6 +46,28 @@ export function hashCanonicalRosterPlan(
   organizationId: string,
   members: typeof FLEET_MANIFEST_MEMBERS,
 ): string {
+  const seenHosts = new Map<
+    string,
+    { repoName: string | null; publishRoot: string }
+  >();
+  for (const m of members) {
+    const host = m.canonicalHost.toLowerCase().trim();
+    const normRoot = normalizeGitRelativePath(m.publishRoot);
+    const prev = seenHosts.get(host);
+    if (
+      prev &&
+      (prev.repoName !== (m.repoName ?? null) || prev.publishRoot !== normRoot)
+    ) {
+      throw new Error(
+        `CONFLICT: Conflicting approved mappings for host '${host}': '${prev.repoName}' (${prev.publishRoot}) vs '${m.repoName}' (${normRoot})`,
+      );
+    }
+    seenHosts.set(host, {
+      repoName: m.repoName ?? null,
+      publishRoot: normRoot,
+    });
+  }
+
   const payload = {
     organizationId,
     versionTag: FLEET_MANIFEST_VERSION,
@@ -56,7 +79,7 @@ export function hashCanonicalRosterPlan(
       siteIntent: m.siteIntent,
       platform: m.platform,
       repoName: m.repoName ?? null,
-      publishRoot: m.publishRoot ?? ".",
+      publishRoot: normalizeGitRelativePath(m.publishRoot),
       enrollmentState: "active",
     })),
   };
@@ -174,7 +197,7 @@ export async function importApprovedRoster(
           siteIntent: member.siteIntent,
           platform: member.platform,
           repoName: member.repoName ?? null,
-          publishRoot: member.publishRoot ?? ".",
+          publishRoot: normalizeGitRelativePath(member.publishRoot),
           enrollmentState: "active",
           aliasesJson: "[]",
         });

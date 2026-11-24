@@ -40,7 +40,8 @@ const changedKey = computeVerifiedComparisonKey({
   canonicalOrigin: host,
   panelHash: "different-panel",
 });
-const migration = readFileSync("drizzle/sqlite/0056_modern_zarda.sql", "utf8");
+const migration0056 = readFileSync("drizzle/sqlite/0056_modern_zarda.sql", "utf8");
+const migration0058 = readFileSync("drizzle/sqlite/0058_typical_riptide.sql", "utf8");
 
 let statements = 0;
 beforeEach(async () => {
@@ -49,7 +50,8 @@ beforeEach(async () => {
     await client.executeMultiple(
       "PRAGMA foreign_keys=ON; CREATE TABLE organization(id TEXT PRIMARY KEY); CREATE TABLE projects(id TEXT PRIMARY KEY, organization_id TEXT NOT NULL REFERENCES organization(id), name TEXT NOT NULL, domain TEXT, location_code INTEGER DEFAULT 2840, language_code TEXT DEFAULT 'en', created_at TEXT DEFAULT CURRENT_TIMESTAMP, archived_at TEXT, ai_research_keywords TEXT); CREATE TABLE audits(id TEXT PRIMARY KEY);",
     );
-    await client.executeMultiple(migration);
+    await client.executeMultiple(migration0056);
+    await client.executeMultiple(migration0058);
   }
   statements++;
   await client.executeMultiple(

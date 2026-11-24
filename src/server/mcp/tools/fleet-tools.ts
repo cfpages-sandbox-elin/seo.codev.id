@@ -8,6 +8,7 @@ import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { formatMcpTable, type McpTableColumn } from "@/server/mcp/table";
 import { routeIssueToSkill } from "@/server/lib/audit/issue-routing";
+import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
 
 const CANONICAL_DOMAIN_REGEX =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
@@ -117,8 +118,16 @@ export const getFleetIssuesTool = {
         ? sql.raw(`${alias}.completed_at::timestamptz`)
         : sql.raw(`julianday(${alias}.completed_at)`);
 
-    const repoAuditSubquery = (alias: string) =>
-      sql`(SELECT ${sql.raw(alias)}.id FROM audits ${sql.raw(alias)} WHERE ${sql.raw(alias)}.project_id = ${projects.id} AND ${sql.raw(alias)}.status = 'completed' AND ${sql.raw(alias)}.workflow_instance_id LIKE 'github-audit-%' AND EXISTS (SELECT 1 FROM fleet_roster_members m JOIN fleet_run_items fri ON fri.audit_id = ${sql.raw(alias)}.id AND fri.member_id = m.id AND fri.project_id = ${projects.id} AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = ${projects.organizationId} AND fr.status = 'completed' JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = ${projects.id} AND fs.canonical_host = m.canonical_host AND fs.series_key = 'diagnostic' WHERE m.project_id = ${projects.id} AND m.canonical_host = ${projects.domain} AND m.enrollment_state = 'active') ORDER BY ${completedTimeFor(alias)} DESC NULLS LAST, ${sql.raw(alias)}.id DESC LIMIT 1)`;
+    // Sol Round 18 F2: Bind repository qualification strictly to effective approved roster version
+    const approvedRoster = await FleetRepository.getApprovedRoster(orgId);
+    const approvedRosterId = approvedRoster?.id;
+
+    const repoAuditSubquery = (alias: string) => {
+      if (!approvedRosterId) {
+        return sql`(SELECT NULL WHERE 1 = 0)`;
+      }
+      return sql`(SELECT ${sql.raw(alias)}.id FROM audits ${sql.raw(alias)} WHERE ${sql.raw(alias)}.project_id = ${projects.id} AND ${sql.raw(alias)}.status = 'completed' AND ${sql.raw(alias)}.workflow_instance_id LIKE 'github-audit-%' AND EXISTS (SELECT 1 FROM fleet_roster_members m JOIN fleet_run_items fri ON fri.audit_id = ${sql.raw(alias)}.id AND fri.member_id = m.id AND fri.project_id = ${projects.id} AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = ${projects.organizationId} AND fr.status = 'completed' JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = ${projects.id} AND fs.canonical_host = m.canonical_host AND fs.series_key = 'diagnostic' WHERE m.project_id = ${projects.id} AND m.canonical_host = ${projects.domain} AND m.enrollment_state = 'active' AND m.version_id = ${approvedRosterId} AND fr.roster_version_id = ${approvedRosterId}) ORDER BY ${completedTimeFor(alias)} DESC NULLS LAST, ${sql.raw(alias)}.id DESC LIMIT 1)`;
+    };
 
     let auditSelectorCondition;
     if (source === "edge") {

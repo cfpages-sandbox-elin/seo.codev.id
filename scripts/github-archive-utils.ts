@@ -205,22 +205,53 @@ export function fetchGitHubTree(
     },
   );
   const treeJson = JSON.parse(treeRaw);
-  if (treeJson.truncated) {
+  if (!treeJson || typeof treeJson !== "object") {
     throw new Error(
-      `DISCOVERY_TRUNCATED: Git tree for ${head.repoName} is truncated by GitHub (exceeds limit); recursive subtree enumeration required`,
+      `MALFORMED_TREE_RESPONSE: GitHub returned non-object JSON for ${head.repoName}`,
     );
   }
-  if (treeJson.sha && treeJson.sha.toLowerCase() !== head.treeSha.toLowerCase()) {
+  if (treeJson.truncated !== false) {
     throw new Error(
-      `TREE_SHA_MISMATCH: Expected root tree SHA ${head.treeSha} but received ${treeJson.sha}`,
+      `DISCOVERY_TRUNCATED: Git tree for ${head.repoName} is truncated by GitHub (truncated=${treeJson.truncated}); recursive subtree enumeration required`,
+    );
+  }
+  if (!treeJson.sha || treeJson.sha.toLowerCase() !== head.treeSha.toLowerCase()) {
+    throw new Error(
+      `TREE_SHA_MISMATCH: Expected root tree SHA ${head.treeSha} but received ${treeJson?.sha ?? "missing"}`,
+    );
+  }
+  if (!Array.isArray(treeJson.tree)) {
+    throw new Error(
+      `MALFORMED_TREE_RESPONSE: GitHub response missing 'tree' array for ${head.repoName}`,
     );
   }
 
   return {
     defaultBranch: head.branch,
     commitSha: head.commitSha,
-    tree: treeJson.tree || [],
+    tree: treeJson.tree,
   };
+}
+
+/**
+ * Normalizes roots using one relative Git-path contract (Sol Round 18 F1).
+ * Accepts '.' or a slash-delimited relative path with nonempty components and no '.' or '..' segments.
+ */
+export function normalizeGitRelativePath(p: string | null | undefined): string {
+  if (!p) return ".";
+  const trimmed = p.trim().replace(/\\/g, "/");
+  if (trimmed === "" || trimmed === ".") return ".";
+  const clean = trimmed.replace(/^\/+|\/+$/g, "");
+  if (clean === "") return ".";
+  const parts = clean.split("/");
+  for (const part of parts) {
+    if (part === "" || part === "." || part === "..") {
+      throw new Error(
+        `Invalid Git relative path '${p}': contains invalid segment '${part}'`,
+      );
+    }
+  }
+  return clean;
 }
 
 /**

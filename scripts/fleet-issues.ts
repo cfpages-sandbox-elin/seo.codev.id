@@ -16,6 +16,7 @@ import { parseArgs } from "node:util";
 import {
   isValidCanonicalHostname,
   executeD1SqlBatches,
+  selectEffectiveRosterVersion,
 } from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
@@ -126,9 +127,17 @@ export async function getAggregatedFleetIssues(options: {
     );
   }
 
-  // Sol F09, A3, T1: Partition by lane or filter by source lane before ranking; qualify repository evidence with diagnostic lineage
-  const repoDiagnosticProof =
-    "EXISTS (SELECT 1 FROM fleet_roster_members m JOIN fleet_run_items fri ON fri.audit_id = a.id AND fri.member_id = m.id AND fri.project_id = p.id AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = p.organization_id AND fr.status = 'completed' JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = p.id AND fs.canonical_host = m.canonical_host AND fs.series_key = 'diagnostic' WHERE m.project_id = p.id AND m.canonical_host = p.domain AND m.enrollment_state = 'active')";
+  // Sol Round 18 F2: Bind repository qualification strictly to effective approved roster version
+  const allRosterVersions = runD1Query(
+    `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';`,
+    isRemote,
+  );
+  const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
+  const effectiveRosterId = effectiveRoster?.id ?? null;
+
+  const repoDiagnosticProof = effectiveRosterId
+    ? `EXISTS (SELECT 1 FROM fleet_roster_members m JOIN fleet_run_items fri ON fri.audit_id = a.id AND fri.member_id = m.id AND fri.project_id = p.id AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = p.organization_id AND fr.status = 'completed' JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = p.id AND fs.canonical_host = m.canonical_host AND fs.series_key = 'diagnostic' WHERE m.project_id = p.id AND m.canonical_host = p.domain AND m.enrollment_state = 'active' AND m.version_id = '${effectiveRosterId}' AND fr.roster_version_id = '${effectiveRosterId}')`
+    : "(1 = 0)";
 
   const sourceFilterCondition =
     sourceMode === "edge"

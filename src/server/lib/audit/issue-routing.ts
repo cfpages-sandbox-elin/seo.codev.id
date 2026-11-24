@@ -37,6 +37,7 @@ const ON_PAGE_PATTERNS = [
   "title",
   "description",
   "heading",
+  "h1",
   "thin-content",
   "duplicate",
   "alt",
@@ -47,6 +48,10 @@ const PERF_PATTERNS = [
   "speed",
   "large-page",
   "lighthouse",
+  "rate-limited",
+  "poor-lcp",
+  "poor-cls",
+  "high-tbt",
 ] as const;
 
 function hasAny(target: string, patterns: readonly string[]): boolean {

@@ -109,6 +109,7 @@ export const runFleetAuditTool = {
     const maxPages = args.maxPages || 2000;
     const concurrency = args.concurrency || 2;
 
+    let targetProjectId: string | undefined;
     if (domain) {
       const activeProjects = await db
         .select({ id: projects.id })
@@ -129,6 +130,7 @@ export const runFleetAuditTool = {
         throw new Error(
           `Ambiguous domain binding: multiple active projects (${activeProjects.length}) found for '${domain}' in organization '${orgId}'.`,
         );
+      targetProjectId = activeProjects[0].id;
     }
 
     if (mode === "repository_direct") {
@@ -149,7 +151,12 @@ export const runFleetAuditTool = {
           );
 
         const rosterMember = await db
-          .select({ id: fleetRosterMembers.id })
+          .select({
+            id: fleetRosterMembers.id,
+            enrollmentState: fleetRosterMembers.enrollmentState,
+            projectId: fleetRosterMembers.projectId,
+            repoName: fleetRosterMembers.repoName,
+          })
           .from(fleetRosterMembers)
           .where(
             and(
@@ -162,6 +169,16 @@ export const runFleetAuditTool = {
         if (rosterMember.length === 0) {
           throw new Error(
             `Domain '${domain}' is not in approved fleet roster '${effectiveRoster.id}'.`,
+          );
+        }
+        if (rosterMember[0].enrollmentState !== "active") {
+          throw new Error(
+            `Domain '${domain}' is '${rosterMember[0].enrollmentState}' in roster '${effectiveRoster.id}'; only active members can be planned for audit.`,
+          );
+        }
+        if (!rosterMember[0].projectId || rosterMember[0].projectId !== targetProjectId) {
+          throw new Error(
+            `Domain '${domain}' has mismatched or missing project mapping in roster '${effectiveRoster.id}'.`,
           );
         }
       }

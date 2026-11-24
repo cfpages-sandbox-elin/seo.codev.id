@@ -116,8 +116,8 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 
 ### Lane 1: Commit-Pinned GitHub Direct Audit Engine (`run-github-fleet-audit.ts`) — Primary Source Diagnostic Lane
 - **Purpose**: Rapid, high-volume static source inspection directly from GitHub repositories without Worker isolate memory ceilings.
-- **Commit Pinning**: Resolves target branch to an immutable commit SHA (`gh api /repos/:owner/:repo/commits/:branch`). All Git tree queries and blob reads are bound to this commit.
-- **Git Tree Discovery**: Retrieves up to 100,000 files in a single atomic call (`GET /repos/:owner/:repo/git/trees/:commitSha?recursive=1`), bounded by GitHub API's 100,000 entry and 7 MB response payload cap. Fails fast if `truncated: true` (requiring recursive subtree enumeration).
+- **Commit Pinning**: Resolves target branch to an immutable commit SHA (`gh api /repos/:owner/:repo/commits/:branch`). The commit SHA serves as the blob/archive identity, while the resolved tree SHA serves as the enumeration identity. All Git tree queries and blob reads are bound to these pinned identities.
+- **Git Tree Discovery**: Retrieves up to 100,000 files in a single atomic call (`GET /repos/:owner/:repo/git/trees/:treeSha?recursive=1`), bounded by GitHub API's 100,000 entry and 7 MB response payload cap. Fails fast if `truncated: true` or if the returned tree SHA mismatches the resolved tree SHA.
 - **Zero Edge Heap Pressure**: HTML parsing, heading extraction, meta tag inspection, and OpenGraph analysis execute host-side in Node.js, completely bypassing Cloudflare Workers Free Tier 128 MB isolate memory ceiling.
 - **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/index.htm` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set using unified route indexing and domain host equivalence (supporting HTTP/HTTPS and apex/www pairs on default ports 80/443) to detect broken links and orphan pages with zero network calls.
 - **Staged D1 Persistence**:
@@ -279,7 +279,7 @@ await AuditService.startAudit({
 ```
 
 ### Playbook 2C: Fleet-Wide Issue Triage & CSV Export
-Queries the latest completed audit per active project, ordering by severity priority (critical $\rightarrow$ warning $\rightarrow$ info) then domain and issue ID:
+Queries the latest completed audit per source lane per active project (subject to diagnostic lineage for repository results; `all` and `both` are aliases that select the union of latest edge and latest repository audits), ordering by severity priority (critical $\rightarrow$ warning $\rightarrow$ info) then domain and issue ID. Returned issue counts represent limited samples up to the specified limit:
 ```powershell
 # List top aggregated issues across all fleet audits with sovereign skill routing (default limit 200, max 1000)
 # Supports --local (local SQLite D1 fixture) or default remote D1 execution
@@ -351,7 +351,7 @@ pnpm exec tsx scripts/check-fleet-repos.ts --local
 pnpm exec tsx scripts/check-fleet-repos.ts --local --json
 ```
 > [!NOTE]
-> The coverage report denominator evaluates enrolled active members of the effective approved roster version (`m.version_id = effectiveRoster.id AND m.enrollment_state = 'active'`). Properties in `exempt` or `parked` states remain in roster records but are excluded from active audit requirements, while `excluded` properties are kept outside the dashboard population entirely. A partial status can result from a partial attempt or insufficient evidence for an official grade; an interval is rendered only when reconciled evidence satisfies 80% <= coverage < 100% and bounds agree with earned mass (otherwise displayed as `—`). Full point scores require exactly 100% qualified evidence coverage. Status badge freshness (10-day TTL) and historical trend comparability (21-day window) operate independently of interval display eligibility.
+> The coverage report denominator evaluates enrolled active members of the effective approved roster version (`m.version_id = effectiveRoster.id AND m.enrollment_state = 'active'`). Active members, validated project links, and approved repository mappings are distinguished in coverage calculations. Properties in `exempt` or `parked` states remain in roster records but are excluded from active audit requirements, while `excluded` properties are kept outside the dashboard population entirely. A partial status can result from a partial attempt or insufficient evidence for an official grade; an interval is rendered only when reconciled evidence satisfies 80% <= coverage < 100% and bounds agree with earned mass (otherwise displayed as `—`). Full point scores require exactly 100% qualified evidence coverage. Status badge freshness (10-day TTL) and historical trend comparability (21-day window) operate independently of interval display eligibility.
 
 ### Playbook 3: Monitoring Workspace Audit Execution in Remote D1
 To inspect real-time crawler progress and audit state using workspace-scoped predicates:
@@ -764,14 +764,14 @@ try {
        }
      });
      ```
-  3. Query crawled pages (default limit 100, capped at 1,000; filterable by search substring, fetchClass, and statusCode):
+  3. Query crawled pages (default limit 100, capped at 1,000; filterable by urlContains substring, fetchClass, and statusCode):
      ```ts
      const pages = await client.callTool({
        name: "get_audit_pages",
        arguments: {
          projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
          auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a",
-         search: "/category",
+         urlContains: "/category",
          fetchClass: "ok",
          statusCode: 200,
          limit: 100
@@ -800,13 +800,7 @@ try {
      ```
 
 > [!NOTE]
-> **Crawler Access Credentials**: When a project requires authentication or custom request headers, configure crawler credentials via `save_crawler_credential`. Calling `start_site_audit` with `crawlerCredentialId` attaches the credential to the crawl, causing the crawler to replay authorization tokens automatically. The edge fleet CLI (`run-fleet-audits.ts`) passes `access: null` by default.
-       arguments: {
-         projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b",
-         auditId: "d4e7f6a3-9f5b-4a1d-ae3c-7b8c9d0e1f2a"
-       }
-     });
-     ```
+> **Crawler Access Credentials**: When a project requires authentication or custom request headers, configure crawler credentials (such as Shopify storefront password or basic auth) in the UI under Settings → Crawler Access. Once saved, invoking `run_site_audit` automatically looks up and attaches any valid, unexpired credentials configured for the target start host via `AuditService.startAudit`, passing sealed access to the Workflow. The edge fleet CLI (`run-fleet-audits.ts`) passes `access: null` by default.
 
 ---
 

@@ -11,7 +11,7 @@
  *     error is copied into the row before Workflows retention deletes it.
  */
 import { env } from "cloudflare:workers";
-import { and, asc, eq, isNotNull, isNull, notLike, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { db } from "@/db";
 import { audits, projects, watchdogCursor } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
@@ -61,7 +61,7 @@ export async function reconcileRunningAudit(
         errorDetail:
           "GitHub repository audit exceeded max run duration (2h) and was reclaimed.",
       };
-      await AuditRepository.failAudit(
+      const failed = await AuditRepository.failAudit(
         audit.id,
         audit.workflowInstanceId,
         {
@@ -70,7 +70,8 @@ export async function reconcileRunningAudit(
           failedPhase: audit.currentPhase ?? "analyzing",
         },
       );
-      return errorInfo;
+      if (failed) return errorInfo;
+      return null;
     }
     return null;
   }
@@ -295,10 +296,14 @@ async function getStaleRunningAudits(
   cursor: WatchdogCursor = sweepCursor,
 ) {
   const isPg = getDatabaseProvider() === "postgres";
-  const cutoffIso = cutoff.toISOString();
-  const timestampPredicate = isPg
-    ? sql`${audits.startedAt}::timestamptz < ${cutoffIso}::timestamptz`
-    : sql`julianday(${audits.startedAt}) < julianday(${cutoffIso})`;
+  const edgeCutoffIso = cutoff.toISOString();
+  // Sol Round 18 F4: Repository audits (github-audit-*) have a 2-hour TTL.
+  // Sweep them in the same keyset cursor pass so crashed CLI runners never lock projects indefinitely.
+  const repoCutoffIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+
+  const stalenessPredicate = isPg
+    ? sql`(${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${audits.startedAt}::timestamptz < ${edgeCutoffIso}::timestamptz) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${audits.startedAt}::timestamptz < ${repoCutoffIso}::timestamptz)`
+    : sql`(${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND julianday(${audits.startedAt}) < julianday(${edgeCutoffIso})) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND julianday(${audits.startedAt}) < julianday(${repoCutoffIso}))`;
 
   const cursorPredicate = cursor
     ? isPg
@@ -310,8 +315,7 @@ async function getStaleRunningAudits(
     where: and(
       eq(audits.status, "running"),
       isNotNull(audits.workflowInstanceId),
-      notLike(audits.workflowInstanceId, "github-audit-%"),
-      timestampPredicate,
+      stalenessPredicate,
       cursorPredicate,
     ),
     orderBy: isPg
