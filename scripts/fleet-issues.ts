@@ -128,7 +128,7 @@ export async function getAggregatedFleetIssues(options: {
 
   // Sol F09, A3: Partition by lane or filter by source lane before ranking; qualify repository evidence with diagnostic triple
   const repoDiagnosticProof =
-    "EXISTS (SELECT 1 FROM fleet_snapshots fs JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed' WHERE fs.audit_id = a.id AND fs.series_key = 'diagnostic')";
+    "EXISTS (SELECT 1 FROM fleet_snapshots fs JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed' WHERE fri.audit_id = a.id AND fs.series_key = 'diagnostic')";
 
   const sourceFilterCondition =
     sourceMode === "edge"

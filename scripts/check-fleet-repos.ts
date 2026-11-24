@@ -147,7 +147,7 @@ export function checkFleetCoverage(options?: {
          SELECT 1 FROM fleet_snapshots fs
          JOIN fleet_run_items fri ON fri.id = fs.run_item_id AND fri.status = 'completed'
          JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.status = 'completed'
-         WHERE fs.audit_id = a.id AND fs.series_key = 'diagnostic'
+         WHERE fri.audit_id = a.id AND fs.series_key = 'diagnostic'
        );`,
     isRemote,
   );
