@@ -9,6 +9,7 @@ import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
+import { isValidRepoSlug, normalizeGitRelativePath } from "@/shared/git-repo";
 
 const CANONICAL_DOMAIN_REGEX =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
@@ -146,6 +147,7 @@ export const runFleetAuditTool = {
           enrollmentState: fleetRosterMembers.enrollmentState,
           projectId: fleetRosterMembers.projectId,
           repoName: fleetRosterMembers.repoName,
+          publishRoot: fleetRosterMembers.publishRoot,
         })
         .from(fleetRosterMembers)
         .where(
@@ -174,10 +176,26 @@ export const runFleetAuditTool = {
           `Domain '${domain}' has mismatched or missing project mapping in roster '${effectiveRoster.id}'.`,
         );
       }
-      if (mode === "repository_direct" && !rosterMember[0].repoName) {
-        throw new Error(
-          `Domain '${domain}' has no approved repository mapping in roster '${effectiveRoster.id}' for repository_direct mode. Use edge_workflow mode or link an approved repository in the roster.`,
-        );
+      if (mode === "repository_direct") {
+        const repoName = rosterMember[0].repoName?.trim();
+        if (!repoName) {
+          throw new Error(
+            `Domain '${domain}' has no approved repository mapping in roster '${effectiveRoster.id}' for repository_direct mode. Use edge_workflow mode or link an approved repository in the roster.`,
+          );
+        }
+        if (!isValidRepoSlug(repoName)) {
+          throw new Error(
+            `Domain '${domain}' has an invalid repository slug '${rosterMember[0].repoName}' in roster '${effectiveRoster.id}'. Must be 'owner/repo'.`,
+          );
+        }
+        try {
+          normalizeGitRelativePath(rosterMember[0].publishRoot);
+        } catch (rootErr: unknown) {
+          throw new Error(
+            `Domain '${domain}' has an invalid publish root '${rosterMember[0].publishRoot}' in roster '${effectiveRoster.id}': ${rootErr instanceof Error ? rootErr.message : String(rootErr)}`,
+            { cause: rootErr },
+          );
+        }
       }
     }
 

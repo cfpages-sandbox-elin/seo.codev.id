@@ -460,18 +460,18 @@ async function main() {
             pages_total, lighthouse_total, current_phase, started_at
           )
           SELECT
-            '${auditId}', '${project.id}', 'system', '${startUrl}',
-            '${auditId}', '${JSON.stringify(config).replace(/'/g, "''")}', 'running', 0,
+            ${sqlText(auditId)}, ${sqlText(project.id)}, 'system', ${sqlText(startUrl)},
+            ${sqlText(auditId)}, ${sqlText(JSON.stringify(config))}, 'running', 0,
             ${maxPages}, 20, 'discovery', datetime('now')
           WHERE NOT EXISTS (
             SELECT 1 FROM audits
-            WHERE project_id = '${project.id}' AND status = 'running'
+            WHERE project_id = ${sqlText(project.id)} AND status = 'running'
           );
         `;
         runD1Query(insertSql, isRemote);
 
         const reserved = runD1Query(
-          `SELECT id FROM audits WHERE id = '${auditId}';`,
+          `SELECT id FROM audits WHERE id = ${sqlText(auditId)};`,
           isRemote,
         );
         if (!reserved || reserved.length === 0) {

@@ -4,8 +4,9 @@
  * audit_pages, audit_issues, and stored Lighthouse results. Link edges live
  * in the per-audit scratchpad Durable Object, not here.
  */
-import { and, count, desc, eq, isNull } from "drizzle-orm";
+import { and, count, desc, eq, isNull, sql } from "drizzle-orm";
 import { db } from "@/db";
+import { getDatabaseProvider } from "@/db/provider";
 import { AppError } from "@/server/lib/errors";
 import {
   audits,
@@ -239,9 +240,12 @@ async function getAuditForProject(auditId: string, projectId: string) {
 }
 
 async function getLatestAuditForProject(projectId: string) {
+  const isPg = getDatabaseProvider() === "postgres";
   return db.query.audits.findFirst({
     where: eq(audits.projectId, projectId),
-    orderBy: desc(audits.startedAt),
+    orderBy: isPg
+      ? [desc(audits.startedAt), desc(audits.id)]
+      : [sql`julianday(${audits.startedAt}) DESC`, desc(audits.id)],
   });
 }
 
@@ -307,11 +311,15 @@ async function hasPagesForAudit(auditId: string): Promise<boolean> {
 }
 
 async function getAuditsByProject(projectId: string) {
+  const isPg = getDatabaseProvider() === "postgres";
   const rows = await db
     .select({ audit: audits })
     .from(audits)
     .where(eq(audits.projectId, projectId))
-    .orderBy(desc(audits.startedAt));
+    .orderBy(
+      isPg ? desc(audits.startedAt) : sql`julianday(${audits.startedAt}) DESC`,
+      desc(audits.id),
+    );
 
   return rows.map(({ audit }) => audit);
 }

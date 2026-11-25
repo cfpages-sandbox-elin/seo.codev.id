@@ -4,6 +4,8 @@ import fs, { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseUtcTimestampMs } from "../src/server/features/fleet/services/fleetConstants";
+import { isValidRepoSlug, normalizeGitRelativePath } from "../src/shared/git-repo";
+export { isValidRepoSlug, normalizeGitRelativePath };
 
 /**
  * Streaming byte capping transform stream (Sol P1 - F1).
@@ -90,14 +92,6 @@ export function isValidCanonicalHostname(domain: string): boolean {
   );
 }
 
-/**
- * Validates repository slug format (Sol P1-04).
- * Strictly requires owner/repo pattern with standard alphanumeric, dash, dot, or underscore characters.
- */
-export function isValidRepoSlug(slug: string): boolean {
-  if (!slug || typeof slug !== "string") return false;
-  return /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/.test(slug);
-}
 
 export interface GitTreeItem {
   path: string;
@@ -233,26 +227,6 @@ export function fetchGitHubTree(
   };
 }
 
-/**
- * Normalizes roots using one relative Git-path contract (Sol Round 18 F1).
- * Accepts '.' or a slash-delimited relative path with nonempty components and no '.' or '..' segments.
- */
-export function normalizeGitRelativePath(p: string | null | undefined): string {
-  if (!p) return ".";
-  const trimmed = p.trim().replace(/\\/g, "/");
-  if (trimmed === "" || trimmed === ".") return ".";
-  const clean = trimmed.replace(/^\/+|\/+$/g, "");
-  if (clean === "") return ".";
-  const parts = clean.split("/");
-  for (const part of parts) {
-    if (part === "" || part === "." || part === "..") {
-      throw new Error(
-        `Invalid Git relative path '${p}': contains invalid segment '${part}'`,
-      );
-    }
-  }
-  return clean;
-}
 
 /**
  * Discover the repository default branch, pinned commit SHA, and recursive git tree.

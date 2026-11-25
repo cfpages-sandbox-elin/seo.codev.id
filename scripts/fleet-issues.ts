@@ -154,8 +154,12 @@ export async function getAggregatedFleetIssues(options: {
             json_extract(a.config, '$.source') = 'github_repository_direct'
             AND json_extract(a.config, '$.repoName') = m.repo_name
             AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
-            AND (json_extract(a.config, '$.rosterSource.versionId') IS NULL OR json_extract(a.config, '$.rosterSource.versionId') = m.version_id)
-            AND (json_extract(a.config, '$.rosterSource.memberId') IS NULL OR json_extract(a.config, '$.rosterSource.memberId') = m.id)
+            AND json_extract(a.config, '$.rosterSource.versionId') = m.version_id
+            AND json_extract(a.config, '$.rosterSource.memberId') = m.id
+            AND json_extract(a.config, '$.rosterSource.projectId') = m.project_id
+            AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
+            AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
+            AND coalesce(json_extract(a.config, '$.rosterSource.publishRoot'), '.') = coalesce(m.publish_root, '.')
           ELSE 0 END
       )`
     : "(1 = 0)";

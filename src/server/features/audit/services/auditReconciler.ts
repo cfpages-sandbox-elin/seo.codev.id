@@ -142,12 +142,12 @@ type WatchdogCursor = {
 
 let sweepCursor: WatchdogCursor = null;
 
-type LoadedCursorState = {
-  cursor: WatchdogCursor;
-  revision: number | null;
-};
+export type LoadedCursorState =
+  | { kind: "persisted"; cursor: WatchdogCursor; revision: number }
+  | { kind: "absent"; cursor: null; revision: null }
+  | { kind: "read_error"; cursor: null; revision: null };
 
-async function loadPersistedCursor(): Promise<LoadedCursorState> {
+export async function loadPersistedCursor(): Promise<LoadedCursorState> {
   try {
     const row = await db.query.watchdogCursor.findFirst({
       where: eq(watchdogCursor.id, "singleton"),
@@ -155,28 +155,30 @@ async function loadPersistedCursor(): Promise<LoadedCursorState> {
     if (row) {
       if (row.startedAt && row.auditId) {
         return {
+          kind: "persisted",
           cursor: { startedAt: row.startedAt, id: row.auditId },
           revision: row.revision,
         };
       }
       // A stored null reset must be honored rather than falling back to process memory
-      return { cursor: null, revision: row.revision };
+      return { kind: "persisted", cursor: null, revision: row.revision };
     }
-  } catch {}
-  return { cursor: sweepCursor, revision: null };
+    return { kind: "absent", cursor: null, revision: null };
+  } catch {
+    return { kind: "read_error", cursor: null, revision: null };
+  }
 }
 
-async function savePersistedCursor(
+export async function savePersistedCursor(
   cursor: WatchdogCursor,
   expectedRevision?: number | null,
 ): Promise<boolean> {
-  sweepCursor = cursor;
   try {
     const isPg = getDatabaseProvider() === "postgres";
     const nowIso = new Date().toISOString();
 
     if (expectedRevision !== undefined && expectedRevision !== null) {
-      await db
+      const res = await db
         .update(watchdogCursor)
         .set({
           startedAt: cursor ? cursor.startedAt : null,
@@ -189,8 +191,33 @@ async function savePersistedCursor(
             eq(watchdogCursor.id, "singleton"),
             eq(watchdogCursor.revision, expectedRevision),
           ),
-        );
-      return true;
+        )
+        .returning({ revision: watchdogCursor.revision });
+
+      if (res.length > 0) {
+        sweepCursor = cursor;
+        return true;
+      }
+      return false;
+    }
+
+    if (expectedRevision === null) {
+      const res = await db
+        .insert(watchdogCursor)
+        .values({
+          id: "singleton",
+          startedAt: cursor ? cursor.startedAt : null,
+          auditId: cursor ? cursor.id : null,
+          revision: 1,
+        })
+        .onConflictDoNothing()
+        .returning({ revision: watchdogCursor.revision });
+
+      if (res.length > 0) {
+        sweepCursor = cursor;
+        return true;
+      }
+      return false;
     }
 
     const existing = await db.query.watchdogCursor.findFirst({
@@ -198,7 +225,7 @@ async function savePersistedCursor(
     });
 
     if (existing) {
-      await db
+      const res = await db
         .update(watchdogCursor)
         .set({
           startedAt: cursor ? cursor.startedAt : null,
@@ -211,9 +238,16 @@ async function savePersistedCursor(
             eq(watchdogCursor.id, "singleton"),
             eq(watchdogCursor.revision, existing.revision),
           ),
-        );
+        )
+        .returning({ revision: watchdogCursor.revision });
+
+      if (res.length > 0) {
+        sweepCursor = cursor;
+        return true;
+      }
+      return false;
     } else {
-      await db
+      const res = await db
         .insert(watchdogCursor)
         .values({
           id: "singleton",
@@ -221,9 +255,15 @@ async function savePersistedCursor(
           auditId: cursor ? cursor.id : null,
           revision: 1,
         })
-        .onConflictDoNothing();
+        .onConflictDoNothing()
+        .returning({ revision: watchdogCursor.revision });
+
+      if (res.length > 0) {
+        sweepCursor = cursor;
+        return true;
+      }
+      return false;
     }
-    return true;
   } catch {
     return false;
   }
@@ -232,10 +272,19 @@ async function savePersistedCursor(
 /** Cron watchdog: sweep stale running audits and reconcile each. */
 export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
   const cutoff = new Date(Date.now() - STALE_RUNNING_AFTER_MS);
-  const loaded =
+  const loaded: LoadedCursorState =
     overrideCursor !== undefined
-      ? { cursor: overrideCursor, revision: null }
+      ? { kind: "persisted", cursor: overrideCursor, revision: -1 }
       : await loadPersistedCursor();
+
+  // If DB read failed, keep fallback method-local without persisting blind CAS
+  if (loaded.kind === "read_error") {
+    console.warn(
+      "[WATCHDOG] Failed to read persisted cursor state; skipping cursor sweep this cycle.",
+    );
+    return;
+  }
+
   let activeCursor = loaded.cursor;
   let stale = await getStaleRunningAudits(
     cutoff,
@@ -250,14 +299,16 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
   }
 
   // Update cursor for next sweep with CAS revision check
-  if (stale.length > 0) {
-    const last = stale[stale.length - 1];
-    await savePersistedCursor(
-      { startedAt: last.startedAt, id: last.id },
-      loaded.revision,
-    );
-  } else {
-    await savePersistedCursor(null, loaded.revision);
+  if (loaded.revision !== -1) {
+    if (stale.length > 0) {
+      const last = stale[stale.length - 1];
+      await savePersistedCursor(
+        { startedAt: last.startedAt, id: last.id },
+        loaded.revision,
+      );
+    } else {
+      await savePersistedCursor(null, loaded.revision);
+    }
   }
 
   // Reconcile legacy running rows with NULL workflow_instance_id that are older than cutoff
@@ -275,7 +326,9 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
         isNull(audits.workflowInstanceId),
         nullTimestampPredicate,
       ),
-      orderBy: [asc(audits.startedAt), asc(audits.id)],
+      orderBy: isPg
+        ? [asc(audits.startedAt), asc(audits.id)]
+        : [sql`julianday(${audits.startedAt}) ASC`, asc(audits.id)],
       limit: 20,
       columns: {
         id: true,

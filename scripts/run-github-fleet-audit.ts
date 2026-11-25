@@ -301,10 +301,38 @@ export function findMatchingCompletedAudit(
   repoName: string,
   publishRoot: string,
   commitSha: string,
-  effectiveRosterId: string | null,
+  rosterSourceOrVersionId?: RosterSource | string | null,
   isRemote = true,
 ): CompletedAuditMatch | null {
   const normalizedRoot = normalizeGitRelativePath(publishRoot || ".");
+  const rosterSource: RosterSource | null =
+    typeof rosterSourceOrVersionId === "object" && rosterSourceOrVersionId !== null
+      ? rosterSourceOrVersionId
+      : null;
+  const effectiveRosterId =
+    rosterSource?.versionId ??
+    (typeof rosterSourceOrVersionId === "string" ? rosterSourceOrVersionId : null);
+
+  const rosterSourceSql = rosterSource
+    ? `AND json_extract(a.config, '$.rosterSource.versionId') = ${sqlText(rosterSource.versionId)}
+       AND json_extract(a.config, '$.rosterSource.memberId') = ${sqlText(rosterSource.memberId)}
+       AND json_extract(a.config, '$.rosterSource.projectId') = ${sqlText(rosterSource.projectId)}
+       AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(${sqlText(rosterSource.canonicalHost)}))
+       AND json_extract(a.config, '$.rosterSource.repoName') = ${sqlText(rosterSource.repoName)}
+       AND coalesce(json_extract(a.config, '$.rosterSource.publishRoot'), '.') = ${sqlText(normalizedRoot)}`
+    : effectiveRosterId
+      ? `AND json_extract(a.config, '$.rosterSource.versionId') = ${sqlText(effectiveRosterId)}`
+      : "";
+
+  const tripleFilter = rosterSource
+    ? `AND r.roster_version_id = ${sqlText(rosterSource.versionId)}
+       AND rm.version_id = ${sqlText(rosterSource.versionId)}
+       AND rm.id = ${sqlText(rosterSource.memberId)}
+       AND lower(trim(rm.canonical_host)) = lower(trim(${sqlText(rosterSource.canonicalHost)}))`
+    : effectiveRosterId
+      ? `AND r.roster_version_id = ${sqlText(effectiveRosterId)} AND rm.version_id = ${sqlText(effectiveRosterId)}`
+      : "";
+
   const rows = runD1Query(
     `SELECT a.id, a.config,
             (
@@ -324,7 +352,7 @@ export function findMatchingCompletedAudit(
                 AND rm.project_id = a.project_id
                 AND fs.canonical_host = rm.canonical_host
                 AND r.organization_id = 'shared-workspace'
-                ${effectiveRosterId ? `AND r.roster_version_id = ${sqlText(effectiveRosterId)} AND rm.version_id = ${sqlText(effectiveRosterId)}` : ""}
+                ${tripleFilter}
             ) AS has_verified_triple
      FROM audits a
      WHERE a.project_id = ${sqlText(projectId)}
@@ -336,6 +364,7 @@ export function findMatchingCompletedAudit(
        AND json_extract(a.config, '$.commitSha') = ${sqlText(commitSha)}
        AND json_extract(a.config, '$.repoName') = ${sqlText(repoName)}
        AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = ${sqlText(normalizedRoot)}
+       ${rosterSourceSql}
      ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
      LIMIT 1;`,
     isRemote,
@@ -349,12 +378,25 @@ export function findMatchingCompletedAudit(
     if (
       cfg.source !== "github_repository_direct" ||
       cfg.repoName !== repoName ||
-      (cfg.publishRoot ?? ".") !== normalizedRoot ||
+      normalizeGitRelativePath(cfg.publishRoot ?? ".") !== normalizedRoot ||
       cfg.commitSha !== commitSha
     ) {
       return null;
     }
-    if (
+    if (rosterSource) {
+      if (!cfg.rosterSource) return null;
+      const rs = cfg.rosterSource;
+      if (
+        rs.versionId !== rosterSource.versionId ||
+        rs.memberId !== rosterSource.memberId ||
+        rs.projectId !== rosterSource.projectId ||
+        rs.canonicalHost?.toLowerCase().trim() !== rosterSource.canonicalHost.toLowerCase().trim() ||
+        rs.repoName !== rosterSource.repoName ||
+        normalizeGitRelativePath(rs.publishRoot ?? ".") !== normalizedRoot
+      ) {
+        return null;
+      }
+    } else if (
       effectiveRosterId &&
       cfg.rosterSource?.versionId &&
       cfg.rosterSource.versionId !== effectiveRosterId
@@ -651,7 +693,7 @@ async function auditRepository(
   );
 
   const reserved = runD1Query(
-    `SELECT id FROM audits WHERE id = '${auditId}';`,
+    `SELECT id FROM audits WHERE id = ${sqlText(auditId)};`,
     isRemote,
   );
   if (reserved.length === 0) {
@@ -970,14 +1012,14 @@ async function auditRepository(
           external_link_count, has_structured_data, is_indexable, crawl_depth, in_sitemap, response_time_ms
         )
         SELECT
-          '${p.id}', '${targetAuditId}', ${sqlText(p.url)}, NULL, ${sqlText(p.fetchClass)},
+          ${sqlText(p.id)}, ${sqlText(targetAuditId)}, ${sqlText(p.url)}, NULL, ${sqlText(p.fetchClass)},
           ${sqlText(title)}, ${sqlText(metaDesc)}, ${sqlText(canonical)}, ${sqlText(robots)},
           ${sqlText(ogTitle)}, ${sqlText(ogDesc)}, ${sqlText(ogImage)},
           ${p.h1Count}, ${p.h2Count}, ${p.h3Count}, ${p.h4Count}, ${p.h5Count}, ${p.h6Count},
           ${p.wordCount}, ${sqlText(p.contentHash)}, ${p.imagesTotal}, ${p.imagesMissingAlt},
           ${p.links.filter((l) => l.isInternal).length}, ${p.links.filter((l) => !l.isInternal).length},
           ${p.hasStructuredData ? 1 : 0}, ${p.isIndexable ? 1 : 0}, NULL, 0, NULL
-        WHERE EXISTS (SELECT 1 FROM audits WHERE id = '${targetAuditId}' AND status = 'running')
+        WHERE EXISTS (SELECT 1 FROM audits WHERE id = ${sqlText(targetAuditId)} AND status = 'running')
         ON CONFLICT(id) DO NOTHING;
       `.trim();
     }
@@ -1136,26 +1178,39 @@ async function auditRepository(
       );
       const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
       if (!effectiveRoster) {
-        console.warn(
-          `[DIAGNOSTIC] No effective approved roster found for organization 'shared-workspace'. Skipping diagnostic series.`,
-        );
+        if (mapping.expectedRosterVersionId || mapping.expectedMemberId) {
+          console.error(
+            `[ERROR] Expected approved roster '${mapping.expectedRosterVersionId}' for domain '${domain}' but no effective roster was found at publication.`,
+          );
+          diagnosticFailed = true;
+        } else {
+          console.warn(
+            `[DIAGNOSTIC] No effective approved roster found for organization 'shared-workspace'. Skipping diagnostic series.`,
+          );
+        }
       } else {
         const rosterRows = runD1Query(
           `SELECT m.id AS member_id, m.version_id, v.organization_id
            FROM fleet_roster_members m
            JOIN fleet_roster_versions v ON v.id = m.version_id
            JOIN projects p ON p.id = m.project_id
+           JOIN audits a ON a.id = ${sqlText(auditId)}
            WHERE v.id = ${sqlText(effectiveRoster.id)}
              AND v.organization_id = 'shared-workspace'
-             AND m.canonical_host = ${sqlText(domain)}
+             AND lower(trim(m.canonical_host)) = lower(trim(${sqlText(domain)}))
              AND m.enrollment_state = 'active'
              AND m.repo_name = ${sqlText(mapping.repoName)}
              AND coalesce(m.publish_root, '.') = ${sqlText(normalizeGitRelativePath(mapping.publishRoot || "."))}
              AND p.id = ${sqlText(projectId)}
              AND p.organization_id = v.organization_id
              AND p.archived_at IS NULL
-             ${mapping.expectedMemberId ? `AND m.id = ${sqlText(mapping.expectedMemberId)}` : ""}
-             ${mapping.expectedRosterVersionId ? `AND v.id = ${sqlText(mapping.expectedRosterVersionId)}` : ""};`,
+             AND a.status = 'completed'
+             AND json_extract(a.config, '$.source') = 'github_repository_direct'
+             AND json_extract(a.config, '$.repoName') = m.repo_name
+             AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
+             ${mapping.expectedMemberId ? `AND m.id = ${sqlText(mapping.expectedMemberId)} AND json_extract(a.config, '$.rosterSource.memberId') = m.id` : ""}
+             ${mapping.expectedRosterVersionId ? `AND v.id = ${sqlText(mapping.expectedRosterVersionId)} AND json_extract(a.config, '$.rosterSource.versionId') = v.id` : ""}
+             ${mapping.expectedMemberId ? `AND json_extract(a.config, '$.rosterSource.projectId') = p.id AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))` : ""};`,
           isRemote,
         );
 
@@ -1298,7 +1353,7 @@ async function auditRepository(
              error_code = 'CHUNK_WRITE_FAILED',
              current_phase = 'failed',
              completed_at = datetime('now')
-         WHERE id = '${auditId}' AND status = 'running'
+         WHERE id = ${sqlText(auditId)} AND status = 'running'
          RETURNING id;`;
       const fallbackRows = runD1Query(fallbackSql, isRemote);
       if (!fallbackRows || fallbackRows.length === 0) {
@@ -1393,12 +1448,7 @@ function repairDiagnosticObservation(
   auditId: string,
   projectId: string,
   domain: string,
-  expectedSource?: {
-    repoName: string;
-    publishRoot: string;
-    expectedVersionId?: string;
-    expectedMemberId?: string;
-  },
+  expectedSource?: RosterSource,
   isRemote = true,
 ): boolean {
   try {
@@ -1416,15 +1466,15 @@ function repairDiagnosticObservation(
        JOIN projects p ON p.id = m.project_id
        WHERE v.id = ${sqlText(effectiveRoster.id)}
          AND v.organization_id = 'shared-workspace'
-         AND m.canonical_host = ${sqlText(domain)}
+         AND lower(trim(m.canonical_host)) = lower(trim(${sqlText(domain)}))
          AND m.enrollment_state = 'active'
          AND p.id = ${sqlText(projectId)}
          AND p.organization_id = v.organization_id
          AND p.archived_at IS NULL
-         ${expectedSource?.expectedMemberId ? `AND m.id = ${sqlText(expectedSource.expectedMemberId)}` : ""}
-         ${expectedSource?.expectedVersionId ? `AND v.id = ${sqlText(expectedSource.expectedVersionId)}` : ""}
-         ${expectedSource?.repoName ? `AND m.repo_name = ${sqlText(expectedSource.repoName)}` : ""}
-         ${expectedSource?.publishRoot ? `AND coalesce(m.publish_root, '.') = ${sqlText(normalizeGitRelativePath(expectedSource.publishRoot))}` : ""};`,
+         ${expectedSource ? `AND m.id = ${sqlText(expectedSource.memberId)}` : ""}
+         ${expectedSource ? `AND v.id = ${sqlText(expectedSource.versionId)}` : ""}
+         ${expectedSource ? `AND m.repo_name = ${sqlText(expectedSource.repoName)}` : ""}
+         ${expectedSource ? `AND coalesce(m.publish_root, '.') = ${sqlText(normalizeGitRelativePath(expectedSource.publishRoot))}` : ""};`,
       isRemote,
     );
     if (rosterRows.length === 0) return false;
@@ -1478,7 +1528,7 @@ function repairDiagnosticObservation(
     if (Number(page_count || 0) < total) return false;
     if (Number(orphaned_count || 0) > 0) return false;
 
-    // Sol F1, A1: Validate audit config source tuple matches expectedSource
+    // Sol F01: Validate audit config source tuple matches expectedSource across all 6 fields
     if (expectedSource) {
       try {
         const cfg = JSON.parse(rawConfig || "{}");
@@ -1487,17 +1537,15 @@ function repairDiagnosticObservation(
         const auditRoot = normalizeGitRelativePath(cfg.publishRoot || ".");
         const expectedRoot = normalizeGitRelativePath(expectedSource.publishRoot || ".");
         if (auditRoot !== expectedRoot) return false;
+        if (!cfg.rosterSource) return false;
+        const rs = cfg.rosterSource;
         if (
-          expectedSource.expectedVersionId &&
-          cfg.rosterSource?.versionId &&
-          cfg.rosterSource.versionId !== expectedSource.expectedVersionId
-        ) {
-          return false;
-        }
-        if (
-          expectedSource.expectedMemberId &&
-          cfg.rosterSource?.memberId &&
-          cfg.rosterSource.memberId !== expectedSource.expectedMemberId
+          rs.versionId !== expectedSource.versionId ||
+          rs.memberId !== expectedSource.memberId ||
+          rs.projectId !== expectedSource.projectId ||
+          rs.canonicalHost?.toLowerCase().trim() !== expectedSource.canonicalHost.toLowerCase().trim() ||
+          rs.repoName !== expectedSource.repoName ||
+          normalizeGitRelativePath(rs.publishRoot || ".") !== expectedRoot
         ) {
           return false;
         }
@@ -1575,12 +1623,7 @@ type FleetAction =
       domain: string;
       projectId: string;
       auditId: string;
-      expectedSource?: {
-        repoName: string;
-        publishRoot: string;
-        expectedVersionId?: string;
-        expectedMemberId?: string;
-      };
+      expectedSource?: RosterSource;
     }
   | {
       kind: "audit";
@@ -1812,6 +1855,18 @@ async function main() {
       process.exit(1);
     }
 
+    const expectedRosterSource: RosterSource | null =
+      effectiveRoster && approvedMember
+        ? {
+            versionId: effectiveRoster.id,
+            memberId: approvedMember.memberId,
+            projectId: projId,
+            canonicalHost: targetDomain,
+            repoName,
+            publishRoot: normalizeGitRelativePath(publishRoot),
+          }
+        : null;
+
     const head = resolveGitHubHead(repoName);
     const matchingAudit = !force
       ? findMatchingCompletedAudit(
@@ -1819,25 +1874,20 @@ async function main() {
           repoName,
           publishRoot,
           head.commitSha,
-          effectiveRoster?.id ?? null,
+          expectedRosterSource,
           isRemote,
         )
       : null;
 
     if (!force && matchingAudit) {
       const isRosterMember = approvedHosts.has(targetDomain);
-      if (isRosterMember && !matchingAudit.hasDiagnostic) {
+      if (isRosterMember && !matchingAudit.hasDiagnostic && expectedRosterSource) {
         plannedActions.push({
           kind: "repair",
           domain: targetDomain,
           projectId: projId,
           auditId: matchingAudit.id,
-          expectedSource: {
-            repoName,
-            publishRoot,
-            expectedVersionId: effectiveRoster?.id,
-            expectedMemberId: approvedMember?.memberId,
-          },
+          expectedSource: expectedRosterSource,
         });
       } else {
         console.log(
@@ -1895,6 +1945,18 @@ async function main() {
 
       if (projId && repoName) {
         try {
+          const expectedRosterSource: RosterSource | null =
+            effectiveRoster && approvedMember
+              ? {
+                  versionId: effectiveRoster.id,
+                  memberId: approvedMember.memberId,
+                  projectId: projId,
+                  canonicalHost: dom,
+                  repoName,
+                  publishRoot: normalizeGitRelativePath(publishRoot),
+                }
+              : null;
+
           const head = resolveGitHubHead(repoName);
           const matchingAudit = !force
             ? findMatchingCompletedAudit(
@@ -1902,25 +1964,20 @@ async function main() {
                 repoName,
                 publishRoot,
                 head.commitSha,
-                effectiveRoster?.id ?? null,
+                expectedRosterSource,
                 isRemote,
               )
             : null;
 
           if (!force && matchingAudit) {
             const isRosterMember = approvedHosts.has(dom);
-            if (isRosterMember && !matchingAudit.hasDiagnostic) {
+            if (isRosterMember && !matchingAudit.hasDiagnostic && expectedRosterSource) {
               plannedActions.push({
                 kind: "repair",
                 domain: dom,
                 projectId: projId,
                 auditId: matchingAudit.id,
-                expectedSource: {
-                  repoName,
-                  publishRoot,
-                  expectedVersionId: effectiveRoster?.id,
-                  expectedMemberId: approvedMember?.memberId,
-                },
+                expectedSource: expectedRosterSource,
               });
             } else {
               continue; // Reused

@@ -185,8 +185,12 @@ export function checkFleetCoverage(options?: {
          json_extract(a.config, '$.source') = 'github_repository_direct'
          AND json_extract(a.config, '$.repoName') = rm.repo_name
          AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(rm.publish_root, '.')
-         AND (json_extract(a.config, '$.rosterSource.versionId') IS NULL OR json_extract(a.config, '$.rosterSource.versionId') = rm.version_id)
-         AND (json_extract(a.config, '$.rosterSource.memberId') IS NULL OR json_extract(a.config, '$.rosterSource.memberId') = rm.id)
+         AND json_extract(a.config, '$.rosterSource.versionId') = rm.version_id
+         AND json_extract(a.config, '$.rosterSource.memberId') = rm.id
+         AND json_extract(a.config, '$.rosterSource.projectId') = rm.project_id
+         AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(rm.canonical_host))
+         AND json_extract(a.config, '$.rosterSource.repoName') = rm.repo_name
+         AND coalesce(json_extract(a.config, '$.rosterSource.publishRoot'), '.') = coalesce(rm.publish_root, '.')
        ELSE 0 END;`,
     isRemote,
   );
