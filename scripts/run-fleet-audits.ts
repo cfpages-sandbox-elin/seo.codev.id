@@ -16,6 +16,7 @@ import { parseArgs } from "node:util";
 import {
   executeD1SqlBatches,
   isValidCanonicalHostname,
+  selectEffectiveRosterVersion,
   sqlText,
 } from "./github-archive-utils";
 
@@ -112,7 +113,10 @@ function triggerWorkflow(
   console.error(
     `[DISPATCH REJECTED] Failed to trigger workflow instance ${id}: ${res.stderr || res.stdout}`,
   );
-  return { outcome: "definitively_rejected", message: res.stderr || res.stdout };
+  return {
+    outcome: "definitively_rejected",
+    message: res.stderr || res.stdout,
+  };
 }
 
 interface TargetProject {
@@ -141,9 +145,7 @@ async function main() {
       allowPositionals: false,
     });
   } catch (err: any) {
-    console.error(
-      `[ERROR] Invalid arguments: ${err.message}`,
-    );
+    console.error(`[ERROR] Invalid arguments: ${err.message}`);
     process.exit(1);
   }
 
@@ -245,11 +247,30 @@ async function main() {
   if (targetDomainFilter)
     console.log(`Target Domain Filter: ${targetDomainFilter}`);
 
-  const rosterId = args.values["roster-id"]
-    ? String(args.values["roster-id"]).trim()
-    : null;
+  const rawRosterId = args.values["roster-id"];
+  const rosterId = rawRosterId ? String(rawRosterId).trim() : null;
+  if (rawRosterId !== undefined && !rosterId) {
+    console.error("[ERROR] --roster-id cannot be empty.");
+    process.exit(1);
+  }
+
+  // Sol Round 21 F01: Assert effective approved roster on execution DB
+  const allRosterVersions = runD1Query(
+    "SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';",
+    isRemote,
+  );
+  const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
+
   if (rosterId) {
-    console.log(`Enrolled Roster Filter: ${rosterId}`);
+    if (!effectiveRoster || effectiveRoster.id !== rosterId) {
+      console.error(
+        `[ERROR] Planned roster '${rosterId}' is no longer effective on the execution DB (effective is '${effectiveRoster?.id ?? "none"}').`,
+      );
+      process.exit(1);
+    }
+    console.log(
+      `Enrolled Roster Filter: ${rosterId} (verified effective approved version)`,
+    );
   }
 
   // Query enrolled projects in shared-workspace with normalized UTC epoch of completed edge crawls (Sol F05, C2)
@@ -258,7 +279,8 @@ async function main() {
     FROM projects p
     ${
       rosterId
-        ? `JOIN fleet_roster_members rm ON rm.project_id = p.id AND rm.version_id = ${sqlText(rosterId)} AND rm.enrollment_state = 'active' AND lower(trim(rm.canonical_host)) = lower(trim(p.domain))`
+        ? `JOIN fleet_roster_members rm ON rm.project_id = p.id AND rm.version_id = ${sqlText(rosterId)} AND rm.enrollment_state = 'active' AND lower(trim(rm.canonical_host)) = lower(trim(p.domain))
+           JOIN fleet_roster_versions rv ON rv.id = rm.version_id AND rv.organization_id = p.organization_id AND rv.approved_at IS NOT NULL`
         : ""
     }
     LEFT JOIN audits a ON p.id = a.project_id

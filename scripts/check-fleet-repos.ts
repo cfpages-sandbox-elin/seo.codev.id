@@ -57,9 +57,8 @@ export function checkFleetCoverage(options?: {
     isRemote,
   );
 
-  const effectiveRoster = selectEffectiveRosterVersion<RosterVersionRow>(
-    rosterVersionsRaw,
-  );
+  const effectiveRoster =
+    selectEffectiveRosterVersion<RosterVersionRow>(rosterVersionsRaw);
 
   if (!effectiveRoster) {
     return {
@@ -147,9 +146,7 @@ export function checkFleetCoverage(options?: {
        AND rm.enrollment_state = 'active';`,
     isRemote,
   );
-  const edgeAuditedMemberIds = new Set(
-    edgeAudits.map((a: any) => a.member_id),
-  );
+  const edgeAuditedMemberIds = new Set(edgeAudits.map((a: any) => a.member_id));
 
   // 5. Query qualified repository audits bound to active roster members with verified diagnostic lineage (Sol T1, C1)
   const repoAudits = runD1Query(
@@ -190,7 +187,8 @@ export function checkFleetCoverage(options?: {
          AND json_extract(a.config, '$.rosterSource.projectId') = rm.project_id
          AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(rm.canonical_host))
          AND json_extract(a.config, '$.rosterSource.repoName') = rm.repo_name
-         AND coalesce(json_extract(a.config, '$.rosterSource.publishRoot'), '.') = coalesce(rm.publish_root, '.')
+         AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
+          AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(rm.publish_root, '.')
        ELSE 0 END;`,
     isRemote,
   );

@@ -4,8 +4,12 @@ import fs, { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseUtcTimestampMs } from "../src/server/features/fleet/services/fleetConstants";
-import { isValidRepoSlug, normalizeGitRelativePath } from "../src/shared/git-repo";
-export { isValidRepoSlug, normalizeGitRelativePath };
+import {
+  isValidRepoSlug,
+  normalizeRepoSlug,
+  normalizeGitRelativePath,
+} from "../src/shared/git-repo";
+export { isValidRepoSlug, normalizeRepoSlug, normalizeGitRelativePath };
 
 /**
  * Streaming byte capping transform stream (Sol P1 - F1).
@@ -92,7 +96,6 @@ export function isValidCanonicalHostname(domain: string): boolean {
   );
 }
 
-
 export interface GitTreeItem {
   path: string;
   mode: string;
@@ -126,13 +129,8 @@ export function resolveGitHubHead(
   repoName: string,
   options?: { branch?: string; timeoutMs?: number },
 ): GitHubHeadDescriptor {
-  if (!isValidRepoSlug(repoName)) {
-    throw new Error(
-      `Invalid GitHub repository slug: "${repoName}". Must match owner/repo pattern.`,
-    );
-  }
-
-  const [owner, repo] = repoName.split("/");
+  const cleanRepo = normalizeRepoSlug(repoName);
+  const [owner, repo] = cleanRepo.split("/");
   const base = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   const ghExe = process.platform === "win32" ? "gh.exe" : "gh";
   const timeoutMs = options?.timeoutMs ?? 30_000;
@@ -189,7 +187,10 @@ export function fetchGitHubTree(
   // Fetch recursive git tree for commit by immutable tree SHA
   const treeRaw = execFileSync(
     ghExe,
-    ["api", `${base}/git/trees/${encodeURIComponent(head.treeSha)}?recursive=1`],
+    [
+      "api",
+      `${base}/git/trees/${encodeURIComponent(head.treeSha)}?recursive=1`,
+    ],
     {
       encoding: "utf8",
       timeout: Math.max(timeoutMs, 60_000),
@@ -209,7 +210,10 @@ export function fetchGitHubTree(
       `DISCOVERY_TRUNCATED: Git tree for ${head.repoName} is truncated by GitHub (truncated=${treeJson.truncated}); recursive subtree enumeration required`,
     );
   }
-  if (!treeJson.sha || treeJson.sha.toLowerCase() !== head.treeSha.toLowerCase()) {
+  if (
+    !treeJson.sha ||
+    treeJson.sha.toLowerCase() !== head.treeSha.toLowerCase()
+  ) {
     throw new Error(
       `TREE_SHA_MISMATCH: Expected root tree SHA ${head.treeSha} but received ${treeJson?.sha ?? "missing"}`,
     );
@@ -226,7 +230,6 @@ export function fetchGitHubTree(
     tree: treeJson.tree,
   };
 }
-
 
 /**
  * Discover the repository default branch, pinned commit SHA, and recursive git tree.
@@ -568,28 +571,37 @@ export function parseTarHtmlFiles(
       .toString("utf8")
       .replace(/\0.*$/, "")
       .trim();
+    if (!/^[0-7]+$/.test(sizeStr)) {
+      throw new Error(
+        `Invalid tar size field '${sizeStr}' at offset ${offset}`,
+      );
+    }
     const size = parseInt(sizeStr, 8);
+    if (!Number.isSafeInteger(size) || size < 0) {
+      throw new Error(`Invalid tar entry size ${size} at offset ${offset}`);
+    }
 
     const typeFlag = header[156];
     const isRegularFile = typeFlag === 0 || typeFlag === 48;
 
     const contentStart = offset + 512;
-    const contentEnd = contentStart + (isNaN(size) ? 0 : size);
+    const contentEnd = contentStart + size;
+    const nextOffset = contentStart + Math.ceil(size / 512) * 512;
+    if (nextOffset <= offset || nextOffset > tarBuf.length) {
+      throw new Error("Truncated or invalid tar entry bounds");
+    }
 
     if (
       isRegularFile &&
-      !isNaN(size) &&
       size <= maxEntrySize &&
       (relPath.endsWith(".html") || relPath.endsWith(".htm"))
     ) {
       if (contentEnd <= tarBuf.length) {
-        const content = Buffer.from(tarBuf.subarray(contentStart, contentEnd));
-        htmlMap.set(relPath, content);
+        htmlMap.set(relPath, tarBuf.subarray(contentStart, contentEnd));
       }
     }
 
-    const paddedSize = Math.ceil(size / 512) * 512;
-    offset += 512 + (isNaN(paddedSize) ? 512 : paddedSize);
+    offset = nextOffset;
   }
 
   return htmlMap;

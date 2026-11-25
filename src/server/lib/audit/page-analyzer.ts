@@ -79,23 +79,78 @@ function resolveHttpUrl(
 }
 
 /**
+ * Strips inert <noscript>...</noscript> blocks outside of comments and <script>
+ * without swallowing live content or falling victim to script literals like "<noscript>".
+ */
+export function sanitizeNoscript(html: string): string {
+  let result = "";
+  let i = 0;
+  const len = html.length;
+
+  while (i < len) {
+    if (html.startsWith("<!--", i)) {
+      const endComment = html.indexOf("-->", i + 4);
+      if (endComment === -1) {
+        result += html.slice(i);
+        break;
+      }
+      result += html.slice(i, endComment + 3);
+      i = endComment + 3;
+      continue;
+    }
+
+    if (/^<script\b/i.test(html.slice(i, i + 8))) {
+      let endOpen = i + 7;
+      let inQuote: string | null = null;
+      while (endOpen < len) {
+        const ch = html[endOpen];
+        if (inQuote && ch === inQuote) {
+          inQuote = null;
+        } else if (!inQuote && (ch === '"' || ch === "'")) {
+          inQuote = ch;
+        } else if (!inQuote && ch === ">") {
+          break;
+        }
+        endOpen++;
+      }
+      if (endOpen >= len) {
+        result += html.slice(i);
+        break;
+      }
+      const scriptCloseMatch = /<\/script\s*>/i.exec(html.slice(endOpen + 1));
+      if (!scriptCloseMatch) {
+        result += html.slice(i);
+        break;
+      }
+      const closeEnd =
+        endOpen + 1 + scriptCloseMatch.index + scriptCloseMatch[0].length;
+      result += html.slice(i, closeEnd);
+      i = closeEnd;
+      continue;
+    }
+
+    if (/^<noscript\b/i.test(html.slice(i, i + 10))) {
+      const noscriptCloseMatch = /<\/noscript\s*>/i.exec(html.slice(i));
+      if (!noscriptCloseMatch) {
+        break;
+      }
+      i += noscriptCloseMatch.index + noscriptCloseMatch[0].length;
+      continue;
+    }
+
+    result += html[i];
+    i++;
+  }
+
+  return result;
+}
+
+/**
  * Determine the first document-effective base URL with WHATWG browser semantics:
  * - The first <base href> defines the document base URL for all elements.
  * - <base> inside inert <template> or <noscript> is ignored.
  * - Non-HTTP(S) base schemes (e.g. data:, javascript:) are rejected, falling back to document URL.
  */
-/**
- * WHATWG raw-text handling: when scripting is enabled, <noscript> contents are treated as inert text.
- * Strips <noscript>...</noscript> (including whitespace in close tag </noscript >) while strictly
- * preserving HTML comments so that <!-- <noscript> --> doesn't swallow real content.
- */
-function sanitizeNoscript(rawHtml: string): string {
-  return rawHtml.replace(
-    /(<!--[\s\S]*?-->)|(<noscript\b[^>]*>[\s\S]*?<\/noscript\s*>)/gi,
-    (match) => (match.startsWith("<!--") ? match : ""),
-  );
-}
-
 function getDocumentEffectiveBase(
   html: string,
   pageUrl: string,
@@ -105,8 +160,6 @@ function getDocumentEffectiveBase(
   let inTemplate = 0;
   let inNoscript = 0;
   let inSvg = 0;
-
-  const cleanHtml = sanitizeNoscript(html);
 
   const parser = new Parser(
     {
@@ -139,7 +192,7 @@ function getDocumentEffectiveBase(
     { decodeEntities: true, lowerCaseTags: true },
   );
 
-  parser.write(cleanHtml);
+  parser.write(html);
   parser.end();
 
   return { baseHref: firstBaseHref, effectiveBaseUrl };
@@ -155,6 +208,7 @@ export function analyzeHtml(
   responseTimeMs: number,
   redirectUrl: string | null = null,
 ): PageAnalysis {
+  const cleanHtml = sanitizeNoscript(html);
   let title: string | null = null;
   let titleDepth = 0;
   let titleDone = false;
@@ -164,7 +218,7 @@ export function analyzeHtml(
   let metaDescription: string | null = null;
   let canonical: string | null = null;
   const { baseHref, effectiveBaseUrl } = getDocumentEffectiveBase(
-    html,
+    cleanHtml,
     pageUrl,
   );
   let robotsMeta: string | null = null;
@@ -364,7 +418,6 @@ export function analyzeHtml(
     // Defaults (non-XML mode): lowercased tag/attribute names, decoded
     // entities — matching what the DOM-based implementation saw.
   );
-  const cleanHtml = sanitizeNoscript(html);
   parser.write(cleanHtml);
   parser.end();
 

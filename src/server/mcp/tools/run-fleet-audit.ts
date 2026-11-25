@@ -1,10 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
-import {
-  projects,
-  fleetRosterMembers,
-} from "@/db/schema";
+import { projects, fleetRosterMembers } from "@/db/schema";
 import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
@@ -216,6 +213,9 @@ export const runFleetAuditTool = {
         "tsx",
         "scripts/run-github-fleet-audit.ts",
         ...scopeArgs,
+        "--roster-id",
+        effectiveRoster.id,
+        "--remote",
         "--max-pages",
         String(maxPages),
       ];
@@ -227,6 +227,7 @@ export const runFleetAuditTool = {
         ...scopeArgs,
         "--roster-id",
         effectiveRoster.id,
+        "--remote",
         "--max-pages",
         String(maxPages),
         "--concurrency",

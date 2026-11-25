@@ -159,7 +159,8 @@ export async function getAggregatedFleetIssues(options: {
             AND json_extract(a.config, '$.rosterSource.projectId') = m.project_id
             AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
             AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
-            AND coalesce(json_extract(a.config, '$.rosterSource.publishRoot'), '.') = coalesce(m.publish_root, '.')
+            AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
+            AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
           ELSE 0 END
       )`
     : "(1 = 0)";

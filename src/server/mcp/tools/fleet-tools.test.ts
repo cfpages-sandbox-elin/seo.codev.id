@@ -128,14 +128,12 @@ describe("Fleet MCP Tools", () => {
     });
 
     it("rejects invalid canonical domain in handler (Sol P2-08)", async () => {
-      const result = await getFleetIssuesTool.handler(
-        { limit: 10, domain: "-invalid.com" },
-        toolContext,
-      );
-      expect(result.structuredContent).toEqual({
-        error: "invalid_domain",
-        domain: "-invalid.com",
-      });
+      await expect(
+        getFleetIssuesTool.handler(
+          { limit: 10, domain: "-invalid.com" },
+          toolContext,
+        ),
+      ).rejects.toThrow(/Invalid canonical hostname/);
     });
 
     it("rejects caller outside shared-workspace organization (Sol P2-06)", async () => {
@@ -167,11 +165,14 @@ describe("Fleet MCP Tools", () => {
         "scripts/run-github-fleet-audit.ts",
         "--domain",
         "kaca.co.id",
+        "--roster-id",
+        "roster_v1",
+        "--remote",
         "--max-pages",
         "500",
       ]);
       expect(data.executionCommand).toContain(
-        "run-github-fleet-audit.ts --domain kaca.co.id --max-pages 500",
+        "run-github-fleet-audit.ts --domain kaca.co.id --roster-id roster_v1 --remote --max-pages 500",
       );
     });
 

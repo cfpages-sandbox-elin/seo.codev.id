@@ -19,10 +19,7 @@ import { executeInBatches } from "@/db/runBatch";
 import { insertIssues } from "./auditIssueWrites";
 import { insertLighthouseResults } from "./auditLighthouseWrites";
 import type { DetectedIssue } from "@/server/lib/audit/issues/page-reporters";
-import type {
-  AuditConfig,
-  CrawledPageResult,
-} from "@/server/lib/audit/types";
+import type { AuditConfig, CrawledPageResult } from "@/server/lib/audit/types";
 import type { PageFetchClass } from "@/shared/audit-fetch-class";
 
 async function createAudit(data: {
@@ -244,8 +241,11 @@ async function getLatestAuditForProject(projectId: string) {
   return db.query.audits.findFirst({
     where: eq(audits.projectId, projectId),
     orderBy: isPg
-      ? [desc(audits.startedAt), desc(audits.id)]
-      : [sql`julianday(${audits.startedAt}) DESC`, desc(audits.id)],
+      ? [
+          sql`CASE WHEN pg_input_is_valid(${audits.startedAt}, 'timestamptz') THEN ${audits.startedAt}::timestamptz END DESC NULLS LAST`,
+          desc(audits.id),
+        ]
+      : [sql`julianday(${audits.startedAt}) DESC NULLS LAST`, desc(audits.id)],
   });
 }
 
@@ -317,7 +317,9 @@ async function getAuditsByProject(projectId: string) {
     .from(audits)
     .where(eq(audits.projectId, projectId))
     .orderBy(
-      isPg ? desc(audits.startedAt) : sql`julianday(${audits.startedAt}) DESC`,
+      isPg
+        ? sql`CASE WHEN pg_input_is_valid(${audits.startedAt}, 'timestamptz') THEN ${audits.startedAt}::timestamptz END DESC NULLS LAST`
+        : sql`julianday(${audits.startedAt}) DESC NULLS LAST`,
       desc(audits.id),
     );
 

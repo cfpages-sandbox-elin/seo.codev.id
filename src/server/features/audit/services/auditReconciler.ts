@@ -298,25 +298,12 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
     stale = await getStaleRunningAudits(cutoff, WATCHDOG_BATCH_LIMIT, null);
   }
 
-  // Update cursor for next sweep with CAS revision check
-  if (loaded.revision !== -1) {
-    if (stale.length > 0) {
-      const last = stale[stale.length - 1];
-      await savePersistedCursor(
-        { startedAt: last.startedAt, id: last.id },
-        loaded.revision,
-      );
-    } else {
-      await savePersistedCursor(null, loaded.revision);
-    }
-  }
-
   // Reconcile legacy running rows with NULL workflow_instance_id that are older than cutoff
   // (Sol R1: "Handle historical null IDs via a separately scoped recovery rule.")
   const isPg = getDatabaseProvider() === "postgres";
   const cutoffIso = cutoff.toISOString();
   const nullTimestampPredicate = isPg
-    ? sql`${audits.startedAt}::timestamptz < ${cutoffIso}::timestamptz`
+    ? sql`CASE WHEN pg_input_is_valid(${audits.startedAt}, 'timestamptz') THEN ${audits.startedAt}::timestamptz < ${cutoffIso}::timestamptz ELSE false END`
     : sql`julianday(${audits.startedAt}) < julianday(${cutoffIso})`;
 
   try {
@@ -327,7 +314,10 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
         nullTimestampPredicate,
       ),
       orderBy: isPg
-        ? [asc(audits.startedAt), asc(audits.id)]
+        ? [
+            sql`CASE WHEN pg_input_is_valid(${audits.startedAt}, 'timestamptz') THEN ${audits.startedAt}::timestamptz END ASC NULLS FIRST`,
+            asc(audits.id),
+          ]
         : [sql`julianday(${audits.startedAt}) ASC`, asc(audits.id)],
       limit: 20,
       columns: {
@@ -373,6 +363,25 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
     } catch (error) {
       // One unreconcilable audit must not stop the sweep.
       console.error(`Audit watchdog: failed to reconcile ${audit.id}:`, error);
+    }
+  }
+
+  // Sol Round 21 F08: Update cursor for next sweep AFTER processing stale batch
+  if (loaded.revision !== -1) {
+    let saved = false;
+    if (stale.length > 0) {
+      const last = stale[stale.length - 1];
+      saved = await savePersistedCursor(
+        { startedAt: last.startedAt, id: last.id },
+        loaded.revision,
+      );
+    } else {
+      saved = await savePersistedCursor(null, loaded.revision);
+    }
+    if (!saved) {
+      console.warn(
+        "Audit watchdog: cursor was not advanced due to revision conflict",
+      );
     }
   }
 }

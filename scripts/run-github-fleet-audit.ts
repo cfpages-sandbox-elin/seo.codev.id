@@ -196,7 +196,11 @@ function loadRepoMappings(): Map<string, RepoMapping> {
             );
             ambiguousHosts.add(site);
           } else if (!map.has(site)) {
-            map.set(site, { domain: site, repoName: slug, publishRoot: normRoot });
+            map.set(site, {
+              domain: site,
+              repoName: slug,
+              publishRoot: normRoot,
+            });
           }
         }
       }
@@ -306,22 +310,27 @@ export function findMatchingCompletedAudit(
 ): CompletedAuditMatch | null {
   const normalizedRoot = normalizeGitRelativePath(publishRoot || ".");
   const rosterSource: RosterSource | null =
-    typeof rosterSourceOrVersionId === "object" && rosterSourceOrVersionId !== null
+    typeof rosterSourceOrVersionId === "object" &&
+    rosterSourceOrVersionId !== null
       ? rosterSourceOrVersionId
       : null;
   const effectiveRosterId =
     rosterSource?.versionId ??
-    (typeof rosterSourceOrVersionId === "string" ? rosterSourceOrVersionId : null);
+    (typeof rosterSourceOrVersionId === "string"
+      ? rosterSourceOrVersionId
+      : null);
 
   const rosterSourceSql = rosterSource
-    ? `AND json_extract(a.config, '$.rosterSource.versionId') = ${sqlText(rosterSource.versionId)}
+    ? `AND json_valid(a.config)
+       AND json_extract(a.config, '$.rosterSource.versionId') = ${sqlText(rosterSource.versionId)}
        AND json_extract(a.config, '$.rosterSource.memberId') = ${sqlText(rosterSource.memberId)}
        AND json_extract(a.config, '$.rosterSource.projectId') = ${sqlText(rosterSource.projectId)}
        AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(${sqlText(rosterSource.canonicalHost)}))
        AND json_extract(a.config, '$.rosterSource.repoName') = ${sqlText(rosterSource.repoName)}
-       AND coalesce(json_extract(a.config, '$.rosterSource.publishRoot'), '.') = ${sqlText(normalizedRoot)}`
+       AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
+       AND json_extract(a.config, '$.rosterSource.publishRoot') = ${sqlText(normalizedRoot)}`
     : effectiveRosterId
-      ? `AND json_extract(a.config, '$.rosterSource.versionId') = ${sqlText(effectiveRosterId)}`
+      ? `AND json_valid(a.config) AND json_extract(a.config, '$.rosterSource.versionId') = ${sqlText(effectiveRosterId)}`
       : "";
 
   const tripleFilter = rosterSource
@@ -390,7 +399,8 @@ export function findMatchingCompletedAudit(
         rs.versionId !== rosterSource.versionId ||
         rs.memberId !== rosterSource.memberId ||
         rs.projectId !== rosterSource.projectId ||
-        rs.canonicalHost?.toLowerCase().trim() !== rosterSource.canonicalHost.toLowerCase().trim() ||
+        rs.canonicalHost?.toLowerCase().trim() !==
+          rosterSource.canonicalHost.toLowerCase().trim() ||
         rs.repoName !== rosterSource.repoName ||
         normalizeGitRelativePath(rs.publishRoot ?? ".") !== normalizedRoot
       ) {
@@ -414,7 +424,10 @@ export function findMatchingCompletedAudit(
 }
 
 function bareHost(host: string): string {
-  return host.toLowerCase().trim().replace(/^www\./, "");
+  return host
+    .toLowerCase()
+    .trim()
+    .replace(/^www\./, "");
 }
 
 function isAdmissibleInternalLink(
@@ -427,8 +440,7 @@ function isAdmissibleInternalLink(
       (target.protocol === "http:" || target.protocol === "https:") &&
       target.port === "";
     return (
-      defaultWebPort &&
-      bareHost(target.hostname) === bareHost(canonicalHost)
+      defaultWebPort && bareHost(target.hostname) === bareHost(canonicalHost)
     );
   } catch {
     return false;
@@ -992,16 +1004,22 @@ async function auditRepository(
       },
     ): string {
       const title = boundUtf8Bytes(p.title, limits.titleBytes, 500);
-      const metaDesc = boundUtf8Bytes(p.metaDescription, limits.descBytes, 1000);
-      const canonical = limits.canonicalBytes > 0
-        ? boundUtf8Bytes(p.canonicalUrl, limits.canonicalBytes, 2000)
-        : null;
+      const metaDesc = boundUtf8Bytes(
+        p.metaDescription,
+        limits.descBytes,
+        1000,
+      );
+      const canonical =
+        limits.canonicalBytes > 0
+          ? boundUtf8Bytes(p.canonicalUrl, limits.canonicalBytes, 2000)
+          : null;
       const robots = boundUtf8Bytes(p.robotsMeta, 200, 200);
       const ogTitle = boundUtf8Bytes(p.ogTitle, limits.ogTitleBytes, 500);
       const ogDesc = boundUtf8Bytes(p.ogDescription, limits.ogDescBytes, 1000);
-      const ogImage = limits.ogImageBytes > 0
-        ? boundUtf8Bytes(p.ogImage, limits.ogImageBytes, 2000)
-        : null;
+      const ogImage =
+        limits.ogImageBytes > 0
+          ? boundUtf8Bytes(p.ogImage, limits.ogImageBytes, 2000)
+          : null;
 
       return `
         INSERT INTO audit_pages (
@@ -1040,7 +1058,8 @@ async function auditRepository(
       // If statement or its JSON-serialized envelope exceeds budget, progressively scale down display/optional fields
       if (
         Buffer.byteLength(stmt, "utf8") > MAX_PAGE_SQL_BYTES ||
-        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") > MAX_PAGE_SQL_BYTES
+        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") >
+          MAX_PAGE_SQL_BYTES
       ) {
         // Step 1: drop optional ogImage and shrink ogDesc/ogTitle
         limits = {
@@ -1053,7 +1072,8 @@ async function auditRepository(
       }
       if (
         Buffer.byteLength(stmt, "utf8") > MAX_PAGE_SQL_BYTES ||
-        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") > MAX_PAGE_SQL_BYTES
+        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") >
+          MAX_PAGE_SQL_BYTES
       ) {
         // Step 2: drop optional canonicalUrl and shrink metaDesc/title
         limits = {
@@ -1066,7 +1086,8 @@ async function auditRepository(
       }
       if (
         Buffer.byteLength(stmt, "utf8") > MAX_PAGE_SQL_BYTES ||
-        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") > MAX_PAGE_SQL_BYTES
+        Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8") >
+          MAX_PAGE_SQL_BYTES
       ) {
         // Step 3: aggressive clamp to minimal display lengths
         limits = {
@@ -1081,7 +1102,10 @@ async function auditRepository(
       }
 
       const finalBytes = Buffer.byteLength(stmt, "utf8");
-      const envelopeBytes = Buffer.byteLength(JSON.stringify({ sql: stmt }), "utf8");
+      const envelopeBytes = Buffer.byteLength(
+        JSON.stringify({ sql: stmt }),
+        "utf8",
+      );
       if (finalBytes > MAX_PAGE_SQL_BYTES || envelopeBytes > 14_999) {
         throw new Error(
           `Page SQL statement for ${p.url} exceeds strict serialized budget (${finalBytes} raw bytes, ${envelopeBytes} envelope bytes). Ingestion halted.`,
@@ -1142,12 +1166,27 @@ async function auditRepository(
       );
     }
 
-    // Stage 4: Atomic compare-and-set flip to final status with child row count reconciliation and RETURNING assertion (Sol P1-01, P1-05)
+    // Stage 4: Atomic compare-and-set flip to final status with child row count reconciliation, error code attribution, and RETURNING assertion (Sol P1-01, P1-05, Round 21 F10)
+    const errorCode = !isComplete
+      ? attemptedCount < htmlFiles.length
+        ? "PAGE_BUDGET_REACHED"
+        : unreadCount > 0
+          ? "REPOSITORY_BLOB_UNREAD"
+          : isTreeTruncated
+            ? "TREE_TRUNCATED"
+            : "INCOMPLETE_INGESTION"
+      : null;
+    const errorDetail = errorCode
+      ? `Audit incomplete: ${errorCode} (processed ${processedCount} of ${htmlFiles.length} pages)`
+      : null;
+
     const casSql = `UPDATE audits
        SET status = ${sqlText(finalStatus)},
            current_phase = ${sqlText(finalStatus)},
            pages_crawled = ${processedCount},
            pages_total = ${htmlFiles.length},
+           error_code = ${errorCode ? sqlText(errorCode) : "NULL"},
+           error_detail = ${errorDetail ? sqlText(errorDetail) : "NULL"},
            completed_at = datetime('now')
        WHERE id = ${sqlText(auditId)}
          AND status = 'running'
@@ -1272,32 +1311,21 @@ async function auditRepository(
               : "failed";
           const nowIso = new Date().toISOString();
 
-          const diagnosticSql = [
-            `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-             VALUES (${sqlText(runId)}, ${sqlText(organization_id)}, ${sqlText(version_id)}, 'v1', 'manual', 'github-audit-runner', ${sqlText(runStatus)}, 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, ${sqlText(nowIso)}, ${sqlText(nowIso)})
-             ON CONFLICT(id) DO UPDATE SET status = ${sqlText(runStatus)}, completed_at = ${sqlText(nowIso)};`,
-            `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-             VALUES (${sqlText(runItemId)}, ${sqlText(runId)}, ${sqlText(member_id)}, ${sqlText(projectId)}, ${sqlText(auditId)}, 'diagnostic', ${sqlText(itemStatus)}, 1, ${sqlText(nowIso)}, ${sqlText(nowIso)})
-             ON CONFLICT(id) DO UPDATE SET status = ${sqlText(itemStatus)}, completed_at = ${sqlText(nowIso)};`,
-            `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-             VALUES (${sqlText(snapshotId)}, ${sqlText(runItemId)}, ${sqlText(member_id)}, ${sqlText(projectId)}, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(nowIso)})
-             ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(nowIso)};`,
-          ];
-          executeD1SqlStatements(diagnosticSql, isRemote);
-
-          // Verify exact triple persisted with full identities (Sol F02, F07)
-          const isVerified = verifyDiagnosticTriple(
-            runId,
-            runItemId,
-            snapshotId,
+          const isVerified = publishGuardedDiagnosticTriple(
             auditId,
-            organization_id,
-            version_id,
-            member_id,
             projectId,
             domain,
-            runStatus,
-            itemStatus,
+            member_id,
+            version_id,
+            organization_id,
+            {
+              score,
+              grade,
+              coverage,
+              isComplete,
+              processedCount,
+              observedAt: nowIso,
+            },
             isRemote,
           );
           if (!isVerified) {
@@ -1390,6 +1418,121 @@ function deterministicUuid(seed: string): string {
       .padStart(2, "0") + hash.slice(18, 20),
     hash.slice(20, 32),
   ].join("-");
+}
+
+// Sol Round 21 F02: Atomic guarded diagnostic publication joining eligible relations before write
+function publishGuardedDiagnosticTriple(
+  auditId: string,
+  projectId: string,
+  domain: string,
+  memberId: string,
+  versionId: string,
+  organizationId: string,
+  metrics: {
+    score: number;
+    grade: string;
+    coverage: number;
+    isComplete: boolean;
+    processedCount: number;
+    observedAt?: string;
+  },
+  isRemote = true,
+): boolean {
+  const { score, grade, coverage, isComplete, processedCount, observedAt } =
+    metrics;
+  const runId =
+    "run_" +
+    crypto
+      .createHash("sha256")
+      .update(`${auditId}:${versionId}:${memberId}:run`)
+      .digest("hex")
+      .slice(0, 16);
+  const runItemId =
+    "item_" +
+    crypto
+      .createHash("sha256")
+      .update(`${auditId}:${versionId}:${memberId}:item`)
+      .digest("hex")
+      .slice(0, 16);
+  const snapshotId =
+    "snap_" +
+    crypto
+      .createHash("sha256")
+      .update(`${auditId}:${versionId}:${memberId}:snap`)
+      .digest("hex")
+      .slice(0, 16);
+
+  const runStatus = isComplete ? "completed" : "partial";
+  const itemStatus = isComplete
+    ? "completed"
+    : processedCount > 0
+      ? "partial"
+      : "failed";
+  const nowIso = observedAt || new Date().toISOString();
+
+  const diagnosticSql = [
+    `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
+     SELECT ${sqlText(runId)}, v.organization_id, v.id, 'v1', 'manual', 'github-audit-runner', ${sqlText(runStatus)}, 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, ${sqlText(nowIso)}, ${sqlText(nowIso)}
+     FROM fleet_roster_versions v
+     WHERE v.id = ${sqlText(versionId)} AND v.organization_id = ${sqlText(organizationId)}
+     ON CONFLICT(id) DO UPDATE SET status = ${sqlText(runStatus)}, completed_at = ${sqlText(nowIso)};`,
+
+    `WITH eligible AS (
+       SELECT a.id, p.id AS project_id, m.id AS member_id, m.version_id
+       FROM audits a
+       JOIN projects p ON p.id = a.project_id AND p.archived_at IS NULL
+       JOIN fleet_roster_members m ON m.project_id = p.id AND m.id = ${sqlText(memberId)}
+       JOIN fleet_roster_versions v ON v.id = m.version_id
+       WHERE a.id = ${sqlText(auditId)} AND a.status = 'completed'
+         AND p.organization_id = ${sqlText(organizationId)} AND v.organization_id = ${sqlText(organizationId)}
+         AND m.enrollment_state = 'active' AND m.version_id = ${sqlText(versionId)}
+         AND lower(trim(p.domain)) = lower(trim(m.canonical_host))
+         AND json_valid(a.config)
+         AND json_extract(a.config, '$.source') = 'github_repository_direct'
+         AND json_extract(a.config, '$.repoName') = m.repo_name
+         AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
+         AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
+         AND json_extract(a.config, '$.rosterSource.versionId') = v.id
+         AND json_extract(a.config, '$.rosterSource.memberId') = m.id
+         AND json_extract(a.config, '$.rosterSource.projectId') = p.id
+         AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
+         AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
+     )
+     INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
+     SELECT ${sqlText(runItemId)}, ${sqlText(runId)}, member_id, project_id, id, 'diagnostic', ${sqlText(itemStatus)}, 1, ${sqlText(nowIso)}, ${sqlText(nowIso)}
+     FROM eligible
+     ON CONFLICT(id) DO UPDATE SET status = ${sqlText(itemStatus)}, completed_at = ${sqlText(nowIso)};`,
+
+    `WITH eligible_item AS (
+       SELECT fri.id AS run_item_id, fri.member_id, fri.project_id
+       FROM fleet_run_items fri
+       JOIN fleet_runs fr ON fr.id = fri.run_id
+       JOIN fleet_roster_members rm ON rm.id = fri.member_id AND rm.version_id = fr.roster_version_id
+       WHERE fri.id = ${sqlText(runItemId)}
+         AND fri.audit_id = ${sqlText(auditId)}
+         AND fri.status IN ('completed', 'partial')
+     )
+     INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
+     SELECT ${sqlText(snapshotId)}, run_item_id, member_id, project_id, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(nowIso)}
+     FROM eligible_item
+     ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(nowIso)};`,
+  ];
+
+  executeD1SqlStatements(diagnosticSql, isRemote);
+  return verifyDiagnosticTriple(
+    runId,
+    runItemId,
+    snapshotId,
+    auditId,
+    organizationId,
+    versionId,
+    memberId,
+    projectId,
+    domain,
+    runStatus,
+    itemStatus,
+    isRemote,
+  );
 }
 
 function verifyDiagnosticTriple(
@@ -1535,7 +1678,9 @@ function repairDiagnosticObservation(
         if (cfg.source !== "github_repository_direct") return false;
         if (cfg.repoName !== expectedSource.repoName) return false;
         const auditRoot = normalizeGitRelativePath(cfg.publishRoot || ".");
-        const expectedRoot = normalizeGitRelativePath(expectedSource.publishRoot || ".");
+        const expectedRoot = normalizeGitRelativePath(
+          expectedSource.publishRoot || ".",
+        );
         if (auditRoot !== expectedRoot) return false;
         if (!cfg.rosterSource) return false;
         const rs = cfg.rosterSource;
@@ -1543,7 +1688,8 @@ function repairDiagnosticObservation(
           rs.versionId !== expectedSource.versionId ||
           rs.memberId !== expectedSource.memberId ||
           rs.projectId !== expectedSource.projectId ||
-          rs.canonicalHost?.toLowerCase().trim() !== expectedSource.canonicalHost.toLowerCase().trim() ||
+          rs.canonicalHost?.toLowerCase().trim() !==
+            expectedSource.canonicalHost.toLowerCase().trim() ||
           rs.repoName !== expectedSource.repoName ||
           normalizeGitRelativePath(rs.publishRoot || ".") !== expectedRoot
         ) {
@@ -1574,32 +1720,21 @@ function repairDiagnosticObservation(
       Math.round((crawled / Math.max(1, total)) * 100 * 100) / 100;
     const observedAt = completed_at || new Date().toISOString();
 
-    const diagnosticSql = [
-      `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-       VALUES (${sqlText(runId)}, ${sqlText(organization_id)}, ${sqlText(version_id)}, 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, ${sqlText(observedAt)}, ${sqlText(observedAt)})
-       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = ${sqlText(observedAt)};`,
-      `INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-       VALUES (${sqlText(runItemId)}, ${sqlText(runId)}, ${sqlText(member_id)}, ${sqlText(projectId)}, ${sqlText(auditId)}, 'diagnostic', 'completed', 1, ${sqlText(observedAt)}, ${sqlText(observedAt)})
-       ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = ${sqlText(observedAt)};`,
-      `INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-       VALUES (${sqlText(snapshotId)}, ${sqlText(runItemId)}, ${sqlText(member_id)}, ${sqlText(projectId)}, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(observedAt)})
-       ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(observedAt)};`,
-    ];
-    executeD1SqlStatements(diagnosticSql, isRemote);
-
-    // Strict full exact triple verification (Sol F02, F07)
-    const isVerified = verifyDiagnosticTriple(
-      runId,
-      runItemId,
-      snapshotId,
+    const isVerified = publishGuardedDiagnosticTriple(
       auditId,
-      organization_id,
-      version_id,
-      member_id,
       projectId,
       domain,
-      "completed",
-      "completed",
+      member_id,
+      version_id,
+      organization_id,
+      {
+        score,
+        grade,
+        coverage,
+        isComplete: true,
+        processedCount: crawled,
+        observedAt,
+      },
       isRemote,
     );
     if (isVerified) {
@@ -1641,6 +1776,7 @@ async function main() {
       workspace: { type: "boolean", short: "w" },
       archive: { type: "boolean" },
       "max-pages": { type: "string", short: "m", default: "10000" },
+      "roster-id": { type: "string" },
       remote: { type: "boolean", default: true },
       local: { type: "boolean", default: false },
     },
@@ -1742,12 +1878,35 @@ async function main() {
     projectIdByDomain.set(dom, p.id);
   }
 
+  const rawRosterId = args.values["roster-id"];
+  const expectedRosterId = rawRosterId ? String(rawRosterId).trim() : undefined;
+  if (expectedRosterId !== undefined && expectedRosterId === "") {
+    console.error("[ERROR] --roster-id cannot be empty.");
+    process.exit(1);
+  }
+  if (expectedRosterId !== undefined && isWorkspace) {
+    console.error(
+      "[ERROR] Conflicting options: --workspace cannot be combined with --roster-id.",
+    );
+    process.exit(1);
+  }
+
   // Load effective approved roster for admission scoping (Sol F01)
   const allRosterVersions = runD1Query(
     `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';`,
     isRemote,
   );
   const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
+
+  if (expectedRosterId !== undefined) {
+    if (!effectiveRoster || effectiveRoster.id !== expectedRosterId) {
+      console.error(
+        `[ERROR] Planned roster '${expectedRosterId}' is no longer effective on the execution DB (effective is '${effectiveRoster?.id ?? "none"}').`,
+      );
+      process.exit(1);
+    }
+  }
+
   if (!isWorkspace && !effectiveRoster) {
     console.error(
       "[ERROR] No effective approved roster found for organization 'shared-workspace'. Pass --workspace to audit wider inventory or approve a roster.",
@@ -1797,7 +1956,9 @@ async function main() {
         projectId: activeProjId,
         canonicalHost: host,
         repoName: r.repo_name ? String(r.repo_name).trim() : null,
-        publishRoot: r.publish_root ? normalizeGitRelativePath(String(r.publish_root)) : ".",
+        publishRoot: r.publish_root
+          ? normalizeGitRelativePath(String(r.publish_root))
+          : ".",
       });
       approvedHosts.add(host);
     }
@@ -1831,7 +1992,10 @@ async function main() {
         );
         process.exit(1);
       }
-      if (!approvedMember.repoName || !isValidRepoSlug(approvedMember.repoName)) {
+      if (
+        !approvedMember.repoName ||
+        !isValidRepoSlug(approvedMember.repoName)
+      ) {
         console.error(
           `[ERROR] Domain '${targetDomain}' has no approved repository mapping in roster '${effectiveRoster?.id}'. Use edge mode or link an approved repository in the roster.`,
         );
@@ -1881,7 +2045,11 @@ async function main() {
 
     if (!force && matchingAudit) {
       const isRosterMember = approvedHosts.has(targetDomain);
-      if (isRosterMember && !matchingAudit.hasDiagnostic && expectedRosterSource) {
+      if (
+        isRosterMember &&
+        !matchingAudit.hasDiagnostic &&
+        expectedRosterSource
+      ) {
         plannedActions.push({
           kind: "repair",
           domain: targetDomain,
@@ -1928,7 +2096,10 @@ async function main() {
       let publishRoot = ".";
 
       if (!isWorkspace) {
-        if (!approvedMember?.repoName || !isValidRepoSlug(approvedMember.repoName)) {
+        if (
+          !approvedMember?.repoName ||
+          !isValidRepoSlug(approvedMember.repoName)
+        ) {
           // Unmapped member in approved roster: skip, do NOT plan action or substitute unapproved repo
           continue;
         }
@@ -1971,7 +2142,11 @@ async function main() {
 
           if (!force && matchingAudit) {
             const isRosterMember = approvedHosts.has(dom);
-            if (isRosterMember && !matchingAudit.hasDiagnostic && expectedRosterSource) {
+            if (
+              isRosterMember &&
+              !matchingAudit.hasDiagnostic &&
+              expectedRosterSource
+            ) {
               plannedActions.push({
                 kind: "repair",
                 domain: dom,

@@ -395,4 +395,16 @@ describe("Document effective base resolution & WHATWG semantics", () => {
     expect(res.links[0]?.targetUrl).toBe("https://example.com/catalog/first");
     expect(res.links[1]?.targetUrl).toBe("https://example.com/catalog/second");
   });
+
+  it("preserves title and links when script literal contains '<noscript>' tag (Sol Round 21 F07)", () => {
+    const html =
+      '<script>const marker = "<noscript>";</script>' +
+      '<base href="/docs/"><title>Main title</title><a href="guide">Guide</a>' +
+      "<noscript>Fallback</noscript>";
+    const page = analyzeHtml(html, "https://example.test/root", 200, 1);
+    expect(page.title).toBe("Main title");
+    expect(page.links.map((link) => link.targetUrl)).toEqual([
+      "https://example.test/docs/guide",
+    ]);
+  });
 });
