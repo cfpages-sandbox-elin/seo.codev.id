@@ -491,7 +491,7 @@ async function main() {
           `[DISPATCH] Launching audit on ${project.domain} (${startUrl}) [ID: ${auditId}]`,
         );
 
-        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits for the same project and requires unarchived project
+        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits for the same project and asserts current effective roster & unarchived project (Sol Round 24 P1-03)
         const insertSql = `
           INSERT INTO audits (
             id, project_id, started_by_user_id, start_url,
@@ -508,8 +508,31 @@ async function main() {
           )
           AND EXISTS (
             SELECT 1 FROM projects
-            WHERE id = ${sqlText(project.id)} AND archived_at IS NULL
-          );
+            WHERE id = ${sqlText(project.id)}
+              AND archived_at IS NULL
+              AND organization_id = 'shared-workspace'
+              AND lower(trim(domain)) = ${sqlText(cleanHost)}
+          )
+          ${
+            rosterId
+              ? `AND EXISTS (
+                   SELECT 1 FROM fleet_roster_members rm
+                   JOIN fleet_roster_versions rv ON rv.id = rm.version_id
+                   WHERE rm.project_id = ${sqlText(project.id)}
+                     AND rm.version_id = ${sqlText(rosterId)}
+                     AND rm.enrollment_state = 'active'
+                     AND lower(trim(rm.canonical_host)) = ${sqlText(cleanHost)}
+                     AND rv.id = (
+                       SELECT id FROM fleet_roster_versions
+                       WHERE organization_id = 'shared-workspace'
+                         AND approved_at IS NOT NULL
+                         AND julianday(approved_at) <= julianday('now')
+                       ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
+                       LIMIT 1
+                     )
+                 )`
+              : ""
+          };
         `;
         runD1Query(insertSql, isRemote);
 
@@ -519,7 +542,7 @@ async function main() {
         );
         if (!reserved || reserved.length === 0) {
           console.warn(
-            `[SKIP] Project ${project.domain} (${project.id}) already has an active running edge audit. Skipping concurrent dispatch.`,
+            `[SKIP] Project ${project.domain} (${project.id}) already has an active running edge audit or roster binding superseded. Skipping concurrent dispatch.`,
           );
           skippedBusyCount++;
           continue;

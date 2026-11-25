@@ -142,12 +142,12 @@ type WatchdogCursor = {
 
 let sweepCursor: WatchdogCursor = null;
 
-export type LoadedCursorState =
+type LoadedCursorState =
   | { kind: "persisted"; cursor: WatchdogCursor; revision: number }
   | { kind: "absent"; cursor: null; revision: null }
   | { kind: "read_error"; cursor: null; revision: null };
 
-export async function loadPersistedCursor(): Promise<LoadedCursorState> {
+async function loadPersistedCursor(): Promise<LoadedCursorState> {
   try {
     const row = await db.query.watchdogCursor.findFirst({
       where: eq(watchdogCursor.id, "singleton"),
@@ -169,9 +169,9 @@ export async function loadPersistedCursor(): Promise<LoadedCursorState> {
   }
 }
 
-export type CursorSaveResult = "applied" | "conflict" | "error";
+type CursorSaveResult = "applied" | "conflict" | "error";
 
-export async function savePersistedCursor(
+async function savePersistedCursor(
   cursor: WatchdogCursor,
   expectedRevision?: number | null,
 ): Promise<CursorSaveResult> {

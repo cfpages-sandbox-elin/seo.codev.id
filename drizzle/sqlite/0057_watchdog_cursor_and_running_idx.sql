@@ -8,6 +8,7 @@ CREATE TABLE IF NOT EXISTS `watchdog_cursor` (
 --> statement-breakpoint
 UPDATE `audits`
 SET `status` = 'failed',
+    `current_phase` = 'failed',
     `error_code` = 'MIGRATION_CONCURRENCY_RECONCILED',
     `completed_at` = COALESCE(`completed_at`, CURRENT_TIMESTAMP)
 WHERE `status` = 'running'
@@ -19,7 +20,10 @@ WHERE `status` = 'running'
         SELECT 1 FROM `audits` a2
         WHERE a2.`project_id` = a1.`project_id`
           AND a2.`status` = 'running'
-          AND (a2.`started_at` > a1.`started_at` OR (a2.`started_at` = a1.`started_at` AND a2.`id` > a1.`id`))
+          AND (
+            julianday(a2.`started_at`) > julianday(a1.`started_at`)
+            OR (julianday(a2.`started_at`) = julianday(a1.`started_at`) AND a2.`id` > a1.`id`)
+          )
       )
   );
 --> statement-breakpoint

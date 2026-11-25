@@ -22,7 +22,7 @@ import {
  */
 const LIGHTHOUSE_URL_CONCURRENCY = 5;
 
-export type LighthousePhaseParams = {
+type LighthousePhaseParams = {
   auditId: string;
   workflowInstanceId: string;
   billingCustomer: BillingCustomerContext;

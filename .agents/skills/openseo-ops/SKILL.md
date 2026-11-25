@@ -76,10 +76,10 @@ unmapped → exempt → unavailable → terminal partial (fresh_partial or stale
 1. `Unmapped`: Domain exists in `fleet_roster_members`, but `project_id` is NULL.
 2. `Exempt`: Intentionally excluded from automated fleet crawls (e.g. Tier 4 parked domains).
 3. `Unavailable`: Latest attempt failed, crashed, errored, or finalized without an admitted observation snapshot (`status: "unavailable"`). Displays score `—` (distinguished from measured 0%).
-4. `Terminal Partial`: Audit completed with partial evidence coverage between $80\%$ and $<100\%$, displayed as provisional interval $[L, U]$ when reconciled bounds exist from admitted observation evidence.
+4. `Terminal Partial`: Audit completed with partial evidence coverage ($C < 100\%$). A provisional interval $[L, U]$ is rendered if and only if reconciled evidence coverage satisfies $80\% \le C < 100\%$ with validated earned mass $L$ ($U = L + 100 - C$, subject to a confirmed critical incident cap of 59).
 5. `Never Audited`: Linked to an active project in `projects`, but no completed audit attempt exists.
 6. `Stale`: Previous audit completed, but results exceed the 10-day TTL freshness window.
-7. `Graded`: Audit completed with 100% evidence coverage within the 10-day TTL window (or provisional when partial coverage reconciles).
+7. `Graded`: Audit completed with 100% qualified evidence coverage within the 10-day TTL window. Full point scores require exactly $C = 100\%$ qualified evidence.
 
 **Interval Display Contract**: Provisional interval $[L, U]$ is a rendering presentation rule displayed if and only if:
 1. Reconciled evidence coverage satisfies $80\% \le C < 100\%$.
@@ -121,13 +121,24 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **Zero Edge Heap Pressure**: HTML parsing, heading extraction, meta tag inspection, and OpenGraph analysis execute host-side in Node.js, completely bypassing Cloudflare Workers Free Tier 128 MB isolate memory ceiling.
 - **In-Memory Link Graph Validation**: Maps repository file paths to canonical served identities (including directory `/index.html` $\leftrightarrow$ `/index.htm` $\leftrightarrow$ `/` and extensionless routes). Resolves internal `<a href="...">` links against the known route set using unified route indexing and domain host equivalence (supporting HTTP/HTTPS and apex/www pairs on default ports 80/443) to detect broken links and orphan pages with zero network calls.
 - **Staged D1 Persistence**:
-  1. Inserts parent audit in `running` phase with `github-audit-${auditId}` instance ID via atomic conditional insert that prevents concurrent double-reservation and auto-reclaims stale orphaned runs (> 2h old).
+  1. Inserts parent audit in `running` phase with `github-audit-${auditId}` instance ID via atomic conditional insert that prevents concurrent double-reservation. Note: The repository runner includes a 2-hour pre-reservation cleanup (`run-github-fleet-audit.ts:641–646`) to reclaim abandoned runs for the project, and the background watchdog reconciler (`auditReconciler.ts:52–71`) periodically reclaims abandoned repository audits across the whole database.
   2. Ingests pages and issues in bounded $\le 9$-statement chunks ($\le 14,999$ UTF-8 bytes total per serialized batch envelope, strictly respecting Windows CreateProcessW 30,000 character limits). Binds string fields to safe character limits and serialized byte limits ($\le 10,000$ bytes per page statement) and detailsJson to bounded UTF-8 bytes (max 3,499) preserving valid structured JSON.
   3. Guards child writes so that `audit_pages` and `audit_issues` only insert when the parent audit is `status = 'running'`, and validates that issue `page_id` references belong to the same attempt.
   4. Verifies child row count integrity and asserts zero orphaned page references before the final atomic compare-and-set UPDATE with `RETURNING id`.
-  5. On count mismatch, invalid child references, or state conflict, throws immediately. Incomplete source acquisition or interrupted storage ends with audit status `failed`; intentional capped input (e.g. `--max-pages`) completes with `status = 'completed'` up to the requested budget. Diagnostic fleet item publication and reused audits strictly require parent `status = 'completed'` and item `status = 'completed'`.
+  5. On count mismatch, invalid child references, or state conflict, throws immediately. Incomplete source acquisition, interrupted storage, or page budget limits (e.g. hitting `--max-pages`) persists with audit status `failed` and current phase `failed` with error code `PAGE_BUDGET_REACHED`. Diagnostic fleet item publication and audit reuse strictly require parent audit status `completed` and `pages_crawled >= pages_total`, so budget-limited audits are explicitly skipped from diagnostic fleet series publication.
 - **Diagnostic Fleet Series Integration**: Writes `fleet_runs` (`requester_id = 'github-audit-runner'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`), and `fleet_snapshots` (`series_key = 'diagnostic'`, unmeasured pillars `NULL`). Reused audits strictly verify the exact triple (`r.status = 'completed'`, `fri.status = 'completed'`, matching `project_id`, matching `member_id`, and exactly 1 verified diagnostic attempt per member) bound to the effective roster version; repair failures abort without falling back to a redundant Git crawl.
 - **Evidence Boundary**: Records source-only evidence. Unmeasured runtime properties (`status_code`, `response_time_ms`, `crawl_depth`) remain `NULL` and `in_sitemap` is `0`. Runtime-only issue reporters (`deep-page`, `slow-response`) are excluded.
+
+### Runner Scope, Concurrency & Defaults Reference
+| Runner | Default Pages | Max Pages | Concurrency | Scope Flags | Operational Availability |
+|---|---|---|---|---|---|
+| **Edge HTTP Runner** (`scripts/run-fleet-audits.ts`) | 500 | 10,000 | 2 (1–5) | Exactly one of `--domain`, `--all`, or `--limit`; optional `--roster-id` | Shipped live production crawler |
+| **Repository Direct Runner** (`scripts/run-github-fleet-audit.ts`) | 10,000 | 10,000 | Host-side paced | Optional `--domain`, `--limit`, `--workspace` | Shipped diagnostic source audit |
+| **Weekly Fleet Baseline Publisher** | N/A | N/A | Scheduled | Fleet-wide | External scheduled service consuming `fleetCalculations.ts` contracts |
+
+**Database Migration & Cutover Runbooks**:
+- Simple D1 to PostgreSQL Migration: [d1-to-postgres-simple.md](file:///C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/docs/maintainers/runbooks/d1-to-postgres-simple.md)
+- Detailed Cutover & Reversion Guide: [d1-to-postgres-detailed.md](file:///C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/docs/maintainers/runbooks/d1-to-postgres-detailed.md)
 
 ### Lane 2: Edge HTTP Workflow Crawler (`SiteAuditWorkflow`) — Live Runtime & Fleet Grading Lane
 - **Purpose**: Full live HTTP validation, external third-party crawls, robots.txt enforcement, and real edge TTFB latency measurement. (Note: neither `run-fleet-audits.ts` nor `run_site_audit` publishes official weekly fleet snapshots; official weekly baseline grading is reserved for dedicated aggregate grading publishers).
@@ -145,7 +156,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **Three-Role Execution Topology**:
   - **Role 1 (App HTTP / MCP)**: Vite dev server on port `3001` (`pnpm run dev`) or app Wrangler dev serving UI routes and `/mcp`.
   - **Role 2 (Auxiliary Audit Worker)**: Auxiliary worker on port `8787` (`pnpm exec wrangler dev --config wrangler.audit.jsonc --local --port 8787`) managing Cloudflare Workflows and the local Workflows control API. Note that the auxiliary worker returns 404 for general HTTP fetches; its sole purpose is workflow execution.
-  - **Role 3 (Direct Host CLI)**: Local and remote CLI execution against D1 via Wrangler (`--local` or `--remote`), sharing the local persistence root at `.wrangler/state/v3/d1`. Note environment precedence: `.env.selfhost` overlays local process environment, with populated values winning over default configuration files. Ambient `gh api` uses ambient GitHub CLI authentication, while the repository runner's raw download fallback inspects `GITHUB_TOKEN` and `GH_TOKEN`.
+  - **Role 3 (Direct Host CLI)**: Local and remote CLI execution against D1 via Wrangler (`--local` or `--remote`), sharing the local persistence root at `.wrangler/state/v3/d1`. Note environment precedence: `.env.selfhost` overlays local process environment, with populated values winning over default configuration files. Ambient `gh api` uses ambient GitHub CLI credentials (including Windows Credential Manager or ambient `GH_TOKEN`), while the repository runner's raw archive download fallback calls `gh auth token` first and directly inspects `process.env.GITHUB_TOKEN`.
 - **Cloudflare Access Two-Stage Authentication**: Edge access is governed by the Cloudflare Access session cookie at the public edge boundary, while the worker validates the signed `Cf-Access-Jwt-Assertion` header, mapping verified identity to user records before enforcing organization authorization.
 - **Approval Protocol**: Approval JSON requires canonical schema fields: `organizationId`, `versionTag`, `rosterPlanSha256`, `approvedBy`, and optional `approvedAt` (ISO timestamp).
 - **Importer Semantics**: Importer execution (`import-fleet-roster.ts`) has local-only semantics (runs against local D1 `DB`). To compute the canonical roster plan SHA-256 for the approval file without mutating D1:
@@ -596,8 +607,8 @@ try {
   1. Query metrics: `get_search_console_performance({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", startDate: "2026-10-01", endDate: "2026-11-20", dimensions: ["query", "page"] })`.
   2. Inspect index status: `inspect_urls({ projectId: "b2a5c4e1-7d3f-4e9b-8c1a-5f6e7d8c9a0b", urls: ["https://kaca.co.id/produk/"] })`.
 
-### Playbook 6D: Google Analytics 4 Organic Overview (`/ga4-overview`)
-- **UI Route**: `/p/:projectId/settings/integrations#google-analytics`
+### Playbook 6D: Google Analytics 4 Organic Acquisition (`get_google_analytics_organic_overview`)
+- **UI Route**: Dashboard card (`Ga4Card.tsx`) and Settings Integrations tab (`/p/:projectId/settings/integrations#google-analytics`). (Note: GA4 acquisition data is surfaced via the dashboard card; there is no standalone `/ga4-overview` page route).
 - **MCP Tools**: `get_google_analytics_organic_overview`
 - **Prerequisite**: GA4 property ID bound (`properties/<id>`).
 - **Workflow**:
@@ -829,8 +840,8 @@ try {
 > [!NOTE]
 > **Resolution & Deletion Invariants**: `resolveAudit` reads an explicit project-bound ID or the project's latest attempt regardless of status, ordered deterministically by `julianday(started_at) DESC, id DESC` on SQLite/D1 and `started_at DESC, id DESC` on PostgreSQL. Direct repository source pages store HTTP status as NULL, so filtering `get_audit_pages` by `statusCode: 200` excludes direct repository pages. `delete_site_audit` cancels running edge Workflows when a workflow instance handle is available in Cloudflare Workflows; direct repository audits run out-of-band with synthetic marker `github-audit-*` and are deleted directly without contacting Cloudflare Workflows. A running row with a null instance ID cannot be cancelled via Workflows.
 > **Authentication & Watchdog Invariants**:
-> - **Authentication Lanes**: Public self-hosted MCP uses Cloudflare Access session cookie → Access edge → signed origin assertion (validating issuer, audience, subject, and email claims). Git discovery uses ambient `gh` CLI identity; raw/blob archive requests call `gh auth token` first, falling back to `process.env.GITHUB_TOKEN` directly.
-> - **Attempt Expiration vs Reservation**: The 2-hour TTL for abandoned repository audits is enforced exclusively by the background watchdog reconciler (`auditReconciler.ts`), not by the CLI reservation phase. Reservation asserts no other currently running attempt exists for the project on the target DB.
+> - **Authentication Lanes**: Public self-hosted MCP uses Cloudflare Access session cookie → Access edge → signed origin assertion (validating issuer, audience, subject, and email claims). Git discovery uses ambient `gh` CLI credentials (including Windows Credential Manager or ambient `GH_TOKEN`); raw archive downloads call `gh auth token` first, falling back to `process.env.GITHUB_TOKEN` directly.
+> - **Attempt Expiration vs Reservation**: Abandoned repository audits running longer than 2 hours are reclaimed both by the CLI runner pre-reservation pass (`run-github-fleet-audit.ts:641–646`) and by the background watchdog reconciler (`auditReconciler.ts:52–71`). Reservation asserts no other currently running attempt exists for the project on the target DB.
 > **Crawler Access Credentials**: When a project requires authentication or custom request headers, configure crawler credentials (such as Shopify storefront password or basic auth) in the UI under Settings → Crawler Access. Once saved, invoking `run_site_audit` automatically looks up and attaches any valid, unexpired credentials configured for the target start host via `AuditService.startAudit`, passing sealed access to the Workflow. The edge fleet CLI (`run-fleet-audits.ts`) passes `access: null` by default.
 
 ### Playbook 7: Fleet Operations, Matrix Inspection, and Repository Linking (`link_fleet_repository`, `get_fleet_matrix`, `run_fleet_audit`, `get_fleet_issues`)
@@ -857,7 +868,7 @@ try {
   2. Link or update approved repository mapping in effective roster:
      Note: `link-github-fleet.ts` binds projects to roster members, whereas `link_fleet_repository` updates the approved GitHub repository mapping and publish root for a member in the approved roster.
      Omitting `publishRoot` preserves the current directory mapping; pass `.` to explicitly reset to the repository root.
-     Passing `expectedRosterId` guards against concurrent roster supersession:
+     The write asserts that the target roster version remains the currently effective approved roster in the database at write time, and supports optional `expectedRosterId` for explicit optimistic concurrency:
      ```ts
      await client.callTool({
        name: "link_fleet_repository",
@@ -1001,7 +1012,7 @@ ightarrow$ triage via `get_fleet_issues` with sovereign skill routing. |
 - `get_fleet_issues`: Query aggregated technical SEO issues across the entire enrolled fleet (`domain` [canonical host, optional], `severity` [`"critical"` | `"warning"` | `"info"`, optional], `issueType` [optional], `source` [`"all"` | `"edge"` | `"repository"` | `"both"`, default `"all"`], `limit` [1–200, default 50]).
 - `run_fleet_audit`: Generate execution plan for fleet-wide audits across enrolled properties (requires exactly one selector: `domain`, `limit` [1–100], or `all: true`; `mode` [`"repository_direct"` | `"edge_workflow"`, default `"repository_direct"`], `maxPages` [10–10,000, default 2000], `concurrency` [1–5, default 2, emitted only in edge_workflow mode]; requires shared-workspace and approved roster; validates repo slug and publish root; emitted CLI targets D1 by default).
 - `get_fleet_matrix`: Retrieve the complete 87-domain OpenSEO fleet overview matrix, including per-pillar health scores, grades, dispositions, and comparison metrics across all enrolled properties (`domain` [canonical host, optional]).
-- `link_fleet_repository`: Link or update the approved GitHub repository mapping and publish root for an enrolled fleet roster member in OpenSEO (`domain` [canonical host, required], `repoName` [owner/repo slug, required], `publishRoot` [optional relative root, default `.` ], `expectedRosterId` [optional effective roster version ID]).
+- `link_fleet_repository`: Link or update the approved GitHub repository mapping and publish root for an enrolled fleet roster member in OpenSEO (`domain` [canonical host, required], `repoName` [owner/repo slug, required], `publishRoot` [optional relative root, omitted preserves current root, `.` sets repo root], `expectedRosterId` [optional effective roster version ID]).
 
 ### Family 8: Reports, Templates & Backlinks (10 tools)
 - `list_report_templates`: List available executive report templates (`projectId`).

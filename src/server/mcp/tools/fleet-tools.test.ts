@@ -35,6 +35,8 @@ vi.mock("@/db", () => {
             enrollmentState: "active",
             projectId: "proj_1",
             repoName: "cfpages-syamsulalam-net/kaca-co-id",
+            publishRoot: ".",
+            versionId: "roster_v1",
           },
         ];
       }
@@ -79,6 +81,20 @@ vi.mock("@/db", () => {
     db: {
       select: () => ({
         from: () => dummyChain,
+      }),
+      update: () => ({
+        set: (vals: Record<string, unknown>) => ({
+          where: () => ({
+            returning: () => [
+              {
+                id: "member_1",
+                repoName: vals.repoName ?? "cfpages-syamsulalam-net/kaca-co-id",
+                publishRoot: vals.publishRoot ?? "dist",
+                versionId: "roster_v1",
+              },
+            ],
+          }),
+        }),
       }),
     },
   };
@@ -289,6 +305,33 @@ describe("Fleet MCP Tools", () => {
           toolContext,
         ),
       ).rejects.toThrow(/Invalid canonical hostname/);
+    });
+
+    it("successfully links repository mapping in effective roster (Sol Round 24 P1-02)", async () => {
+      const res = await linkFleetRepositoryTool.handler(
+        {
+          domain: "kaca.co.id",
+          repoName: "cfpages-syamsulalam-net/kaca-co-id",
+          publishRoot: "dist",
+        },
+        toolContext,
+      );
+      expect(res.structuredContent).toBeDefined();
+      expect(res.structuredContent.status).toBe("linked");
+      expect(res.structuredContent.publishRoot).toBe("dist");
+    });
+
+    it("returns unchanged when mapping matches active member in effective roster (Sol Round 24 P1-02)", async () => {
+      const res = await linkFleetRepositoryTool.handler(
+        {
+          domain: "kaca.co.id",
+          repoName: "cfpages-syamsulalam-net/kaca-co-id",
+        },
+        toolContext,
+      );
+      expect(res.structuredContent).toBeDefined();
+      expect(res.structuredContent.status).toBe("unchanged");
+      expect(res.structuredContent.publishRoot).toBe(".");
     });
   });
 

@@ -8,8 +8,12 @@ CREATE TABLE IF NOT EXISTS "watchdog_cursor" (
 --> statement-breakpoint
 UPDATE "audits"
 SET "status" = 'failed',
+    "current_phase" = 'failed',
     "error_code" = 'MIGRATION_CONCURRENCY_RECONCILED',
-    "completed_at" = COALESCE("completed_at", CURRENT_TIMESTAMP)
+    "completed_at" = COALESCE(
+      "completed_at",
+      to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
+    )
 WHERE "status" = 'running'
   AND "id" NOT IN (
     SELECT a1."id"
@@ -19,7 +23,15 @@ WHERE "status" = 'running'
         SELECT 1 FROM "audits" a2
         WHERE a2."project_id" = a1."project_id"
           AND a2."status" = 'running'
-          AND (a2."started_at" > a1."started_at" OR (a2."started_at" = a1."started_at" AND a2."id" > a1."id"))
+          AND (
+            (CASE WHEN pg_input_is_valid(a2."started_at", 'timestamptz') THEN a2."started_at"::timestamptz END >
+             CASE WHEN pg_input_is_valid(a1."started_at", 'timestamptz') THEN a1."started_at"::timestamptz END)
+            OR (
+              (CASE WHEN pg_input_is_valid(a2."started_at", 'timestamptz') THEN a2."started_at"::timestamptz END =
+               CASE WHEN pg_input_is_valid(a1."started_at", 'timestamptz') THEN a1."started_at"::timestamptz END)
+              AND a2."id" > a1."id"
+            )
+          )
       )
   );
 --> statement-breakpoint

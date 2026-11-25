@@ -6,7 +6,7 @@
  */
 import manifestData from "./fleetManifest.json";
 
-export interface FleetManifestMember {
+interface FleetManifestMember {
   canonicalHost: string;
   category: string;
   categoryEmoji: string;

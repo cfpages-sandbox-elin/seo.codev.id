@@ -18,12 +18,19 @@ import {
   executeD1SqlBatches,
 } from "./github-archive-utils";
 
-const MANIFEST_PATH = resolve("src/server/features/fleet/data/fleetManifest.json");
-const GITHUB_EVIDENCE_PATH = resolve("C:/Users/THINKPAD/OneDrive/MD/PORTFOLIO/EVIDENCE/PROJECTS_GITHUB.md");
+const MANIFEST_PATH = resolve(
+  "src/server/features/fleet/data/fleetManifest.json",
+);
+const GITHUB_EVIDENCE_PATH = resolve(
+  "C:/Users/THINKPAD/OneDrive/MD/PORTFOLIO/EVIDENCE/PROJECTS_GITHUB.md",
+);
 const ENV_FILE = resolve(".env.selfhost");
 
 function loadEnv(): Record<string, string> {
-  const env: Record<string, string> = { ...process.env } as Record<string, string>;
+  const env: Record<string, string> = { ...process.env } as Record<
+    string,
+    string
+  >;
   try {
     const content = readFileSync(ENV_FILE, "utf8");
     for (const rawLine of content.split(/\r?\n/)) {
@@ -31,7 +38,10 @@ function loadEnv(): Record<string, string> {
       const eqIdx = line.indexOf("=");
       if (eqIdx > 0 && !line.startsWith("#")) {
         const key = line.slice(0, eqIdx).trim();
-        const val = line.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, "");
+        const val = line
+          .slice(eqIdx + 1)
+          .trim()
+          .replace(/^['"]|['"]$/g, "");
         env[key] = val;
       }
     }
@@ -104,12 +114,16 @@ export async function linkFleet(options: {
 
   // Sol P2-05: Validate organization ID against injection
   if (!/^[a-zA-Z0-9_-]+$/.test(orgId)) {
-    throw new Error(`Invalid organization ID '${orgId}'. Must contain only alphanumeric, dash, or underscore characters.`);
+    throw new Error(
+      `Invalid organization ID '${orgId}'. Must contain only alphanumeric, dash, or underscore characters.`,
+    );
   }
 
   console.log(`\n=== OpenSEO Fleet Linking Runner (FLEET-SYNC-01) ===`);
   console.log(`Target: ${isRemote ? "Cloudflare D1 (Remote)" : "Local D1"}`);
-  console.log(`Mode: ${isDryRun ? "DRY RUN (Preview Only)" : "LIVE EXECUTION"}`);
+  console.log(
+    `Mode: ${isDryRun ? "DRY RUN (Preview Only)" : "LIVE EXECUTION"}`,
+  );
   console.log(`Organization ID: ${orgId}`);
 
   // 1. Read manifest & portfolio evidence
@@ -121,7 +135,9 @@ export async function linkFleet(options: {
     const ghRaw = readFileSync(GITHUB_EVIDENCE_PATH, "utf8");
     ghLines = ghRaw.split("\n");
   } catch {
-    console.warn(`[WARN] Could not read ${GITHUB_EVIDENCE_PATH}, proceeding with manifest members only.`);
+    console.warn(
+      `[WARN] Could not read ${GITHUB_EVIDENCE_PATH}, proceeding with manifest members only.`,
+    );
   }
 
   const targetMap = new Map<
@@ -165,7 +181,9 @@ export async function linkFleet(options: {
     }
   }
 
-  console.log(`Discovered ${targetMap.size} unique eligible portfolio targets (87 manifest + external active repos).`);
+  console.log(
+    `Discovered ${targetMap.size} unique eligible portfolio targets (87 manifest + external active repos).`,
+  );
 
   // 2. Query existing state from D1
   let existingProjects: any[] = [];
@@ -184,7 +202,9 @@ export async function linkFleet(options: {
     );
     approvedRoster = selectEffectiveRosterVersion(rosterVersions);
     if (!approvedRoster) {
-      throw new Error(`No effective approved roster version found for organization '${orgId}'.`);
+      throw new Error(
+        `No effective approved roster version found for organization '${orgId}'.`,
+      );
     }
 
     // Scoped strictly to the approved roster version to prevent mutating historical or foreign versions (P1-1)
@@ -198,18 +218,34 @@ export async function linkFleet(options: {
   }
 
   const existingProjectDomainMap = new Map<string, string>();
+  const duplicateCandidates = new Set<string>();
   for (const p of existingProjects) {
     if (p.domain) {
-      existingProjectDomainMap.set(p.domain.toLowerCase().trim(), p.id);
+      const normHost = p.domain.toLowerCase().trim();
+      if (existingProjectDomainMap.has(normHost)) {
+        duplicateCandidates.add(normHost);
+      } else {
+        existingProjectDomainMap.set(normHost, p.id);
+      }
     }
+  }
+  if (duplicateCandidates.size > 0) {
+    throw new Error(
+      `Ambiguous project candidates: duplicate active projects found in organization '${orgId}' for domain(s): ${Array.from(duplicateCandidates).join(", ")}. Resolve ambiguity before linking.`,
+    );
   }
 
   console.log(`Found ${existingProjects.length} existing projects in D1.`);
-  console.log(`Found ${existingMembers.length} fleet roster members in approved roster ${approvedRoster.id}.`);
-  console.log(`Active Approved Roster Version: ${approvedRoster.version_tag} (${approvedRoster.id})`);
+  console.log(
+    `Found ${existingMembers.length} fleet roster members in approved roster ${approvedRoster.id}.`,
+  );
+  console.log(
+    `Active Approved Roster Version: ${approvedRoster.version_tag} (${approvedRoster.id})`,
+  );
 
   // 3. Determine missing projects and link updates
-  const missingProjects: Array<{ id: string; domain: string; name: string }> = [];
+  const missingProjects: Array<{ id: string; domain: string; name: string }> =
+    [];
   for (const [domain, meta] of targetMap.entries()) {
     if (!existingProjectDomainMap.has(domain)) {
       const id = crypto.randomUUID(); // Standard UUID convention (P1-1)
@@ -218,7 +254,11 @@ export async function linkFleet(options: {
     }
   }
 
-  const membersToLink: Array<{ memberId: string; host: string; projectId: string }> = [];
+  const membersToLink: Array<{
+    memberId: string;
+    host: string;
+    projectId: string;
+  }> = [];
   for (const m of existingMembers) {
     const host = m.canonical_host.toLowerCase().trim();
     const currentProjectId = m.project_id;
@@ -229,10 +269,14 @@ export async function linkFleet(options: {
     }
   }
 
-  const alreadyLinkedCount = existingMembers.filter((m) => m.project_id !== null).length;
+  const alreadyLinkedCount = existingMembers.filter(
+    (m) => m.project_id !== null,
+  ).length;
   const linkableCount = membersToLink.length;
   const unmappedCount = existingMembers.filter(
-    (m) => m.project_id === null && !existingProjectDomainMap.has(m.canonical_host.toLowerCase().trim())
+    (m) =>
+      m.project_id === null &&
+      !existingProjectDomainMap.has(m.canonical_host.toLowerCase().trim()),
   ).length;
 
   console.log(`\nReconciliation Summary:`);
@@ -245,7 +289,7 @@ export async function linkFleet(options: {
   const totalPartition = alreadyLinkedCount + linkableCount + unmappedCount;
   if (totalPartition !== existingMembers.length) {
     throw new Error(
-      `Reconciliation partition mismatch: partitioned ${totalPartition} members vs ${existingMembers.length} total members in approved roster.`
+      `Reconciliation partition mismatch: partitioned ${totalPartition} members vs ${existingMembers.length} total members in approved roster.`,
     );
   }
 
@@ -253,13 +297,25 @@ export async function linkFleet(options: {
     console.log(`\n[DRY RUN] Actions preview:`);
     if (missingProjects.length > 0) {
       console.log(`Sample missing projects to insert (first 5):`);
-      missingProjects.slice(0, 5).forEach((p) => console.log(`  + [${p.domain}] -> ${p.name} (id: ${p.id})`));
+      missingProjects
+        .slice(0, 5)
+        .forEach((p) =>
+          console.log(`  + [${p.domain}] -> ${p.name} (id: ${p.id})`),
+        );
     }
     if (membersToLink.length > 0) {
       console.log(`Sample roster member links (first 5):`);
-      membersToLink.slice(0, 5).forEach((m) => console.log(`  -> ${m.host} (member: ${m.memberId}) => project: ${m.projectId}`));
+      membersToLink
+        .slice(0, 5)
+        .forEach((m) =>
+          console.log(
+            `  -> ${m.host} (member: ${m.memberId}) => project: ${m.projectId}`,
+          ),
+        );
     }
-    console.log(`\nDry run completed cleanly. Run without --dry-run to apply changes.`);
+    console.log(
+      `\nDry run completed cleanly. Run without --dry-run to apply changes.`,
+    );
     return;
   }
 
@@ -269,14 +325,30 @@ export async function linkFleet(options: {
   for (const p of missingProjects) {
     const escapedName = p.name.replace(/'/g, "''");
     const escapedDomain = p.domain.replace(/'/g, "''");
-    // Atomic insert with duplicate prevention to avoid race conditions (Sol P1-07)
+    // Atomic insert with duplicate prevention and effective approved roster assertion (Sol Round 24 P1-05)
     sqlStatements.push(
       `INSERT INTO projects (id, organization_id, name, domain, location_code, language_code, created_at)
        SELECT '${p.id}', '${orgId}', '${escapedName}', '${escapedDomain}', 2360, 'id', CURRENT_TIMESTAMP
        WHERE NOT EXISTS (
          SELECT 1 FROM projects
          WHERE organization_id = '${orgId}' AND lower(trim(domain)) = '${escapedDomain}' AND archived_at IS NULL
-       );`
+       )
+       AND EXISTS (
+         SELECT 1 FROM fleet_roster_members rm
+         JOIN fleet_roster_versions v ON v.id = rm.version_id
+         WHERE v.id = '${approvedRoster.id}'
+           AND v.organization_id = '${orgId}'
+           AND rm.canonical_host = '${escapedDomain}'
+           AND rm.enrollment_state = 'active'
+           AND v.id = (
+             SELECT id FROM fleet_roster_versions
+             WHERE organization_id = '${orgId}'
+               AND approved_at IS NOT NULL
+               AND julianday(approved_at) <= julianday('now')
+             ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
+             LIMIT 1
+           )
+       );`,
     );
   }
 
@@ -310,44 +382,54 @@ export async function linkFleet(options: {
     `);
   }
 
-// Helper to perform strict live roster verification scoped to version and organization (Sol P1-01)
-function verifyRosterIntegrity(
-  rosterId: string,
-  orgId: string,
-  expectedCount: number,
-  isRemote: boolean,
-) {
-  const query = `
+  // Helper to perform strict live roster verification scoped to version and organization (Sol P1-01)
+  function verifyRosterIntegrity(
+    rosterId: string,
+    orgId: string,
+    expectedCount: number,
+    isRemote: boolean,
+  ) {
+    const query = `
     SELECT
       COUNT(m.id) AS member_count,
       COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.project_id IS NULL THEN 1 ELSE 0 END), 0) AS unmapped,
-      COALESCE(SUM(CASE WHEN m.project_id IS NOT NULL AND (p.id IS NULL OR p.organization_id <> v.organization_id OR p.archived_at IS NOT NULL OR lower(trim(p.domain)) <> m.canonical_host) THEN 1 ELSE 0 END), 0) AS invalid_links
+      COALESCE(SUM(CASE WHEN m.project_id IS NOT NULL AND (p.id IS NULL OR p.organization_id <> v.organization_id OR p.archived_at IS NOT NULL OR p.domain IS NULL OR lower(trim(p.domain)) <> m.canonical_host) THEN 1 ELSE 0 END), 0) AS invalid_links
     FROM fleet_roster_versions v
     LEFT JOIN fleet_roster_members m ON m.version_id = v.id
     LEFT JOIN projects p ON p.id = m.project_id
     WHERE v.id = '${rosterId}' AND v.organization_id = '${orgId}'
     GROUP BY v.id;
   `;
-  const res = runD1Query(query, isRemote);
-  if (!res || res.length === 0) {
-    throw new Error(`Roster integrity query returned no records for roster ${rosterId} in organization ${orgId}.`);
-  }
-  const row = res[0];
-  const memberCount = Number(row.member_count ?? 0);
-  const unmapped = Number(row.unmapped ?? 0);
-  const invalidLinks = Number(row.invalid_links ?? 0);
+    const res = runD1Query(query, isRemote);
+    if (!res || res.length === 0) {
+      throw new Error(
+        `Roster integrity query returned no records for roster ${rosterId} in organization ${orgId}.`,
+      );
+    }
+    const row = res[0];
+    const memberCount = Number(row.member_count ?? 0);
+    const unmapped = Number(row.unmapped ?? 0);
+    const invalidLinks = Number(row.invalid_links ?? 0);
 
-  if (memberCount !== expectedCount) {
-    throw new Error(`Roster member count mismatch: expected ${expectedCount}, found ${memberCount} for roster ${rosterId}.`);
+    if (memberCount !== expectedCount) {
+      throw new Error(
+        `Roster member count mismatch: expected ${expectedCount}, found ${memberCount} for roster ${rosterId}.`,
+      );
+    }
+    if (unmapped > 0) {
+      throw new Error(
+        `${unmapped} fleet roster members remain unmapped in roster ${rosterId}.`,
+      );
+    }
+    if (invalidLinks > 0) {
+      throw new Error(
+        `${invalidLinks} fleet roster members point to foreign, missing, or archived projects in roster ${rosterId}.`,
+      );
+    }
+    console.log(
+      `Live verification: 100% of fleet roster members (${memberCount}/${expectedCount}) are strictly mapped to active projects in organization ${orgId}!`,
+    );
   }
-  if (unmapped > 0) {
-    throw new Error(`${unmapped} fleet roster members remain unmapped in roster ${rosterId}.`);
-  }
-  if (invalidLinks > 0) {
-    throw new Error(`${invalidLinks} fleet roster members point to foreign, missing, or archived projects in roster ${rosterId}.`);
-  }
-  console.log(`Live verification: 100% of fleet roster members (${memberCount}/${expectedCount}) are strictly mapped to active projects in organization ${orgId}!`);
-}
 
   if (sqlStatements.length === 0) {
     if (!isDryRun) {
@@ -358,18 +440,29 @@ function verifyRosterIntegrity(
       const currentEffective = selectEffectiveRosterVersion(liveVersions);
       if (currentEffective?.id !== approvedRoster.id) {
         throw new Error(
-          `Effective roster version supersession detected on no-change path: was ${approvedRoster.id}, now ${currentEffective?.id ?? "none"}. Aborting.`
+          `Effective roster version supersession detected on no-change path: was ${approvedRoster.id}, now ${currentEffective?.id ?? "none"}. Aborting.`,
         );
       }
-      verifyRosterIntegrity(approvedRoster.id, orgId, approvedRoster.domain_count ?? existingMembers.length, isRemote);
-      console.log(`Live verification: All portfolio projects and fleet roster members in ${approvedRoster.id} are 100% mapped! Zero updates required.`);
+      verifyRosterIntegrity(
+        approvedRoster.id,
+        orgId,
+        approvedRoster.domain_count ?? existingMembers.length,
+        isRemote,
+      );
+      console.log(
+        `Live verification: All portfolio projects and fleet roster members in ${approvedRoster.id} are 100% mapped! Zero updates required.`,
+      );
     } else {
       if (unmappedCount > 0) {
-        console.error(`[ERROR] ${unmappedCount} fleet roster members remain unmapped.`);
+        console.error(
+          `[ERROR] ${unmappedCount} fleet roster members remain unmapped.`,
+        );
         process.exitCode = 1;
         return;
       }
-      console.log(`Dry run preview: All portfolio projects and fleet roster members are 100% mapped! Zero updates required.`);
+      console.log(
+        `Dry run preview: All portfolio projects and fleet roster members are 100% mapped! Zero updates required.`,
+      );
     }
     return;
   }
@@ -380,7 +473,7 @@ function verifyRosterIntegrity(
   // 5. Re-check effective roster version post-apply to detect supersession (Sol F10)
   const postApprovedVersions = runD1Query(
     `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = '${orgId}';`,
-    isRemote
+    isRemote,
   );
   const postEffective = selectEffectiveRosterVersion(postApprovedVersions);
   if (!postEffective || postEffective.id !== approvedRoster.id) {
@@ -390,7 +483,12 @@ function verifyRosterIntegrity(
   }
 
   // 6. Verification check strictly scoped to current roster and organization (Sol P1-01, F5, F10)
-  verifyRosterIntegrity(approvedRoster.id, orgId, approvedRoster.domain_count ?? existingMembers.length, isRemote);
+  verifyRosterIntegrity(
+    approvedRoster.id,
+    orgId,
+    approvedRoster.domain_count ?? existingMembers.length,
+    isRemote,
+  );
 }
 
 // CLI execution
@@ -399,7 +497,9 @@ if (process.argv[1] && process.argv[1].includes("link-github-fleet")) {
   const hasRemote = rawArgs.includes("--remote");
   const hasLocal = rawArgs.includes("--local");
   if (hasRemote && hasLocal) {
-    console.error("[ERROR] Conflicting flags: cannot specify both --remote and --local.");
+    console.error(
+      "[ERROR] Conflicting flags: cannot specify both --remote and --local.",
+    );
     process.exit(1);
   }
 

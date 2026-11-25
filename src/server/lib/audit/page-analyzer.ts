@@ -79,7 +79,6 @@ function resolveHttpUrl(
 }
 
 import { sanitizeNoscript } from "./html-sanitizer";
-export { sanitizeNoscript };
 
 /**
  * Determine the first document-effective base URL with WHATWG browser semantics:

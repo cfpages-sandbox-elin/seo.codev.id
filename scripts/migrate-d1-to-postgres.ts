@@ -200,12 +200,14 @@ function primaryKeyColumnNames(table: Table): string[] {
   return [...cols];
 }
 
-// Stable pagination order: the table's primary key. These tables append at the
-// tail, so OFFSET paging is stable during a frozen full copy; any mid-table
-// churn during a live bulk copy is reconciled by the --update delta pass.
+// Stable pagination order: the table's primary key or conflict arbiter. (Sol P2-04)
 function primaryKeyOrder(table: Table): string {
   const cols = primaryKeyColumnNames(table);
-  return cols.length ? `ORDER BY ${cols.map((c) => `"${c}"`).join(",")}` : "";
+  if (cols.length) return `ORDER BY ${cols.map((c) => `"${c}"`).join(",")}`;
+  const arbiter = conflictArbiterNames(table);
+  if (arbiter.length)
+    return `ORDER BY ${arbiter.map((c) => `"${c}"`).join(",")}`;
+  return "";
 }
 
 // Conflict arbiter for --update upserts: the table's PK if it has one, else the
@@ -248,10 +250,11 @@ function deltaPredicate(table: string, cutoffIso: string): string | null {
       return `datetime("fetched_at") >= ${since}`;
     case "rank_snapshots":
       return `datetime("checked_at") >= ${since}`;
-    // Audit child rows carry no timestamp of their own — scope by parent audit.
+    // Audit child rows carry no timestamp of their own — scope by parent audit (started or completed in window) (Sol P2-04).
     case "audit_pages":
+    case "audit_issues":
     case "audit_lighthouse_results":
-      return `"audit_id" IN (SELECT id FROM audits WHERE datetime("started_at") >= ${since})`;
+      return `"audit_id" IN (SELECT id FROM audits WHERE datetime("started_at") >= ${since} OR datetime("completed_at") >= ${since})`;
     default:
       return null;
   }
@@ -410,89 +413,92 @@ async function main() {
   const pgClient = postgres(connectionString!, { max: 1 });
   const dest = drizzlePg(pgClient);
 
-  // Preflight: refuse to write into a populated target unless opted in.
-  // Skipped in --update mode, where the target is expected to already hold the
-  // full migration this run only tops up.
-  if (!allowNonEmpty && !updateMode) {
-    for (const name of order) {
-      const [{ count }] = await dest
-        .select({ count: sql<number>`count(*)::int` })
-        .from(pgTables.get(name)!);
-      if (Number(count) > 0) {
-        await pgClient.end();
-        throw new Error(
-          `Target table "${name}" already has ${count} rows. Migrate into a freshly-created Postgres, or pass --allow-nonempty (idempotent via onConflictDoNothing).`,
-        );
+  try {
+    // Preflight: refuse to write into a populated target unless opted in.
+    // Skipped in --update mode, where the target is expected to already hold the
+    // full migration this run only tops up.
+    if (!allowNonEmpty && !updateMode) {
+      for (const name of order) {
+        const [{ count }] = await dest
+          .select({ count: sql<number>`count(*)::int` })
+          .from(pgTables.get(name)!);
+        if (Number(count) > 0) {
+          throw new Error(
+            `Target table "${name}" already has ${count} rows. Migrate into a freshly-created Postgres, or pass --allow-nonempty (idempotent via onConflictDoNothing).`,
+          );
+        }
       }
     }
-  }
 
-  const written = new Map<string, number>();
-  for (const name of order) {
-    const predicate = updateMode ? deltaPredicate(name, cutoffIso) : null;
-    const count = await copyTable(
-      databaseId,
-      dest,
-      name,
-      sqliteTables.get(name)!,
-      pgTables.get(name)!,
-      predicate,
-      updateMode,
-    );
-    written.set(name, count);
-    const verb = updateMode ? "synced" : "wrote";
-    console.log(`  ${name.padEnd(34)} ${verb} ${String(count).padStart(7)}`);
-  }
+    const written = new Map<string, number>();
+    for (const name of order) {
+      const predicate = updateMode ? deltaPredicate(name, cutoffIso) : null;
+      const count = await copyTable(
+        databaseId,
+        dest,
+        name,
+        sqliteTables.get(name)!,
+        pgTables.get(name)!,
+        predicate,
+        updateMode,
+      );
+      written.set(name, count);
+      const verb = updateMode ? "synced" : "wrote";
+      console.log(`  ${name.padEnd(34)} ${verb} ${String(count).padStart(7)}`);
+    }
 
-  // Serial PKs (keyword_metrics.id, rank_snapshots.id) were copied with their
-  // explicit D1 ids, but the Postgres sequences still sit at 1. Without advancing
-  // them, post-cutover inserts that omit id and rely on the serial default would
-  // collide with migrated rows — silently dropped for rank_snapshots (untargeted
-  // onConflictDoNothing) and a hard duplicate-key error for keyword_metrics. Bump
-  // each serial column's sequence to max(id) (3-arg setval keeps next id at 1 when
-  // the table is empty).
-  console.log("\nResetting serial sequences...");
-  for (const name of order) {
-    const pgTable = pgTables.get(name)!;
-    for (const column of Object.values(getTableColumns(pgTable))) {
-      if (column.getSQLType() !== "serial") continue;
-      const col = sql.identifier(column.name);
-      const tbl = sql.identifier(name);
-      await dest.execute(sql`
+    // Serial PKs (keyword_metrics.id, rank_snapshots.id) were copied with their
+    // explicit D1 ids, but the Postgres sequences still sit at 1. Without advancing
+    // them, post-cutover inserts that omit id and rely on the serial default would
+    // collide with migrated rows — silently dropped for rank_snapshots (untargeted
+    // onConflictDoNothing) and a hard duplicate-key error for keyword_metrics. Bump
+    // each serial column's sequence to max(id) (3-arg setval keeps next id at 1 when
+    // the table is empty).
+    console.log("\nResetting serial sequences...");
+    for (const name of order) {
+      const pgTable = pgTables.get(name)!;
+      for (const column of Object.values(getTableColumns(pgTable))) {
+        if (column.getSQLType() !== "serial") continue;
+        const col = sql.identifier(column.name);
+        const tbl = sql.identifier(name);
+        await dest.execute(sql`
         SELECT setval(
           pg_get_serial_sequence(${name}, ${column.name}),
           COALESCE((SELECT max(${col}) FROM ${tbl}), 1),
           (SELECT max(${col}) FROM ${tbl}) IS NOT NULL
         )
       `);
-      console.log(`  ${name}.${column.name} sequence reset`);
+        console.log(`  ${name}.${column.name} sequence reset`);
+      }
     }
-  }
 
-  // Verify: D1 count vs Postgres count per table.
-  console.log("\nVerifying row counts...");
-  let mismatches = 0;
-  for (const name of order) {
-    const sourceCount = await countD1(databaseId, name);
-    const [{ count }] = await dest
-      .select({ count: sql<number>`count(*)::int` })
-      .from(pgTables.get(name)!);
-    if (Number(count) !== sourceCount) {
-      mismatches += 1;
-      console.log(`  MISMATCH ${name}: D1 ${sourceCount} vs postgres ${count}`);
+    // Verify: D1 count vs Postgres count per table.
+    console.log("\nVerifying row counts...");
+    let mismatches = 0;
+    for (const name of order) {
+      const sourceCount = await countD1(databaseId, name);
+      const [{ count }] = await dest
+        .select({ count: sql<number>`count(*)::int` })
+        .from(pgTables.get(name)!);
+      if (Number(count) !== sourceCount) {
+        mismatches += 1;
+        console.log(
+          `  MISMATCH ${name}: D1 ${sourceCount} vs postgres ${count}`,
+        );
+      }
     }
+
+    const total = [...written.values()].reduce((n, v) => n + v, 0);
+    console.log(
+      `\nDone. ${total} rows across ${order.length} tables.` +
+        (mismatches === 0
+          ? " All row counts match."
+          : ` ${mismatches} table(s) mismatched — investigate before cutover.`),
+    );
+    if (mismatches > 0) process.exitCode = 1;
+  } finally {
+    await pgClient.end();
   }
-
-  await pgClient.end();
-
-  const total = [...written.values()].reduce((n, v) => n + v, 0);
-  console.log(
-    `\nDone. ${total} rows across ${order.length} tables.` +
-      (mismatches === 0
-        ? " All row counts match."
-        : ` ${mismatches} table(s) mismatched — investigate before cutover.`),
-  );
-  if (mismatches > 0) process.exitCode = 1;
 }
 
 main().catch((error) => {

@@ -170,41 +170,67 @@ export async function importApprovedRoster(
       }
     }
 
-    await db.batch([
-      db.insert(fleetRosterVersions).values({
-        id: versionId,
-        organizationId,
-        versionTag: FLEET_MANIFEST_VERSION,
-        domainCount: FLEET_MANIFEST_MEMBERS.length,
-        manifestHash,
-        approvedBy,
-        approvedAt,
-        notes: "Canonical 87-domain portfolio manifest per PRD launch contract",
-      }),
-      ...FLEET_MANIFEST_MEMBERS.map((member) => {
-        const memberId = `${versionId}-${member.canonicalHost.replace(/[^a-z0-9.-]/gi, "-")}`;
-        const matchedProjectId =
-          domainToProjectMap.get(member.canonicalHost.toLowerCase()) ?? null;
+    try {
+      await db.batch([
+        db.insert(fleetRosterVersions).values({
+          id: versionId,
+          organizationId,
+          versionTag: FLEET_MANIFEST_VERSION,
+          domainCount: FLEET_MANIFEST_MEMBERS.length,
+          manifestHash,
+          approvedBy,
+          approvedAt,
+          notes:
+            "Canonical 87-domain portfolio manifest per PRD launch contract",
+        }),
+        ...FLEET_MANIFEST_MEMBERS.map((member) => {
+          const memberId = `${versionId}-${member.canonicalHost.replace(/[^a-z0-9.-]/gi, "-")}`;
+          const matchedProjectId =
+            domainToProjectMap.get(member.canonicalHost.toLowerCase()) ?? null;
 
-        return db.insert(fleetRosterMembers).values({
-          id: memberId,
-          versionId,
-          canonicalHost: member.canonicalHost,
-          projectId: matchedProjectId,
-          category: member.category,
-          categoryEmoji: member.categoryEmoji,
-          tier: member.tier,
-          siteIntent: member.siteIntent,
-          platform: member.platform,
-          repoName: member.repoName ?? null,
-          publishRoot: normalizeGitRelativePath(member.publishRoot),
-          enrollmentState: "active",
-          aliasesJson: "[]",
-        });
-      }),
-    ]);
+          return db.insert(fleetRosterMembers).values({
+            id: memberId,
+            versionId,
+            canonicalHost: member.canonicalHost,
+            projectId: matchedProjectId,
+            category: member.category,
+            categoryEmoji: member.categoryEmoji,
+            tier: member.tier,
+            siteIntent: member.siteIntent,
+            platform: member.platform,
+            repoName: member.repoName ?? null,
+            publishRoot: normalizeGitRelativePath(member.publishRoot),
+            enrollmentState: "active",
+            aliasesJson: "[]",
+          });
+        }),
+      ]);
 
-    return versionId;
+      return versionId;
+    } catch (batchErr: any) {
+      // Sol Round 24 P2-06: Check if concurrent import committed the exact same approved roster
+      const retryExisting = await db
+        .select()
+        .from(fleetRosterVersions)
+        .where(
+          and(
+            eq(fleetRosterVersions.organizationId, organizationId),
+            eq(fleetRosterVersions.versionTag, FLEET_MANIFEST_VERSION),
+          ),
+        );
+      if (retryExisting[0]) {
+        if (
+          retryExisting[0].manifestHash === manifestHash &&
+          retryExisting[0].domainCount === FLEET_MANIFEST_MEMBERS.length
+        ) {
+          return retryExisting[0].id;
+        }
+        throw new Error(
+          `CONFLICT: Roster version hash mismatch for ${FLEET_MANIFEST_VERSION} (committed '${retryExisting[0].manifestHash}' vs expected '${manifestHash}')`,
+        );
+      }
+      throw batchErr;
+    }
   } finally {
     await dispose();
   }

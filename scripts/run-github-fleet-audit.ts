@@ -675,7 +675,7 @@ async function auditRepository(
         : null,
   });
 
-  // Reserve audit attempt in D1 conditionally — fails atomically if an active running repository audit already exists
+  // Reserve audit attempt in D1 conditionally — fails atomically if an active running repository audit already exists (Sol Round 24 P1-03)
   executeD1SqlStatements(
     [
       `INSERT INTO audits (
@@ -691,6 +691,13 @@ async function auditRepository(
       SELECT 1 FROM audits
       WHERE project_id = ${sqlText(projectId)} AND status = 'running'
     )
+    AND EXISTS (
+      SELECT 1 FROM projects p
+      WHERE p.id = ${sqlText(projectId)}
+        AND p.archived_at IS NULL
+        AND p.organization_id = 'shared-workspace'
+        AND lower(trim(p.domain)) = lower(trim(${sqlText(domain)}))
+    )
     ${
       mapping?.expectedRosterVersionId && mapping?.expectedMemberId
         ? `AND EXISTS (
@@ -698,9 +705,20 @@ async function auditRepository(
              JOIN fleet_roster_members rm ON rm.project_id = p.id AND rm.id = ${sqlText(mapping.expectedMemberId)}
              JOIN fleet_roster_versions v ON v.id = rm.version_id
              WHERE p.id = ${sqlText(projectId)} AND p.archived_at IS NULL
+               AND p.organization_id = 'shared-workspace'
                AND rm.enrollment_state = 'active'
                AND rm.repo_name = ${sqlText(repoName)}
+               AND coalesce(rm.publish_root, '.') = ${sqlText(normalizeGitRelativePath(mapping.publishRoot || "."))}
                AND rm.version_id = ${sqlText(mapping.expectedRosterVersionId)}
+               AND lower(trim(rm.canonical_host)) = lower(trim(${sqlText(domain)}))
+               AND v.id = (
+                 SELECT id FROM fleet_roster_versions
+                 WHERE organization_id = 'shared-workspace'
+                   AND approved_at IS NOT NULL
+                   AND julianday(approved_at) <= julianday('now')
+                 ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
+                 LIMIT 1
+               )
            )`
         : ""
     };`,
@@ -1204,6 +1222,31 @@ async function auditRepository(
                WHERE p.id = i.page_id AND p.audit_id = ${sqlText(auditId)}
              )
          )
+         ${
+           mapping?.expectedRosterVersionId && mapping?.expectedMemberId
+             ? `AND EXISTS (
+                  SELECT 1 FROM fleet_roster_members rm
+                  JOIN fleet_roster_versions v ON v.id = rm.version_id
+                  JOIN projects p ON p.id = rm.project_id
+                  WHERE rm.id = ${sqlText(mapping.expectedMemberId)}
+                    AND rm.version_id = ${sqlText(mapping.expectedRosterVersionId)}
+                    AND rm.enrollment_state = 'active'
+                    AND rm.repo_name = ${sqlText(repoName)}
+                    AND coalesce(rm.publish_root, '.') = ${sqlText(normalizeGitRelativePath(mapping.publishRoot || "."))}
+                    AND lower(trim(rm.canonical_host)) = lower(trim(${sqlText(domain)}))
+                    AND p.id = ${sqlText(projectId)}
+                    AND p.archived_at IS NULL
+                    AND v.id = (
+                      SELECT id FROM fleet_roster_versions
+                      WHERE organization_id = 'shared-workspace'
+                        AND approved_at IS NOT NULL
+                        AND julianday(approved_at) <= julianday('now')
+                      ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
+                      LIMIT 1
+                    )
+                )`
+             : ""
+         }
        RETURNING id;`;
     const casResult = runD1Query(casSql, isRemote);
     if (!casResult || casResult.length !== 1 || casResult[0].id !== auditId) {
@@ -1466,33 +1509,42 @@ function publishGuardedDiagnosticTriple(
       .digest("hex")
       .slice(0, 16);
 
-  const runStatus = isComplete ? "completed" : "partial";
-  const itemStatus = isComplete
-    ? "completed"
-    : processedCount > 0
-      ? "partial"
-      : "failed";
+  // Sol Round 24 P1-04: Incomplete or budget-limited runs skip diagnostic publication explicitly
+  if (!isComplete) {
+    console.log(
+      `[DIAGNOSTIC] Audit ${auditId} is incomplete (${isComplete ? "complete" : "incomplete"}). Skipping diagnostic fleet publication.`,
+    );
+    return false;
+  }
   const nowIso = observedAt || new Date().toISOString();
 
-  const diagnosticSql = [
-    `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-     SELECT ${sqlText(runId)}, v.organization_id, v.id, 'v1', 'manual', 'github-audit-runner', ${sqlText(runStatus)}, 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, ${sqlText(nowIso)}, ${sqlText(nowIso)}
-     FROM fleet_roster_versions v
-     JOIN fleet_roster_members rm ON rm.version_id = v.id AND rm.id = ${sqlText(memberId)} AND rm.enrollment_state = 'active'
-     JOIN projects p ON p.id = rm.project_id AND p.organization_id = v.organization_id AND p.archived_at IS NULL
-     WHERE v.id = ${sqlText(versionId)} AND v.organization_id = ${sqlText(organizationId)}
-     ON CONFLICT(id) DO UPDATE SET status = ${sqlText(runStatus)}, completed_at = ${sqlText(nowIso)};`,
-
-    `WITH eligible AS (
-       SELECT a.id, p.id AS project_id, m.id AS member_id, m.version_id
+  // Sol Round 24 P1-04: Single unified eligibility CTE ensuring atomic 1/1/1 or 0/0/0 triple writes
+  const eligibleCte = `WITH eligible AS (
+       SELECT a.id, p.id AS project_id, m.id AS member_id, m.version_id, v.organization_id
        FROM audits a
        JOIN projects p ON p.id = a.project_id AND p.archived_at IS NULL
        JOIN fleet_roster_members m ON m.project_id = p.id AND m.id = ${sqlText(memberId)}
        JOIN fleet_roster_versions v ON v.id = m.version_id
        WHERE a.id = ${sqlText(auditId)} AND a.status = 'completed'
+         AND a.pages_crawled >= a.pages_total AND a.pages_total > 0
+         AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+         AND NOT EXISTS (
+           SELECT 1 FROM audit_issues i
+           WHERE i.audit_id = a.id AND i.page_id IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id)
+         )
          AND p.organization_id = ${sqlText(organizationId)} AND v.organization_id = ${sqlText(organizationId)}
          AND m.enrollment_state = 'active' AND m.version_id = ${sqlText(versionId)}
          AND lower(trim(p.domain)) = lower(trim(m.canonical_host))
+         AND lower(trim(m.canonical_host)) = lower(trim(${sqlText(domain)}))
+         AND v.id = (
+           SELECT id FROM fleet_roster_versions
+           WHERE organization_id = ${sqlText(organizationId)}
+             AND approved_at IS NOT NULL
+             AND julianday(approved_at) <= julianday('now')
+           ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
+           LIMIT 1
+         )
          AND json_valid(a.config)
          AND json_extract(a.config, '$.source') = 'github_repository_direct'
          AND json_extract(a.config, '$.repoName') = m.repo_name
@@ -1503,51 +1555,35 @@ function publishGuardedDiagnosticTriple(
          AND json_extract(a.config, '$.rosterSource.projectId') = p.id
          AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
          AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
-     )
-     INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-     SELECT ${sqlText(runItemId)}, ${sqlText(runId)}, member_id, project_id, id, 'diagnostic', ${sqlText(itemStatus)}, 1, ${sqlText(nowIso)}, ${sqlText(nowIso)}
+     )`;
+
+  const diagnosticSql = [
+    `${eligibleCte}
+     INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
+     SELECT ${sqlText(runId)}, organization_id, version_id, 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, ${sqlText(nowIso)}, ${sqlText(nowIso)}
      FROM eligible
      WHERE 1
-     ON CONFLICT(id) DO UPDATE SET status = ${sqlText(itemStatus)}, completed_at = ${sqlText(nowIso)};`,
+     ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = ${sqlText(nowIso)};`,
 
-    `WITH eligible AS (
-       SELECT a.id, p.id AS project_id, m.id AS member_id, m.version_id
-       FROM audits a
-       JOIN projects p ON p.id = a.project_id AND p.archived_at IS NULL
-       JOIN fleet_roster_members m ON m.project_id = p.id AND m.id = ${sqlText(memberId)}
-       JOIN fleet_roster_versions v ON v.id = m.version_id
-       WHERE a.id = ${sqlText(auditId)} AND a.status = 'completed'
-         AND p.organization_id = ${sqlText(organizationId)} AND v.organization_id = ${sqlText(organizationId)}
-         AND m.enrollment_state = 'active' AND m.version_id = ${sqlText(versionId)}
-         AND lower(trim(p.domain)) = lower(trim(m.canonical_host))
-         AND json_valid(a.config)
-         AND json_extract(a.config, '$.source') = 'github_repository_direct'
-         AND json_extract(a.config, '$.repoName') = m.repo_name
-         AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
-         AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
-         AND json_extract(a.config, '$.rosterSource.versionId') = v.id
-         AND json_extract(a.config, '$.rosterSource.memberId') = m.id
-         AND json_extract(a.config, '$.rosterSource.projectId') = p.id
-         AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
-         AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
-     ),
-     eligible_item AS (
-       SELECT fri.id AS run_item_id, fri.member_id, fri.project_id
-       FROM fleet_run_items fri
-       JOIN eligible e ON e.id = fri.audit_id AND e.member_id = fri.member_id AND e.project_id = fri.project_id
-       JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = e.version_id
-       WHERE fri.id = ${sqlText(runItemId)}
-         AND fri.status IN ('completed', 'partial')
-     )
+    `${eligibleCte}
+     INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
+     SELECT ${sqlText(runItemId)}, ${sqlText(runId)}, e.member_id, e.project_id, e.id, 'diagnostic', 'completed', 1, ${sqlText(nowIso)}, ${sqlText(nowIso)}
+     FROM eligible e
+     JOIN fleet_runs fr ON fr.id = ${sqlText(runId)} AND fr.status = 'completed'
+     WHERE 1
+     ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = ${sqlText(nowIso)};`,
+
+    `${eligibleCte}
      INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-     SELECT ${sqlText(snapshotId)}, run_item_id, member_id, project_id, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(nowIso)}
-     FROM eligible_item
+     SELECT ${sqlText(snapshotId)}, fri.id, e.member_id, e.project_id, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(nowIso)}
+     FROM eligible e
+     JOIN fleet_run_items fri ON fri.id = ${sqlText(runItemId)} AND fri.status = 'completed'
      WHERE 1
      ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(nowIso)};`,
   ];
 
   executeD1SqlStatements(diagnosticSql, isRemote);
-  return verifyDiagnosticTriple(
+  const isVerified = verifyDiagnosticTriple(
     runId,
     runItemId,
     snapshotId,
@@ -1557,10 +1593,29 @@ function publishGuardedDiagnosticTriple(
     memberId,
     projectId,
     domain,
-    runStatus,
-    itemStatus,
+    "completed",
+    "completed",
     isRemote,
   );
+
+  if (!isVerified) {
+    const checkPartial = runD1Query(
+      `SELECT (SELECT count(*) FROM fleet_runs WHERE id = ${sqlText(runId)}) as r_cnt,
+              (SELECT count(*) FROM fleet_run_items WHERE id = ${sqlText(runItemId)}) as i_cnt,
+              (SELECT count(*) FROM fleet_snapshots WHERE id = ${sqlText(snapshotId)}) as s_cnt;`,
+      isRemote,
+    );
+    const rCnt = Number(checkPartial[0]?.r_cnt || 0);
+    const iCnt = Number(checkPartial[0]?.i_cnt || 0);
+    const sCnt = Number(checkPartial[0]?.s_cnt || 0);
+    if (rCnt !== 0 || iCnt !== 0 || sCnt !== 0) {
+      throw new Error(
+        `Diagnostic publication integrity violation for ${auditId}: partial write detected (${rCnt} runs, ${iCnt} items, ${sCnt} snapshots).`,
+      );
+    }
+    return false;
+  }
+  return true;
 }
 
 function verifyDiagnosticTriple(
@@ -1966,7 +2021,8 @@ async function main() {
        WHERE v.id = ${sqlText(effectiveRoster.id)}
          AND v.organization_id = 'shared-workspace'
          AND m.enrollment_state = 'active'
-         AND m.project_id IS NOT NULL;`,
+         AND m.project_id IS NOT NULL
+       ORDER BY m.canonical_host ASC, m.id ASC;`,
       isRemote,
     );
     for (const r of rosterRows) {
@@ -2000,6 +2056,9 @@ async function main() {
   // Build deterministic planned actions list (Sol F01, F02: respects approved roster vs workspace scope)
   const plannedActions: FleetAction[] = [];
   let discoveryFailures = 0;
+
+  let unmappedCount = 0;
+  let reusedCount = 0;
 
   if (targetDomain) {
     const approvedMember = approvedMembersByHost.get(targetDomain);
@@ -2123,10 +2182,11 @@ async function main() {
       });
     }
   } else {
-    const candidateDomains =
+    const candidateDomains = (
       !isWorkspace && effectiveRoster
         ? Array.from(approvedHosts)
-        : Array.from(new Set([...approvedHosts, ...repoMappings.keys()]));
+        : Array.from(new Set([...approvedHosts, ...repoMappings.keys()]))
+    ).sort((a, b) => a.localeCompare(b));
 
     for (const dom of candidateDomains) {
       if (limit !== undefined && plannedActions.length >= limit) {
@@ -2146,7 +2206,8 @@ async function main() {
           !approvedMember?.repoName ||
           !isValidRepoSlug(approvedMember.repoName)
         ) {
-          // Unmapped member in approved roster: skip, do NOT plan action or substitute unapproved repo
+          // Unmapped member in approved roster: track and skip, do NOT plan action or substitute unapproved repo (Sol P2-03)
+          unmappedCount++;
           continue;
         }
         projId = approvedMember.projectId;
@@ -2171,73 +2232,77 @@ async function main() {
         }
       }
 
-      if (projId && repoName) {
-        try {
-          const expectedRosterSource: RosterSource | null =
-            isApprovedProvenance && effectiveRoster && approvedMember
-              ? {
-                  versionId: effectiveRoster.id,
-                  memberId: approvedMember.memberId,
-                  projectId: projId,
-                  canonicalHost: dom,
-                  repoName,
-                  publishRoot: normalizeGitRelativePath(publishRoot),
-                }
-              : null;
+      if (!projId || !repoName) {
+        unmappedCount++;
+        continue;
+      }
 
-          const head = resolveGitHubHead(repoName);
-          const matchingAudit = !force
-            ? findMatchingCompletedAudit(
-                projId,
+      try {
+        const expectedRosterSource: RosterSource | null =
+          isApprovedProvenance && effectiveRoster && approvedMember
+            ? {
+                versionId: effectiveRoster.id,
+                memberId: approvedMember.memberId,
+                projectId: projId,
+                canonicalHost: dom,
                 repoName,
-                publishRoot,
-                head.commitSha,
-                expectedRosterSource,
-                isRemote,
-              )
+                publishRoot: normalizeGitRelativePath(publishRoot),
+              }
             : null;
 
-          if (!force && matchingAudit) {
-            const isRosterMember = approvedHosts.has(dom);
-            if (
-              isRosterMember &&
-              !matchingAudit.hasDiagnostic &&
-              expectedRosterSource
-            ) {
-              plannedActions.push({
-                kind: "repair",
-                domain: dom,
-                projectId: projId,
-                auditId: matchingAudit.id,
-                expectedSource: expectedRosterSource,
-              });
-            } else {
-              continue; // Reused
-            }
-          } else {
+        const head = resolveGitHubHead(repoName);
+        const matchingAudit = !force
+          ? findMatchingCompletedAudit(
+              projId,
+              repoName,
+              publishRoot,
+              head.commitSha,
+              expectedRosterSource,
+              isRemote,
+            )
+          : null;
+
+        if (!force && matchingAudit) {
+          const isRosterMember = approvedHosts.has(dom);
+          if (
+            isRosterMember &&
+            !matchingAudit.hasDiagnostic &&
+            expectedRosterSource
+          ) {
             plannedActions.push({
-              kind: "audit",
-              mapping: {
-                domain: dom,
-                repoName,
-                publishRoot,
-                projectId: projId,
-                expectedRosterVersionId: isApprovedProvenance
-                  ? effectiveRoster?.id
-                  : undefined,
-                expectedMemberId: isApprovedProvenance
-                  ? approvedMember?.memberId
-                  : undefined,
-              },
-              head,
+              kind: "repair",
+              domain: dom,
+              projectId: projId,
+              auditId: matchingAudit.id,
+              expectedSource: expectedRosterSource,
             });
+          } else {
+            reusedCount++;
+            continue; // Reused
           }
-        } catch (e: any) {
-          discoveryFailures++;
-          console.warn(
-            `[DISCOVERY SKIP] Skipping ${dom} (${repoName}): ${e?.message}`,
-          );
+        } else {
+          plannedActions.push({
+            kind: "audit",
+            mapping: {
+              domain: dom,
+              repoName,
+              publishRoot,
+              projectId: projId,
+              expectedRosterVersionId: isApprovedProvenance
+                ? effectiveRoster?.id
+                : undefined,
+              expectedMemberId: isApprovedProvenance
+                ? approvedMember?.memberId
+                : undefined,
+            },
+            head,
+          });
         }
+      } catch (e: any) {
+        discoveryFailures++;
+        console.warn(
+          `[DISCOVERY SKIP] Skipping ${dom} (${repoName}): ${e?.message}`,
+        );
       }
     }
   }
@@ -2298,9 +2363,13 @@ async function main() {
   }
 
   console.log(`\n======================================================`);
+  console.log(`GitHub Fleet Audit Execution Summary:`);
   console.log(
-    `GitHub Fleet Audit Completed! Success: ${successCount}, Failed: ${failCount}, Discovery Failures: ${discoveryFailures}`,
+    `  - Actions executed: ${selectedActions.length} (Success: ${successCount}, Failed: ${failCount})`,
   );
+  console.log(`  - Reused / up-to-date audits: ${reusedCount}`);
+  console.log(`  - Unmapped or unprocessable members: ${unmappedCount}`);
+  console.log(`  - Discovery failures: ${discoveryFailures}`);
   console.log(`======================================================`);
 
   if (failCount > 0 || discoveryFailures > 0) {

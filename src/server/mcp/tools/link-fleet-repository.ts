@@ -1,7 +1,8 @@
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { fleetRosterMembers } from "@/db/schema";
+import { getDatabaseProvider } from "@/db/provider";
 import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
 import type { ToolContext } from "@/server/mcp/context";
 import { mcpResponse } from "@/server/mcp/formatters";
@@ -154,40 +155,93 @@ export const linkFleetRepositoryTool = {
       );
     }
 
-    const effectiveRoot =
-      cleanRoot ?? normalizeGitRelativePath(member.publishRoot);
+    const isPg = getDatabaseProvider() === "postgres";
+    const effectiveVersionSubquery = isPg
+      ? sql`(
+          SELECT id FROM fleet_roster_versions
+          WHERE organization_id = ${orgId}
+            AND approved_at IS NOT NULL
+            AND approved_at::timestamptz <= CURRENT_TIMESTAMP
+          ORDER BY approved_at::timestamptz DESC NULLS LAST, id DESC
+          LIMIT 1
+        )`
+      : sql`(
+          SELECT id FROM fleet_roster_versions
+          WHERE organization_id = ${orgId}
+            AND approved_at IS NOT NULL
+            AND julianday(approved_at) <= julianday('now')
+          ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
+          LIMIT 1
+        )`;
+
     const currentSlug = member.repoName?.trim();
     const currentRoot = normalizeGitRelativePath(member.publishRoot);
 
-    if (currentSlug === cleanSlug && currentRoot === effectiveRoot) {
-      return mcpResponse({
-        structuredContent: {
-          status: "unchanged",
-          domain,
-          repoName: cleanSlug,
-          publishRoot: effectiveRoot,
-          memberId: member.id,
-          versionId: approvedRoster.id,
-        },
-        text: `Repository mapping for '${domain}' is already linked to '${cleanSlug}' (root: '${effectiveRoot}') in roster '${approvedRoster.id}'.`,
-      });
+    if (
+      currentSlug === cleanSlug &&
+      (cleanRoot === undefined || currentRoot === cleanRoot)
+    ) {
+      // Sol Round 24 P1-02: verify the mapping still matches the effective member in the database
+      const verifyEffective = await db
+        .select({
+          id: fleetRosterMembers.id,
+          publishRoot: fleetRosterMembers.publishRoot,
+        })
+        .from(fleetRosterMembers)
+        .where(
+          and(
+            eq(fleetRosterMembers.id, member.id),
+            eq(fleetRosterMembers.versionId, approvedRoster.id),
+            eq(fleetRosterMembers.versionId, effectiveVersionSubquery),
+            eq(fleetRosterMembers.enrollmentState, "active"),
+            eq(fleetRosterMembers.repoName, cleanSlug),
+          ),
+        )
+        .limit(1);
+
+      if (verifyEffective.length > 0) {
+        const liveRoot = normalizeGitRelativePath(
+          verifyEffective[0].publishRoot,
+        );
+        return mcpResponse({
+          structuredContent: {
+            status: "unchanged",
+            domain,
+            repoName: cleanSlug,
+            publishRoot: liveRoot,
+            memberId: member.id,
+            versionId: approvedRoster.id,
+          },
+          text: `Repository mapping for '${domain}' is already linked to '${cleanSlug}' (root: '${liveRoot}') in roster '${approvedRoster.id}'.`,
+        });
+      }
     }
 
-    // Sol Round 22 F04: Atomic in-statement roster assertion with RETURNING id
+    // Sol Round 24 P1-02: Omit publishRoot from update set when omitted from input
+    const updateSet: { repoName: string; publishRoot?: string } = {
+      repoName: cleanSlug,
+    };
+    if (cleanRoot !== undefined) {
+      updateSet.publishRoot = cleanRoot;
+    }
+
+    // Sol Round 24 P1-02: Atomic write-time assertion that versionId is currently effective
     const updateRes = await db
       .update(fleetRosterMembers)
-      .set({
-        repoName: cleanSlug,
-        publishRoot: effectiveRoot,
-      })
+      .set(updateSet)
       .where(
         and(
           eq(fleetRosterMembers.id, member.id),
           eq(fleetRosterMembers.versionId, approvedRoster.id),
           eq(fleetRosterMembers.enrollmentState, "active"),
+          eq(fleetRosterMembers.versionId, effectiveVersionSubquery),
         ),
       )
-      .returning({ id: fleetRosterMembers.id });
+      .returning({
+        id: fleetRosterMembers.id,
+        repoName: fleetRosterMembers.repoName,
+        publishRoot: fleetRosterMembers.publishRoot,
+      });
 
     if (!updateRes || updateRes.length === 0) {
       throw new Error(
@@ -195,16 +249,19 @@ export const linkFleetRepositoryTool = {
       );
     }
 
+    const updated = updateRes[0];
+    const finalPublishRoot = normalizeGitRelativePath(updated.publishRoot);
+
     return mcpResponse({
       structuredContent: {
         status: "linked",
         domain,
         repoName: cleanSlug,
-        publishRoot: effectiveRoot,
-        memberId: member.id,
+        publishRoot: finalPublishRoot,
+        memberId: updated.id,
         versionId: approvedRoster.id,
       },
-      text: `Successfully linked '${domain}' to repository '${cleanSlug}' (root: '${effectiveRoot}') in roster '${approvedRoster.id}'.`,
+      text: `Successfully linked '${domain}' to repository '${cleanSlug}' (root: '${finalPublishRoot}') in roster '${approvedRoster.id}'.`,
     });
   },
 };
