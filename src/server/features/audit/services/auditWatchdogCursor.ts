@@ -19,29 +19,35 @@ export const pgTimeExpr = (
   expr: SQL | Column | string | null | undefined,
 ) => sql`(
   CASE
-    WHEN ${expr} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$'
+    WHEN ${expr} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$'
      AND pg_input_is_valid(${expr} || '+00', 'timestamptz')
     THEN (${expr} || '+00')::timestamptz
-    WHEN pg_input_is_valid(${expr}, 'timestamptz')
+    WHEN ${expr} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$'
+     AND pg_input_is_valid(${expr}, 'timestamptz')
     THEN (${expr})::timestamptz
     ELSE NULL
   END
 )`;
 
-export const pgBucketExpr = (expr: SQL | Column | string | null | undefined) =>
-  sql`(CASE WHEN ${pgTimeExpr(expr)} IS NULL THEN 0 ELSE 1 END)`;
-
-export const pgNormalizedTimeExpr = (
+export const sqliteTimeExpr = (
   expr: SQL | Column | string | null | undefined,
-) => sql`COALESCE(${pgTimeExpr(expr)}, '1970-01-01 00:00:00+00'::timestamptz)`;
-
-export const sqliteBucketExpr = (
-  expr: SQL | Column | string | null | undefined,
-) => sql`(CASE WHEN julianday(${expr}) IS NULL THEN 0 ELSE 1 END)`;
-
-export const sqliteNormalizedTimeExpr = (
-  expr: SQL | Column | string | null | undefined,
-) => sql`COALESCE(julianday(${expr}), 0.0)`;
+) => sql`(
+  CASE
+    WHEN ${expr} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+     AND ${expr} = strftime('%Y-%m-%d %H:%M:%S', ${expr})
+    THEN julianday(${expr})
+    WHEN ${expr} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'
+     AND substr(${expr}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${expr}, 1, 19))
+     AND (length(${expr}) = 20 OR substr(${expr}, 20) GLOB '.[0-9]*Z')
+     AND julianday(${expr}) IS NOT NULL
+    THEN julianday(${expr})
+    WHEN ${expr} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*[+-][0-9][0-9]:[0-9][0-9]'
+     AND substr(${expr}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${expr}, 1, 19))
+     AND julianday(${expr}) IS NOT NULL
+    THEN julianday(${expr})
+    ELSE NULL
+  END
+)`;
 
 export async function loadPersistedCursor(): Promise<LoadedCursorState> {
   try {
@@ -67,7 +73,11 @@ export async function loadPersistedCursor(): Promise<LoadedCursorState> {
 export async function savePersistedCursor(
   cursor: WatchdogCursor,
   expectedRevision?: number | null,
-): Promise<{ result: CursorSaveResult; cursor?: WatchdogCursor }> {
+): Promise<{
+  result: CursorSaveResult;
+  revision?: number;
+  cursor?: WatchdogCursor;
+}> {
   try {
     const isPg = getDatabaseProvider() === "postgres";
     const nowIso = new Date().toISOString();
@@ -90,7 +100,7 @@ export async function savePersistedCursor(
         .returning({ revision: watchdogCursor.revision });
 
       return res.length > 0
-        ? { result: "applied", cursor }
+        ? { result: "applied", revision: res[0].revision, cursor }
         : { result: "conflict" };
     }
 
@@ -102,12 +112,13 @@ export async function savePersistedCursor(
           startedAt: cursor ? cursor.startedAt : null,
           auditId: cursor ? cursor.id : null,
           revision: 1,
+          updatedAt: isPg ? nowIso : undefined,
         })
         .onConflictDoNothing()
         .returning({ revision: watchdogCursor.revision });
 
       return res.length > 0
-        ? { result: "applied", cursor }
+        ? { result: "applied", revision: res[0].revision, cursor }
         : { result: "conflict" };
     }
 
@@ -133,7 +144,7 @@ export async function savePersistedCursor(
         .returning({ revision: watchdogCursor.revision });
 
       return res.length > 0
-        ? { result: "applied", cursor }
+        ? { result: "applied", revision: res[0].revision, cursor }
         : { result: "conflict" };
     }
 
@@ -144,12 +155,13 @@ export async function savePersistedCursor(
         startedAt: cursor ? cursor.startedAt : null,
         auditId: cursor ? cursor.id : null,
         revision: 1,
+        updatedAt: isPg ? nowIso : undefined,
       })
       .onConflictDoNothing()
       .returning({ revision: watchdogCursor.revision });
 
     return res.length > 0
-      ? { result: "applied", cursor }
+      ? { result: "applied", revision: res[0].revision, cursor }
       : { result: "conflict" };
   } catch (error) {
     console.error("Audit watchdog: database error saving cursor:", error);

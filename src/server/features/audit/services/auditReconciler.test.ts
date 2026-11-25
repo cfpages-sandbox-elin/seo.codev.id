@@ -1,7 +1,30 @@
 import { describe, expect, it, vi } from "vitest";
-import { reconcileRunningAudit } from "./auditReconciler";
+import { reconcileRunningAudit, reconcileStaleAudits } from "./auditReconciler";
 
 const mockGet = vi.fn();
+const dbHoisted = vi.hoisted(() => ({
+  cursorRow: null as {
+    id: string;
+    startedAt: string | null;
+    auditId: string | null;
+    revision: number;
+  } | null,
+  auditBatches: [] as Array<
+    Array<{
+      id: string;
+      workflowInstanceId: string | null;
+      projectId: string;
+      startedByUserId: string;
+      startedAt: string;
+      currentPhase: string | null;
+      pagesCrawled: number;
+      pagesTotal: number;
+    }>
+  >,
+  insertRevisions: [] as number[],
+  updateRevisions: [] as number[],
+}));
+
 vi.mock("cloudflare:workers", () => ({
   env: {
     SITE_AUDIT_WORKFLOW: {
@@ -15,6 +38,85 @@ vi.mock("@/server/features/audit/repositories/AuditRepository", () => ({
     failAudit: vi.fn().mockResolvedValue(true),
   },
 }));
+
+vi.mock("@/server/lib/posthog", () => ({
+  captureServerEvent: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock("@/db/provider", () => ({
+  getDatabaseProvider: () => "d1",
+}));
+
+vi.mock("@/db", () => ({
+  db: {
+    query: {
+      watchdogCursor: {
+        findFirst: async () => dbHoisted.cursorRow,
+      },
+      audits: {
+        findMany: async () => dbHoisted.auditBatches.shift() ?? [],
+      },
+      projects: {
+        findFirst: async () => ({
+          id: "proj_1",
+          organizationId: "shared-workspace",
+        }),
+      },
+    },
+    insert: () => ({
+      values: (vals: {
+        id: string;
+        startedAt: string | null;
+        auditId: string | null;
+        revision: number;
+      }) => {
+        dbHoisted.insertRevisions.push(vals.revision);
+        dbHoisted.cursorRow = {
+          id: vals.id,
+          startedAt: vals.startedAt,
+          auditId: vals.auditId,
+          revision: vals.revision,
+        };
+        return {
+          onConflictDoNothing: () => ({
+            returning: async () => [{ revision: vals.revision }],
+          }),
+        };
+      },
+    }),
+    update: () => ({
+      set: (vals: {
+        startedAt: string | null;
+        auditId: string | null;
+        revision: number;
+      }) => ({
+        where: () => ({
+          returning: async () => {
+            dbHoisted.updateRevisions.push(vals.revision);
+            if (dbHoisted.cursorRow) {
+              dbHoisted.cursorRow = {
+                ...dbHoisted.cursorRow,
+                startedAt: vals.startedAt,
+                auditId: vals.auditId,
+                revision: vals.revision,
+              };
+            }
+            return [{ revision: vals.revision }];
+          },
+        }),
+      }),
+    }),
+  },
+}));
+
+type MockCursorRow = {
+  id: string;
+  startedAt: string | null;
+  auditId: string | null;
+  revision: number;
+};
+
+const readMockCursorRow = (): MockCursorRow | null => dbHoisted.cursorRow;
 
 describe("auditReconciler", () => {
   it("immediately returns null and skips Cloudflare Workflows lookup for repository audits (Sol P1-05)", async () => {
@@ -144,5 +246,60 @@ describe("auditReconciler", () => {
       errorDetail:
         "GitHub repository audit exceeded max run duration (2h) and was reclaimed.",
     });
+  });
+
+  it("treats unzoned ISO timestamps as invalid under strict UTC parsing (Sol V4-03)", async () => {
+    mockGet.mockClear();
+    const { AuditRepository } =
+      await import("@/server/features/audit/repositories/AuditRepository");
+    vi.mocked(AuditRepository.failAudit).mockResolvedValueOnce(true);
+
+    const unzonedRepoAudit = {
+      id: "audit_repo_unzoned",
+      workflowInstanceId: "github-audit-unzoned",
+      // Future unzoned ISO lacks Z or offset -> rejected by strict parseUtcTimestampMs -> isOlderThan returns true
+      startedAt: "2099-01-01T00:00:00",
+      currentPhase: "analyzing",
+    };
+
+    const result = await reconcileRunningAudit(unzonedRepoAudit);
+    expect(result).toEqual({
+      errorCode: "runner_timeout",
+      errorDetail:
+        "GitHub repository audit exceeded max run duration (2h) and was reclaimed.",
+    });
+  });
+
+  it("bootstraps missing watchdog_cursor singleton at revision 1 and advances monotonically (Sol V4-01)", async () => {
+    mockGet.mockClear();
+    mockGet.mockRejectedValueOnce(new Error("Workflow instance not found"));
+    dbHoisted.cursorRow = null;
+    dbHoisted.insertRevisions.length = 0;
+    dbHoisted.updateRevisions.length = 0;
+    // Queue: [0] = irregular batch ([]), [1] = canonical stale batch (1 stale audit)
+    dbHoisted.auditBatches = [
+      [],
+      [
+        {
+          id: "audit_stale_bootstrap",
+          workflowInstanceId: "site-audit-workflow-stale-1",
+          projectId: "proj_1",
+          startedByUserId: "user_1",
+          startedAt: new Date(Date.now() - 3600 * 1000).toISOString(),
+          currentPhase: "crawling",
+          pagesCrawled: 0,
+          pagesTotal: 100,
+        },
+      ],
+    ];
+
+    await reconcileStaleAudits();
+
+    expect(dbHoisted.insertRevisions).toEqual([1]);
+    expect(dbHoisted.updateRevisions).toEqual([2]);
+    const finalRow = readMockCursorRow();
+    expect(finalRow?.revision).toBe(2);
+    expect(finalRow?.startedAt).toBeNull();
+    expect(finalRow?.auditId).toBeNull();
   });
 });

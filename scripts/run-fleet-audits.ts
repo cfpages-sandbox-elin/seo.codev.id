@@ -92,30 +92,36 @@ function triggerWorkflow(
   }
 
   const output = ((res.stderr || "") + " " + (res.stdout || "")).toLowerCase();
-  // Sol T2: Treat child timeout or transient connection drop as unknown/ambiguous
-  if (
-    res.error ||
-    res.signal === "SIGTERM" ||
-    output.includes("etimedout") ||
-    output.includes("timeout") ||
-    output.includes("econnreset") ||
-    output.includes("socket hang up")
-  ) {
-    console.warn(
-      `[DISPATCH UNCERTAIN] Wrangler trigger for instance ${id} timed out or aborted: ${res.error?.message || output}. Retaining running status and monitoring for resolution.`,
+  const isConfirmedPreRejection =
+    !res.error &&
+    res.signal === null &&
+    (output.includes("unknown workflow") ||
+      output.includes("workflow not found") ||
+      output.includes("invalid workflow") ||
+      output.includes("invalid params") ||
+      output.includes("missing required") ||
+      output.includes("validation error"));
+
+  if (isConfirmedPreRejection) {
+    console.error(
+      `[DISPATCH REJECTED] Confirmed rejection for workflow instance ${id}: ${res.stderr || res.stdout}`,
     );
     return {
-      outcome: "unknown",
-      message: res.error?.message || "Trigger response timed out or ambiguous",
+      outcome: "definitively_rejected",
+      message: res.stderr || res.stdout,
     };
   }
 
-  console.error(
-    `[DISPATCH REJECTED] Failed to trigger workflow instance ${id}: ${res.stderr || res.stdout}`,
+  console.warn(
+    `[DISPATCH UNCERTAIN] Wrangler trigger for instance ${id} returned ambiguous failure or timed out (status=${res.status}, signal=${res.signal}): ${res.error?.message || output}. Retaining running status and monitoring for resolution.`,
   );
   return {
-    outcome: "definitively_rejected",
-    message: res.stderr || res.stdout,
+    outcome: "unknown",
+    message:
+      res.error?.message ||
+      res.stderr ||
+      res.stdout ||
+      "Trigger response timed out or ambiguous",
   };
 }
 
@@ -239,12 +245,35 @@ async function main() {
     process.exit(1);
   }
 
-  if (
-    !targetDomainFilter &&
-    (args.values["expected-member"] || args.values["expected-project"])
-  ) {
+  const rawExpectedMember = args.values["expected-member"];
+  const rawExpectedProject = args.values["expected-project"];
+  if (rawExpectedMember !== undefined && rawExpectedMember.trim() === "") {
+    console.error("[ERROR] --expected-member cannot be empty.");
+    process.exit(1);
+  }
+  if (rawExpectedProject !== undefined && rawExpectedProject.trim() === "") {
+    console.error("[ERROR] --expected-project cannot be empty.");
+    process.exit(1);
+  }
+  const expectedMember = rawExpectedMember?.trim();
+  const expectedProject = rawExpectedProject?.trim();
+
+  if (!targetDomainFilter && (expectedMember || expectedProject)) {
     console.error(
       "[ERROR] --expected-member and --expected-project are strictly single-target options and cannot be combined with bulk execution.",
+    );
+    process.exit(1);
+  }
+
+  const rawRosterId = args.values["roster-id"];
+  const rosterId = rawRosterId ? String(rawRosterId).trim() : null;
+  if (rawRosterId !== undefined && !rosterId) {
+    console.error("[ERROR] --roster-id cannot be empty.");
+    process.exit(1);
+  }
+  if ((expectedMember || expectedProject) && !rosterId) {
+    console.error(
+      "[ERROR] --expected-member and --expected-project require --roster-id to bind the complete admission tuple.",
     );
     process.exit(1);
   }
@@ -258,13 +287,6 @@ async function main() {
   console.log(`Max Pages Per Site: ${maxPages} (Full Depth Crawl)`);
   if (targetDomainFilter)
     console.log(`Target Domain Filter: ${targetDomainFilter}`);
-
-  const rawRosterId = args.values["roster-id"];
-  const rosterId = rawRosterId ? String(rawRosterId).trim() : null;
-  if (rawRosterId !== undefined && !rosterId) {
-    console.error("[ERROR] --roster-id cannot be empty.");
-    process.exit(1);
-  }
 
   // Sol Round 21 F01: Assert effective approved roster on execution DB
   const allRosterVersions = runD1Query(
@@ -332,27 +354,21 @@ async function main() {
       );
       process.exit(1);
     }
-    // Sol R24-08: Assert bound single-target plan project ID if provided
-    const expectedProject = args.values["expected-project"]
-      ? String(args.values["expected-project"]).trim()
-      : undefined;
+    // Sol R24-08, V1-01: Assert complete bound single-target plan tuple (project, member, roster, canonical host)
     if (expectedProject && candidates[0].id !== expectedProject) {
       console.error(
         `[ERROR] TARGET_BINDING_MISMATCH: Planned project ID '${expectedProject}' does not match live project ID '${candidates[0].id}' for domain '${targetDomainFilter}'.`,
       );
       process.exit(1);
     }
-    const expectedMember = args.values["expected-member"]
-      ? String(args.values["expected-member"]).trim()
-      : undefined;
     if (expectedMember && rosterId) {
       const memberRows = runD1Query(
-        `SELECT id FROM fleet_roster_members WHERE id = ${sqlText(expectedMember)} AND version_id = ${sqlText(rosterId)} AND project_id = ${sqlText(candidates[0].id)} AND enrollment_state = 'active';`,
+        `SELECT id FROM fleet_roster_members WHERE id = ${sqlText(expectedMember)} AND version_id = ${sqlText(rosterId)} AND project_id = ${sqlText(candidates[0].id)} AND enrollment_state = 'active' AND lower(trim(canonical_host)) = ${sqlText(targetDomainFilter)};`,
         isRemote,
       );
       if (!memberRows || memberRows.length === 0) {
         console.error(
-          `[ERROR] TARGET_BINDING_MISMATCH: Planned member ID '${expectedMember}' is not an active member for project '${candidates[0].id}' in roster '${rosterId}'.`,
+          `[ERROR] TARGET_BINDING_MISMATCH: Planned member ID '${expectedMember}' is not an active member for project '${candidates[0].id}' (host '${targetDomainFilter}') in roster '${rosterId}'.`,
         );
         process.exit(1);
       }
@@ -411,14 +427,23 @@ async function main() {
   let completedCount = 0;
   let failedCount = 0;
   let skippedBusyCount = 0;
+  let bindingConflictCount = 0;
   let admissionPaused = false;
 
   async function pollActiveAudits() {
     for (const [auditId, info] of Array.from(activeAudits.entries())) {
-      const statusRows = runD1Query(
-        `SELECT status, pages_crawled, current_phase, error_code FROM audits WHERE id = '${auditId}';`,
-        isRemote,
-      );
+      let statusRows: any[] = [];
+      try {
+        statusRows = runD1Query(
+          `SELECT status, pages_crawled, current_phase, error_code FROM audits WHERE id = ${sqlText(auditId)};`,
+          isRemote,
+        );
+      } catch (err: any) {
+        console.warn(
+          `[POLL RETRY] Transient D1 read error for ${auditId} (${info.project.domain}): ${err?.message || err}. Retaining active slot for next cycle.`,
+        );
+        continue;
+      }
       if (statusRows.length === 0) {
         console.warn(
           `[WARNING] Audit ${auditId} for ${info.project.domain} not found in database.`,
@@ -528,7 +553,7 @@ async function main() {
           `[DISPATCH] Launching audit on ${project.domain} (${startUrl}) [ID: ${auditId}]`,
         );
 
-        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits for the same project and asserts current effective roster & unarchived project (Sol Round 24 P1-03)
+        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits and asserts complete expected tuple (Sol V1-01)
         const insertSql = `
           INSERT INTO audits (
             id, project_id, started_by_user_id, start_url,
@@ -559,6 +584,7 @@ async function main() {
                      AND rm.version_id = ${sqlText(rosterId)}
                      AND rm.enrollment_state = 'active'
                      AND lower(trim(rm.canonical_host)) = ${sqlText(cleanHost)}
+                     ${expectedMember ? `AND rm.id = ${sqlText(expectedMember)}` : ""}
                      AND rv.id = (
                        SELECT id FROM fleet_roster_versions
                        WHERE organization_id = 'shared-workspace'
@@ -569,21 +595,30 @@ async function main() {
                      )
                  )`
               : ""
-          };
+          }
+          RETURNING id;
         `;
-        runD1Query(insertSql, isRemote);
-
-        const reserved = runD1Query(
-          `SELECT id FROM audits WHERE id = ${sqlText(auditId)};`,
-          isRemote,
-        );
+        const reserved = runD1Query(insertSql, isRemote);
         if (!reserved || reserved.length === 0) {
-          console.warn(
-            `[SKIP] Project ${project.domain} (${project.id}) already has an active running edge audit or roster binding superseded. Skipping concurrent dispatch.`,
+          const runningCheck = runD1Query(
+            `SELECT id FROM audits WHERE project_id = ${sqlText(project.id)} AND status = 'running' LIMIT 1;`,
+            isRemote,
           );
-          skippedBusyCount++;
+          if (runningCheck && runningCheck.length > 0) {
+            console.warn(
+              `[SKIP_BUSY] Project ${project.domain} (${project.id}) already has an active running audit (${runningCheck[0].id}). Skipping concurrent dispatch.`,
+            );
+            skippedBusyCount++;
+          } else {
+            console.error(
+              `[BINDING_CONFLICT] Project ${project.domain} (${project.id}) admission tuple (member=${expectedMember ?? "any"}, roster=${rosterId ?? "none"}) was superseded or drifted before reservation.`,
+            );
+            bindingConflictCount++;
+          }
           continue;
         }
+
+        const reservationStartedAt = Date.now();
 
         // 2. Trigger workflow instance
         const params = {
@@ -611,7 +646,7 @@ async function main() {
           activeAudits.set(auditId, {
             auditId,
             project,
-            startedAt: Date.now(),
+            startedAt: reservationStartedAt,
             isAmbiguous: dispatch.outcome === "unknown",
           });
         } else {
@@ -646,13 +681,15 @@ async function main() {
   console.log(`Total Completed: ${completedCount}`);
   console.log(`Total Failed: ${failedCount}`);
   console.log(`Skipped (Reservation Busy): ${skippedBusyCount}`);
+  console.log(`Binding Conflicts: ${bindingConflictCount}`);
   console.log(`Active Remaining: ${activeAudits.size}`);
   console.log(`Undispatched Remaining: ${undispatched.length}`);
   const incomplete =
     failedCount +
+    bindingConflictCount +
     activeAudits.size +
     undispatched.length +
-    (completedCount === 0 && skippedBusyCount > 0 ? skippedBusyCount : 0);
+    skippedBusyCount;
   if (incomplete > 0 || (targetDomainFilter && completedCount === 0)) {
     process.exitCode = 1;
   }

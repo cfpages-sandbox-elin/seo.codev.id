@@ -206,23 +206,33 @@ export default {
     if (controller.cron === MCP_OAUTH_PURGE_CRON) {
       // Only hosted mode runs the OAuth provider (and has OAUTH_KV bound).
       if (isHostedAuthMode(getAuthMode(env.AUTH_MODE))) {
-        const result = await openSeoOAuthProvider.purgeExpiredData(
-          env as OpenSeoOAuthEnv,
-        );
-        console.log("[mcp-oauth] purged expired OAuth data", result);
-        if (!result.done) {
-          // The sweep only advances past live records via deletions; a
-          // persistent incomplete scan means the keyspace outgrew the batch.
-          console.warn("[mcp-oauth] purge did not cover the full keyspace");
-        }
+        // Sol V4-08: Run OAuth purge and Dub referral sweep independently via Promise.allSettled
+        const [purgeResult, referralResult] = await Promise.allSettled([
+          (async () => {
+            const result = await openSeoOAuthProvider.purgeExpiredData(
+              env as OpenSeoOAuthEnv,
+            );
+            console.log("[mcp-oauth] purged expired OAuth data", result);
+            if (!result.done) {
+              // The sweep only advances past live records via deletions; a
+              // persistent incomplete scan means the keyspace outgrew the batch.
+              console.warn("[mcp-oauth] purge did not cover the full keyspace");
+            }
+          })(),
+          sweepDubReferredOrganizations(),
+        ]);
 
-        // Daily referral-sale sweep: catches paid Autumn invoices the
-        // billing.updated webhook path misses (renewals, one-time top-ups).
-        try {
-          await sweepDubReferredOrganizations();
-        } catch (err) {
-          console.error("[cron] Dub referral sale sweep failed:", err);
+        if (purgeResult.status === "rejected") {
+          console.error("[mcp-oauth] OAuth purge failed:", purgeResult.reason);
         }
+        if (referralResult.status === "rejected") {
+          console.error(
+            "[cron] Dub referral sale sweep failed:",
+            referralResult.reason,
+          );
+        }
+        if (purgeResult.status === "rejected") throw purgeResult.reason;
+        if (referralResult.status === "rejected") throw referralResult.reason;
       }
       return;
     }

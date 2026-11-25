@@ -25,10 +25,15 @@ import {
 } from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
-const MANIFEST_PATH = resolve("src/server/features/fleet/data/fleetManifest.json");
+const MANIFEST_PATH = resolve(
+  "src/server/features/fleet/data/fleetManifest.json",
+);
 
 function loadEnv(): Record<string, string> {
-  const env: Record<string, string> = { ...process.env } as Record<string, string>;
+  const env: Record<string, string> = { ...process.env } as Record<
+    string,
+    string
+  >;
   try {
     const content = readFileSync(ENV_FILE, "utf8");
     for (const rawLine of content.split(/\r?\n/)) {
@@ -36,7 +41,10 @@ function loadEnv(): Record<string, string> {
       const eqIdx = line.indexOf("=");
       if (eqIdx > 0 && !line.startsWith("#")) {
         const key = line.slice(0, eqIdx).trim();
-        const val = line.slice(eqIdx + 1).trim().replace(/^['"]|['"]$/g, "");
+        const val = line
+          .slice(eqIdx + 1)
+          .trim()
+          .replace(/^['"]|['"]$/g, "");
         env[key] = val;
       }
     }
@@ -47,7 +55,10 @@ function loadEnv(): Record<string, string> {
 const envVars = loadEnv();
 function getGitHubToken(): string {
   try {
-    const token = execSync("gh auth token", { encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+    const token = execSync("gh auth token", {
+      encoding: "utf8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
     if (token) return token;
   } catch {}
   return envVars.GITHUB_TOKEN || process.env.GITHUB_TOKEN || "";
@@ -58,7 +69,9 @@ const GITHUB_TOKEN = getGitHubToken();
 export async function runBenchmark(repoName: string, publishRoot = ".") {
   const ownerRepoRegex = /^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+$/;
   if (!ownerRepoRegex.test(repoName)) {
-    throw new Error(`Invalid repository name '${repoName}'. Must match 'owner/repo'.`);
+    throw new Error(
+      `Invalid repository name '${repoName}'. Must match 'owner/repo'.`,
+    );
   }
 
   console.log(`\n=== Streaming Archive Reader Benchmark (FLEET-GH-02) ===`);
@@ -71,18 +84,23 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
   const treeItems = discovered.tree;
   console.log(`Pinned commit: ${commitSha.slice(0, 10)} (${defaultBranch})`);
 
-  const prefix = publishRoot === "." ? "" : (publishRoot.replace(/^\/+|\/+$/g, "") + "/");
+  const prefix =
+    publishRoot === "." ? "" : publishRoot.replace(/^\/+|\/+$/g, "") + "/";
   const htmlBlobs = treeItems.filter(
     (item: any) =>
       item.type === "blob" &&
       (item.mode === "100644" || item.mode === "100755") &&
-      (item.path.endsWith(".html") || item.path.endsWith(".htm")) &&
+      /\.html?$/i.test(item.path) &&
       item.path.startsWith(prefix),
   );
-  console.log(`Discovered ${htmlBlobs.length} eligible HTML files in repository tree under '${publishRoot}'.`);
+  console.log(
+    `Discovered ${htmlBlobs.length} eligible HTML files in repository tree under '${publishRoot}'.`,
+  );
 
   // ─── Lane 1: Individual Blob Downloads (Current Baseline) ─────────────────
-  console.log(`\nBenchmarking Lane 1: Individual Blob Downloads (concurrency: 25)...`);
+  console.log(
+    `\nBenchmarking Lane 1: Individual Blob Downloads (concurrency: 25)...`,
+  );
   const memStart1 = process.memoryUsage().rss;
   const t0_lane1 = performance.now();
 
@@ -98,7 +116,9 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
         try {
           const res = await fetch(rawUrl, {
             headers: {
-              ...(GITHUB_TOKEN ? { Authorization: `Bearer ${GITHUB_TOKEN}` } : {}),
+              ...(GITHUB_TOKEN
+                ? { Authorization: `Bearer ${GITHUB_TOKEN}` }
+                : {}),
               "User-Agent": "OpenSEO-Benchmark-Lane1",
             },
             signal: AbortSignal.timeout(60000),
@@ -115,7 +135,9 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
             throw new Error(`HTTP ${res.status} fetching ${file.path}`);
           }
         } catch (err: any) {
-          throw new Error(`Lane 1 failed to acquire or verify blob ${file.path}: ${err?.message || err}`);
+          throw new Error(
+            `Lane 1 failed to acquire or verify blob ${file.path}: ${err?.message || err}`,
+          );
         }
       }),
     );
@@ -127,12 +149,18 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
 
   console.log(`Lane 1 Complete:`);
   console.log(`  - Files fetched: ${lane1Results.size}/${htmlBlobs.length}`);
-  console.log(`  - Response body bytes transferred: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB`);
-  console.log(`  - Elapsed time: ${lane1DurationMs} ms (${(lane1DurationMs / 1000).toFixed(2)}s)`);
+  console.log(
+    `  - Response body bytes transferred: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB`,
+  );
+  console.log(
+    `  - Elapsed time: ${lane1DurationMs} ms (${(lane1DurationMs / 1000).toFixed(2)}s)`,
+  );
   console.log(`  - RSS end-minus-start: ${lane1MemMb} MB`);
 
   // ─── Lane 2: Streamed Commit-Pinned Archive (FLEET-GH-02) ───────────────────
-  console.log(`\nBenchmarking Lane 2: Streamed Commit-Pinned Tarball Archive...`);
+  console.log(
+    `\nBenchmarking Lane 2: Streamed Commit-Pinned Tarball Archive...`,
+  );
   const memStart2 = process.memoryUsage().rss;
   const t0_lane2 = performance.now();
 
@@ -146,7 +174,9 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
     signal: AbortSignal.timeout(60000),
   });
   if (!archiveRes.ok) {
-    throw new Error(`Failed to download archive: ${archiveRes.status} ${archiveRes.statusText}`);
+    throw new Error(
+      `Failed to download archive: ${archiveRes.status} ${archiveRes.statusText}`,
+    );
   }
   const contentLength = archiveRes.headers.get("content-length");
   if (contentLength && parseInt(contentLength, 10) > 100 * 1024 * 1024) {
@@ -210,16 +240,32 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
   const totalTransferredWireBytes = compressedWireBytes + fallbackBytes;
 
   console.log(`Lane 2 Complete:`);
-  console.log(`  - Files extracted: ${lane2Results.size}/${htmlBlobs.length} (Archive hits: ${archiveHits}, Fallback: ${fallbackFiles})`);
-  console.log(`  - Compressed response body bytes: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB`);
+  console.log(
+    `  - Files extracted: ${lane2Results.size}/${htmlBlobs.length} (Archive hits: ${archiveHits}, Fallback: ${fallbackFiles})`,
+  );
+  console.log(
+    `  - Compressed response body bytes: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB`,
+  );
   if (fallbackBytes > 0) {
-    console.log(`  - Fallback response body bytes: ${(fallbackBytes / (1024 * 1024)).toFixed(2)} MB (${fallbackFiles} requests)`);
+    console.log(
+      `  - Fallback response body bytes: ${(fallbackBytes / (1024 * 1024)).toFixed(2)} MB (${fallbackFiles} requests)`,
+    );
   }
-  console.log(`  - Total transferred response body bytes: ${(totalTransferredWireBytes / (1024 * 1024)).toFixed(2)} MB`);
-  console.log(`  - Expanded tarball payload: ${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB`);
-  console.log(`  - Download & gzip decompression time: ${decompressDurationMs} ms`);
-  console.log(`  - Tar parse, verification & fallback time: ${parseDurationMs} ms`);
-  console.log(`  - Total elapsed time: ${lane2DurationMs} ms (${(lane2DurationMs / 1000).toFixed(2)}s)`);
+  console.log(
+    `  - Total transferred response body bytes: ${(totalTransferredWireBytes / (1024 * 1024)).toFixed(2)} MB`,
+  );
+  console.log(
+    `  - Expanded tarball payload: ${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB`,
+  );
+  console.log(
+    `  - Download & gzip decompression time: ${decompressDurationMs} ms`,
+  );
+  console.log(
+    `  - Tar parse, verification & fallback time: ${parseDurationMs} ms`,
+  );
+  console.log(
+    `  - Total elapsed time: ${lane2DurationMs} ms (${(lane2DurationMs / 1000).toFixed(2)}s)`,
+  );
   console.log(`  - RSS end-minus-start: ${lane2MemMb} MB`);
 
   // ─── Parity & Performance Comparison ───────────────────────────────────────
@@ -243,13 +289,17 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
 
   if (!parity) {
     throw new Error(
-      `PARITY FAILURE: Candidate set mismatch (Tree: ${htmlBlobs.length}, Lane 1: ${lane1Results.size}, Lane 2: ${lane2Results.size}, Matched: ${matchedFiles})`
+      `PARITY FAILURE: Candidate set mismatch (Tree: ${htmlBlobs.length}, Lane 1: ${lane1Results.size}, Lane 2: ${lane2Results.size}, Matched: ${matchedFiles})`,
     );
   }
 
   console.log(`\nWorkload Tradeoff Assessment:`);
-  console.log(`  - Selective Blob Lane: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB response body payload, ${lane1DurationMs} ms`);
-  console.log(`  - Archive Tarball Lane: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB compressed response payload + ${(fallbackBytes / (1024 * 1024)).toFixed(2)} MB fallback (${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB expanded), ${lane2DurationMs} ms (${fallbackFiles} fallback requests)`);
+  console.log(
+    `  - Selective Blob Lane: ${(lane1TotalBytes / (1024 * 1024)).toFixed(2)} MB response body payload, ${lane1DurationMs} ms`,
+  );
+  console.log(
+    `  - Archive Tarball Lane: ${(compressedWireBytes / (1024 * 1024)).toFixed(2)} MB compressed response payload + ${(fallbackBytes / (1024 * 1024)).toFixed(2)} MB fallback (${(expandedArchiveBytes / (1024 * 1024)).toFixed(2)} MB expanded), ${lane2DurationMs} ms (${fallbackFiles} fallback requests)`,
+  );
   return {
     lane1DurationMs,
     lane2DurationMs,
@@ -287,7 +337,8 @@ if (process.argv[1] && process.argv[1].includes("benchmark-archive-audit")) {
       const manifestRaw = readFileSync(MANIFEST_PATH, "utf8");
       const list = JSON.parse(manifestRaw);
       const found = list.find(
-        (m: any) => m.canonicalHost?.toLowerCase() === values.domain?.toLowerCase()
+        (m: any) =>
+          m.canonicalHost?.toLowerCase() === values.domain?.toLowerCase(),
       );
       if (found?.repoName) {
         targetRepo = found.repoName;
@@ -298,7 +349,9 @@ if (process.argv[1] && process.argv[1].includes("benchmark-archive-audit")) {
     } catch {}
 
     if (!targetRepo) {
-      console.error(`[ERROR] Domain '${values.domain}' was not found in fleet manifest.`);
+      console.error(
+        `[ERROR] Domain '${values.domain}' was not found in fleet manifest.`,
+      );
       process.exit(1);
     }
   }

@@ -355,7 +355,15 @@ export function findMatchingCompletedAudit(
     `SELECT a.id, a.config,
             (
               SELECT CASE
-                WHEN COUNT(DISTINCT r.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1 THEN 1
+                WHEN COUNT(DISTINCT r.id) = 1
+                 AND COUNT(DISTINCT fri.id) = 1
+                 AND COUNT(DISTINCT fs.id) = 1
+                 AND (
+                   SELECT COUNT(*) FROM fleet_run_items fri_all
+                   WHERE fri_all.audit_id = a.id
+                     AND fri_all.primary_series_key = 'diagnostic'
+                 ) = 1
+                THEN 1
                 ELSE 0
               END
               FROM fleet_runs r
@@ -552,7 +560,7 @@ async function auditRepository(
     const p = item.path;
     // Sol F01: filter by declared publish root boundary
     if (prefix && !p.startsWith(prefix)) continue;
-    const isHtml = p.endsWith(".html") || p.endsWith(".htm");
+    const isHtml = /\.html?$/i.test(p);
 
     if (isHtml) {
       const served = pathToUrl(p);
@@ -578,7 +586,7 @@ async function auditRepository(
       htmlFiles.push(items[0]);
     } else {
       ambiguousServedUrls.add(servedUrl);
-      const htmlExt = items.find((it) => it.path.endsWith(".html"));
+      const htmlExt = items.find((it) => /\.html$/i.test(it.path));
       const chosen = htmlExt ?? items[0];
       htmlFiles.push(chosen);
     }
@@ -617,17 +625,17 @@ async function auditRepository(
       const pageOwner: RouteOwner = { kind: "page", gitPath: p, pageUrl };
       physicalRoutes.set(physicalKey, pageOwner);
 
-      // Inferred aliases: extensionless & directory roots
+      // Inferred aliases: extensionless & directory roots (V3-05 case-insensitive)
       let cleanSlug: string | null = null;
-      if (servedPath === "index.html" || servedPath === "index.htm") {
+      if (/^index\.html?$/i.test(servedPath)) {
         cleanSlug = "";
-      } else if (servedPath.endsWith("/index.html")) {
+      } else if (/\/index\.html$/i.test(servedPath)) {
         cleanSlug = encodedPath.slice(0, -11);
-      } else if (servedPath.endsWith("/index.htm")) {
+      } else if (/\/index\.htm$/i.test(servedPath)) {
         cleanSlug = encodedPath.slice(0, -10);
-      } else if (servedPath.endsWith(".html")) {
+      } else if (/\.html$/i.test(servedPath)) {
         cleanSlug = encodedPath.slice(0, -5);
-      } else if (servedPath.endsWith(".htm")) {
+      } else if (/\.htm$/i.test(servedPath)) {
         cleanSlug = encodedPath.slice(0, -4);
       }
 
@@ -656,10 +664,10 @@ async function auditRepository(
 
   const candidateFiles = htmlFiles.slice(0, maxPages);
 
-  // Handle stale recovery (> 2 hours old without completion) strictly for repository-lane audits (Sol R3)
+  // Handle stale recovery (> 2 hours old without completion) strictly bounded by live org, host, and roster binding (Sol R3, V1-06)
   executeD1SqlStatements(
     [
-      `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = ${sqlText(projectId)} AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2;`,
+      `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = ${sqlText(projectId)} AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2 AND EXISTS (SELECT 1 FROM projects p WHERE p.id = audits.project_id AND p.archived_at IS NULL AND p.organization_id = 'shared-workspace' AND lower(trim(p.domain)) = lower(trim(${sqlText(domain)})))${mapping?.expectedRosterVersionId && mapping?.expectedMemberId ? ` AND EXISTS (SELECT 1 FROM fleet_roster_members rm JOIN fleet_roster_versions v ON v.id = rm.version_id WHERE rm.id = ${sqlText(mapping.expectedMemberId)} AND rm.project_id = ${sqlText(projectId)} AND rm.version_id = ${sqlText(mapping.expectedRosterVersionId)} AND rm.enrollment_state = 'active' AND lower(trim(rm.canonical_host)) = lower(trim(${sqlText(domain)})) AND v.organization_id = 'shared-workspace')` : ""};`,
     ],
     isRemote,
   );
@@ -1259,7 +1267,9 @@ async function auditRepository(
                     AND coalesce(rm.publish_root, '.') = ${sqlText(normalizeGitRelativePath(mapping.publishRoot || "."))}
                     AND lower(trim(rm.canonical_host)) = lower(trim(${sqlText(domain)}))
                     AND p.id = ${sqlText(projectId)}
+                    AND p.organization_id = 'shared-workspace'
                     AND p.archived_at IS NULL
+                    AND lower(trim(p.domain)) = lower(trim(rm.canonical_host))
                     AND v.id = (
                       SELECT id FROM fleet_roster_versions
                       WHERE organization_id = 'shared-workspace'
@@ -1581,6 +1591,39 @@ function publishGuardedDiagnosticTriple(
          AND json_extract(a.config, '$.rosterSource.projectId') = p.id
          AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
          AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
+         AND (
+           SELECT COUNT(*) FROM fleet_run_items fri_other
+           WHERE fri_other.audit_id = a.id
+             AND fri_other.primary_series_key = 'diagnostic'
+             AND fri_other.id <> ${sqlText(runItemId)}
+         ) = 0
+         AND NOT EXISTS (
+           SELECT 1 FROM fleet_runs fr_bad
+           WHERE fr_bad.id = ${sqlText(runId)}
+             AND (fr_bad.organization_id <> v.organization_id OR fr_bad.roster_version_id <> v.id)
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM fleet_run_items fri_bad
+           WHERE fri_bad.id = ${sqlText(runItemId)}
+             AND (
+               fri_bad.run_id <> ${sqlText(runId)}
+               OR fri_bad.member_id <> m.id
+               OR fri_bad.project_id <> p.id
+               OR fri_bad.audit_id <> a.id
+               OR fri_bad.primary_series_key <> 'diagnostic'
+             )
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM fleet_snapshots fs_bad
+           WHERE fs_bad.id = ${sqlText(snapshotId)}
+             AND (
+               fs_bad.run_item_id <> ${sqlText(runItemId)}
+               OR fs_bad.member_id <> m.id
+               OR fs_bad.project_id <> p.id
+               OR lower(trim(fs_bad.canonical_host)) <> lower(trim(m.canonical_host))
+               OR fs_bad.series_key <> 'diagnostic'
+             )
+         )
      )`;
 
   const diagnosticSql = [
@@ -1991,6 +2034,24 @@ async function main() {
     process.exit(1);
   }
 
+  let validatedScanBudget: number | undefined;
+  if (args.values["scan-budget"] !== undefined) {
+    if (targetDomain) {
+      console.error(
+        "[ERROR] --scan-budget cannot be combined with single-target --domain mode.",
+      );
+      process.exit(1);
+    }
+    const rawSb = String(args.values["scan-budget"]);
+    if (!/^[1-9][0-9]*$/.test(rawSb) || !Number.isSafeInteger(Number(rawSb))) {
+      console.error(
+        "[ERROR] Invalid --scan-budget value. Must be a safe positive integer.",
+      );
+      process.exit(1);
+    }
+    validatedScanBudget = Number(rawSb);
+  }
+
   // Load project mappings from D1 with duplicate domain detection (Sol F01)
   const projectRows = runD1Query(
     "SELECT id, domain FROM projects WHERE organization_id = 'shared-workspace' AND domain IS NOT NULL AND archived_at IS NULL;",
@@ -2283,12 +2344,12 @@ async function main() {
         : Array.from(new Set([...approvedHosts, ...repoMappings.keys()]))
     ).sort((a, b) => a.localeCompare(b));
 
-    const rawScanBudget = args.values["scan-budget"];
-    const scanLimit = rawScanBudget
-      ? parseInt(String(rawScanBudget), 10)
-      : limit !== undefined
-        ? Math.max(limit * 10, 20)
-        : Infinity;
+    const scanLimit =
+      validatedScanBudget !== undefined
+        ? validatedScanBudget
+        : limit !== undefined
+          ? Math.max(limit * 10, 20)
+          : Infinity;
     let scannedCandidates = 0;
 
     for (const dom of candidateDomains) {
@@ -2488,9 +2549,8 @@ async function main() {
     discoveryFailures > 0 ||
     (targetDomain && executedOrReused === 0) ||
     (!targetDomain &&
-      candidateDomains.length > 0 &&
-      executedOrReused === 0 &&
-      unmappedCount > 0)
+      (candidateDomains.length === 0 ||
+        (executedOrReused === 0 && unmappedCount > 0)))
   ) {
     process.exit(1);
   }

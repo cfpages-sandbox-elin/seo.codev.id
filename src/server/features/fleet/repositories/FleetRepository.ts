@@ -35,6 +35,12 @@ type RawFleetSnapshotWithAttempt = RawFleetSnapshot & {
   rubricVersion?: string | null;
 };
 
+const pgSafeTs = (col: string) =>
+  `(CASE WHEN ${col} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$' AND pg_input_is_valid(${col} || '+00', 'timestamptz') THEN (${col} || '+00')::timestamptz WHEN ${col} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$' AND pg_input_is_valid(${col}, 'timestamptz') THEN ${col}::timestamptz ELSE NULL END)`;
+
+const sqliteSafeTs = (col: string) =>
+  `(CASE WHEN ${col} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND ${col} = strftime('%Y-%m-%d %H:%M:%S', ${col}) THEN julianday(${col}) WHEN ${col} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z' AND substr(${col}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${col}, 1, 19)) AND (length(${col}) = 20 OR substr(${col}, 20) GLOB '.[0-9]*Z') AND julianday(${col}) IS NOT NULL THEN julianday(${col}) WHEN ${col} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*[+-][0-9][0-9]:[0-9][0-9]' AND substr(${col}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${col}, 1, 19)) AND julianday(${col}) IS NOT NULL THEN julianday(${col}) ELSE NULL END)`;
+
 interface RawFleetData {
   version: RawFleetVersion;
   members: RawFleetMember[];
@@ -158,15 +164,32 @@ export const FleetRepository = {
       },
     );
 
-    // Query 3: Run items for this approved roster version joined with runs bounded by window partition (Sol Round 24 P2-07, R24-12)
+    // Query 3: Run items & Snapshots using injected clock, strict UTC parsing, binary tie-breaking, and full CTE pushdown (V4-03, V4-04, V4-06)
     const isPg = getDatabaseProvider() === "postgres";
+    const nowIso = new Date(nowMs).toISOString();
+
+    const friCompletedExpr = isPg
+      ? sql.raw(pgSafeTs("fri.completed_at"))
+      : sql.raw(sqliteSafeTs("fri.completed_at"));
+    const fsObservedExpr = isPg
+      ? sql.raw(pgSafeTs("fs.observed_at"))
+      : sql.raw(sqliteSafeTs("fs.observed_at"));
+
     const friOrder = isPg
-      ? sql`ORDER BY (CASE WHEN fri.completed_at IS NOT NULL THEN (CASE WHEN fri.completed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$' AND pg_input_is_valid(fri.completed_at || '+00', 'timestamptz') THEN (fri.completed_at || '+00')::timestamptz WHEN pg_input_is_valid(fri.completed_at, 'timestamptz') THEN fri.completed_at::timestamptz ELSE NULL END) ELSE NULL END) DESC NULLS LAST, fri.id DESC`
-      : sql`ORDER BY (CASE WHEN fri.completed_at IS NOT NULL THEN julianday(fri.completed_at) ELSE NULL END) DESC NULLS LAST, fri.id DESC`;
+      ? sql`ORDER BY ${friCompletedExpr} DESC NULLS LAST, fri.id COLLATE "C" DESC`
+      : sql`ORDER BY ${friCompletedExpr} DESC NULLS LAST, fri.id COLLATE BINARY DESC`;
 
     const fsOrder = isPg
-      ? sql`ORDER BY (CASE WHEN fs.observed_at IS NOT NULL THEN (CASE WHEN fs.observed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$' AND pg_input_is_valid(fs.observed_at || '+00', 'timestamptz') THEN (fs.observed_at || '+00')::timestamptz WHEN pg_input_is_valid(fs.observed_at, 'timestamptz') THEN fs.observed_at::timestamptz ELSE NULL END) ELSE NULL END) DESC NULLS LAST, fs.id DESC`
-      : sql`ORDER BY (CASE WHEN fs.observed_at IS NOT NULL THEN julianday(fs.observed_at) ELSE NULL END) DESC NULLS LAST, fs.id DESC`;
+      ? sql`ORDER BY ${fsObservedExpr} DESC NULLS LAST, fs.id COLLATE "C" DESC`
+      : sql`ORDER BY ${fsObservedExpr} DESC NULLS LAST, fs.id COLLATE BINARY DESC`;
+
+    const friValidClock = isPg
+      ? sql`(${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= ${nowIso}::timestamptz)`
+      : sql`(${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= julianday(${nowIso}))`;
+
+    const fsValidClock = isPg
+      ? sql`(${fsObservedExpr} IS NOT NULL AND ${fsObservedExpr} <= ${nowIso}::timestamptz AND ${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= ${nowIso}::timestamptz AND ${fsObservedExpr} <= ${friCompletedExpr})`
+      : sql`(${fsObservedExpr} IS NOT NULL AND ${fsObservedExpr} <= julianday(${nowIso}) AND ${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= julianday(${nowIso}) AND ${fsObservedExpr} <= ${friCompletedExpr})`;
 
     const runItems = await db
       .select({
@@ -208,18 +231,14 @@ export const FleetRepository = {
               AND rm.enrollment_state = 'active'
               AND fri.project_id = rm.project_id
               AND fri.status IN ('completed', 'partial', 'failed')
-              AND ${
-                isPg
-                  ? sql`(CASE WHEN fri.completed_at IS NOT NULL AND fri.completed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$' AND pg_input_is_valid(fri.completed_at || '+00', 'timestamptz') THEN (fri.completed_at || '+00')::timestamptz <= CURRENT_TIMESTAMP WHEN fri.completed_at IS NOT NULL AND pg_input_is_valid(fri.completed_at, 'timestamptz') THEN fri.completed_at::timestamptz <= CURRENT_TIMESTAMP ELSE false END)`
-                  : sql`(fri.completed_at IS NOT NULL AND julianday(fri.completed_at) <= julianday('now'))`
-              }
+              AND ${friValidClock}
           ) r
           WHERE r.rn <= 30
         )`,
       )
       .orderBy(desc(fleetRunItems.completedAt), desc(fleetRunItems.id));
 
-    // Query 4: Snapshots for this approved roster version bounded by series-aware window function (Sol Round 24 P2-07, R24-12)
+    // Query 4: Snapshots for this approved roster version bounded by series-aware window function (Sol Round 24 P2-07, R24-12, V4-06)
     const rawSnapshots = await db
       .select({
         id: fleetSnapshots.id,
@@ -283,14 +302,11 @@ export const FleetRepository = {
               AND fs.member_id = fri.member_id
               AND fs.project_id = fri.project_id
               AND fs.project_id = rm.project_id
+              AND fs.series_key = fri.primary_series_key
               AND rm.enrollment_state = 'active'
               AND lower(trim(fs.canonical_host)) = lower(trim(rm.canonical_host))
               AND fri.status IN ('completed', 'partial', 'failed')
-              AND ${
-                isPg
-                  ? sql`(CASE WHEN fs.observed_at IS NOT NULL AND fs.observed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$' AND pg_input_is_valid(fs.observed_at || '+00', 'timestamptz') THEN (fs.observed_at || '+00')::timestamptz <= CURRENT_TIMESTAMP WHEN fs.observed_at IS NOT NULL AND pg_input_is_valid(fs.observed_at, 'timestamptz') THEN fs.observed_at::timestamptz <= CURRENT_TIMESTAMP ELSE false END)`
-                  : sql`(fs.observed_at IS NOT NULL AND julianday(fs.observed_at) <= julianday('now'))`
-              }
+              AND ${fsValidClock}
           ) s
           WHERE s.rn <= 30
         )`,

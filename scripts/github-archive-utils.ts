@@ -269,7 +269,7 @@ export function selectEffectiveRosterVersion<
     const tB = parseUtcTimestampMs(b.approved_at ?? b.approvedAt);
     const diff = (isNaN(tB) ? 0 : tB) - (isNaN(tA) ? 0 : tA);
     if (diff !== 0) return diff;
-    return b.id.localeCompare(a.id);
+    return b.id === a.id ? 0 : b.id > a.id ? 1 : -1;
   });
 
   return valid[0] ?? null;
@@ -471,9 +471,9 @@ export function executeD1SqlBatches(
     }
 
     const parsed = extractJsonFromOutput(result.stdout);
-    if (!Array.isArray(parsed) || parsed.length < batch.length) {
+    if (!Array.isArray(parsed) || parsed.length !== batch.length) {
       throw new Error(
-        `D1 execution did not return a valid result array matching batch length (${parsed?.length ?? 0} vs expected ${batch.length}) for batch ${b + 1}/${batches.length}: ${result.stdout.slice(0, 500)}`,
+        `D1 execution did not return an exact result array matching batch length (${parsed?.length ?? 0} vs expected ${batch.length}) for batch ${b + 1}/${batches.length}: ${result.stdout.slice(0, 500)}`,
       );
     }
 
@@ -561,16 +561,11 @@ export function parseTarHtmlFiles(
     }
     if (isAllZero) break;
 
-    const rawName = header
-      .subarray(0, 100)
-      .toString("utf8")
-      .replace(/\0.*$/, "")
-      .trim();
+    const rawName = header.subarray(0, 100).toString("utf8").split("\0", 1)[0];
     const rawPrefix = header
       .subarray(345, 500)
       .toString("utf8")
-      .replace(/\0.*$/, "")
-      .trim();
+      .split("\0", 1)[0];
     const fullName = rawPrefix ? `${rawPrefix}/${rawName}` : rawName;
 
     const slashIdx = fullName.indexOf("/");

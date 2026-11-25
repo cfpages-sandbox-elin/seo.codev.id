@@ -7,7 +7,15 @@ import {
 } from "./fleet-tools";
 import { makeToolContext } from "./tool-test-support";
 
+const hoisted = vi.hoisted(() => ({
+  provider: "d1" as "d1" | "postgres",
+  memberPublishRoot: ".",
+}));
+
 vi.mock("cloudflare:workers", () => ({ env: {} }));
+vi.mock("@/db/provider", () => ({
+  getDatabaseProvider: () => hoisted.provider,
+}));
 
 const toolContext = makeToolContext({ organizationId: "shared-workspace" });
 
@@ -35,7 +43,7 @@ vi.mock("@/db", () => {
             enrollmentState: "active",
             projectId: "proj_1",
             repoName: "cfpages-syamsulalam-net/kaca-co-id",
-            publishRoot: ".",
+            publishRoot: hoisted.memberPublishRoot,
             versionId: "roster_v1",
           },
         ];
@@ -200,8 +208,8 @@ describe("Fleet MCP Tools", () => {
         "--expected-root",
         ".",
       ]);
-      expect(data.executionCommand).toContain(
-        "run-github-fleet-audit.ts --domain kaca.co.id --roster-id roster_v1 --remote --max-pages 500 --expected-member member_1 --expected-project proj_1 --expected-repo cfpages-syamsulalam-net/kaca-co-id --expected-root .",
+      expect(data.executionCommand).toBe(
+        "& 'pnpm' 'exec' 'tsx' 'scripts/run-github-fleet-audit.ts' '--domain' 'kaca.co.id' '--roster-id' 'roster_v1' '--remote' '--max-pages' '500' '--expected-member' 'member_1' '--expected-project' 'proj_1' '--expected-repo' 'cfpages-syamsulalam-net/kaca-co-id' '--expected-root' '.'",
       );
     });
 
@@ -218,8 +226,8 @@ describe("Fleet MCP Tools", () => {
       expect(data.planId).toBeDefined();
       expect(data.mode).toBe("edge_workflow");
       expect(data.executionCommand).toContain("run-fleet-audits.ts");
-      expect(data.executionCommand).toContain("--all");
-      expect(data.executionCommand).toContain("--concurrency 3");
+      expect(data.executionCommand).toContain("'--all'");
+      expect(data.executionCommand).toContain("'--concurrency' '3'");
       expect(data.argv).toContain("--all");
       expect(data.argv).toContain("--concurrency");
       expect(data.argv).toContain("3");
@@ -257,6 +265,44 @@ describe("Fleet MCP Tools", () => {
       expect(schema.domain.safeParse("a".repeat(255) + ".com").success).toBe(
         false,
       );
+    });
+
+    it("quotes PowerShell publishRoot with spaces and apostrophe cleanly while keeping exact argv (Sol V3-02)", async () => {
+      const prevRoot = hoisted.memberPublishRoot;
+      hoisted.memberPublishRoot = "release notes/owner's copy";
+      try {
+        const result = await runFleetAuditTool.handler(
+          { mode: "repository_direct", domain: "kaca.co.id", maxPages: 500 },
+          toolContext,
+        );
+        const data = runFleetAuditTool.config.outputSchema.parse(
+          result.structuredContent,
+        );
+        expect(data.argv).toContain("--expected-root");
+        expect(data.argv[data.argv.indexOf("--expected-root") + 1]).toBe(
+          "release notes/owner's copy",
+        );
+        expect(data.executionCommand).toContain(
+          "'--expected-root' 'release notes/owner''s copy'",
+        );
+      } finally {
+        hoisted.memberPublishRoot = prevRoot;
+      }
+    });
+
+    it("rejects non-D1 database providers in run_fleet_audit planner (Sol V2-03)", async () => {
+      const prevProvider = hoisted.provider;
+      hoisted.provider = "postgres";
+      try {
+        await expect(
+          runFleetAuditTool.handler(
+            { mode: "repository_direct", domain: "kaca.co.id" },
+            toolContext,
+          ),
+        ).rejects.toThrow(/requires Cloudflare D1 provider/);
+      } finally {
+        hoisted.provider = prevProvider;
+      }
     });
   });
 
@@ -340,6 +386,25 @@ describe("Fleet MCP Tools", () => {
       expect(res.structuredContent).toBeDefined();
       expect(res.structuredContent.status).toBe("unchanged");
       expect(res.structuredContent.publishRoot).toBe(".");
+    });
+
+    it("handles normalized equivalent trailing-slash publishRoot via raw column CAS comparison (Sol V4-07)", async () => {
+      const prevRoot = hoisted.memberPublishRoot;
+      hoisted.memberPublishRoot = "public/";
+      try {
+        const res = await linkFleetRepositoryTool.handler(
+          {
+            domain: "kaca.co.id",
+            repoName: "cfpages-syamsulalam-net/kaca-co-id",
+            publishRoot: "public",
+          },
+          toolContext,
+        );
+        expect(res.structuredContent.status).toBe("unchanged");
+        expect(res.structuredContent.publishRoot).toBe("public");
+      } finally {
+        hoisted.memberPublishRoot = prevRoot;
+      }
     });
   });
 

@@ -16,6 +16,7 @@ import { parseArgs } from "node:util";
 import {
   selectEffectiveRosterVersion,
   executeD1SqlBatches,
+  sqlText,
 } from "./github-archive-utils";
 
 const MANIFEST_PATH = resolve(
@@ -290,31 +291,69 @@ export async function linkFleet(options: {
     }
   }
 
-  const alreadyLinkedCount = existingMembers.filter(
-    (m) => m.project_id !== null,
-  ).length;
+  const existingProjectIdMap = new Map<
+    string,
+    { id: string; domain: string | null }
+  >();
+  for (const p of existingProjects) {
+    existingProjectIdMap.set(p.id, { id: p.id, domain: p.domain ?? null });
+  }
+
+  let alreadyLinkedCount = 0;
+  let inactiveCount = 0;
+  let unmappedCount = 0;
+  const invalidActiveMembers: Array<{
+    memberId: string;
+    host: string;
+    projectId: string;
+    reason: string;
+  }> = [];
+
+  for (const m of existingMembers) {
+    if (m.enrollment_state !== "active") {
+      inactiveCount++;
+      continue;
+    }
+    if (m.project_id !== null) {
+      alreadyLinkedCount++;
+      const matchedProj = existingProjectIdMap.get(m.project_id);
+      if (
+        !matchedProj ||
+        !matchedProj.domain ||
+        matchedProj.domain.toLowerCase().trim() !==
+          m.canonical_host.toLowerCase().trim()
+      ) {
+        invalidActiveMembers.push({
+          memberId: m.id,
+          host: m.canonical_host,
+          projectId: m.project_id,
+          reason: matchedProj
+            ? `project domain '${matchedProj.domain ?? "null"}' != '${m.canonical_host}'`
+            : "project missing or archived/foreign org",
+        });
+      }
+    } else if (
+      !existingProjectDomainMap.has(m.canonical_host.toLowerCase().trim())
+    ) {
+      unmappedCount++;
+    }
+  }
   const linkableCount = membersToLink.length;
-  const inactiveCount = existingMembers.filter(
-    (m) => m.enrollment_state !== "active",
-  ).length;
-  const unmappedCount = existingMembers.filter(
-    (m) =>
-      m.enrollment_state === "active" &&
-      m.project_id === null &&
-      !existingProjectDomainMap.has(m.canonical_host.toLowerCase().trim()),
-  ).length;
 
   console.log(`\nReconciliation Summary:`);
   console.log(`  - Missing projects to insert: ${missingProjects.length}`);
   console.log(`  - Fleet roster members to link: ${linkableCount}`);
-  console.log(`  - Already linked roster members: ${alreadyLinkedCount}`);
+  console.log(`  - Already linked active members: ${alreadyLinkedCount}`);
+  console.log(
+    `  - Invalid existing active links: ${invalidActiveMembers.length}`,
+  );
   console.log(`  - Inactive / parked roster members: ${inactiveCount}`);
   console.log(`  - Unmapped active roster members: ${unmappedCount}`);
   console.log(
     `  - Outside-roster inventory targets (skipped): ${outsideRosterInventory.length}`,
   );
 
-  // Sol P2-01: Reconcile complete partition: total must equal alreadyLinked + linkable + unmapped + inactive
+  // Sol P2-01, V3-01: Exclusive non-overlapping partition check
   const totalPartition =
     alreadyLinkedCount + linkableCount + unmappedCount + inactiveCount;
   if (totalPartition !== existingMembers.length) {
@@ -343,6 +382,20 @@ export async function linkFleet(options: {
           ),
         );
     }
+    if (invalidActiveMembers.length > 0) {
+      console.error(
+        `\n[ERROR] Dry run detected ${invalidActiveMembers.length} invalid existing active member binding(s):`,
+      );
+      invalidActiveMembers
+        .slice(0, 5)
+        .forEach((inv) =>
+          console.error(
+            `  ! ${inv.host} (member: ${inv.memberId}, project: ${inv.projectId}): ${inv.reason}`,
+          ),
+        );
+      process.exitCode = 1;
+      return;
+    }
     if (unmappedCount > 0) {
       console.error(
         `\n[ERROR] Dry run found ${unmappedCount} active unmapped roster members that cannot be linked to any project.`,
@@ -356,30 +409,34 @@ export async function linkFleet(options: {
     return;
   }
 
+  if (invalidActiveMembers.length > 0) {
+    throw new Error(
+      `Cannot apply links while ${invalidActiveMembers.length} active roster member(s) have invalid existing project bindings (first: ${invalidActiveMembers[0].host} -> ${invalidActiveMembers[0].reason}).`,
+    );
+  }
+
   // 4. Live execution: Build SQL and execute
   const sqlStatements: string[] = [];
 
   for (const p of missingProjects) {
-    const escapedName = p.name.replace(/'/g, "''");
-    const escapedDomain = p.domain.replace(/'/g, "''");
-    // Atomic insert with duplicate prevention and effective approved roster assertion (Sol Round 24 P1-05)
+    // Atomic insert with duplicate prevention and effective approved roster assertion (Sol Round 24 P1-05, V3-01)
     sqlStatements.push(
       `INSERT INTO projects (id, organization_id, name, domain, location_code, language_code, created_at)
-       SELECT '${p.id}', '${orgId}', '${escapedName}', '${escapedDomain}', 2360, 'id', CURRENT_TIMESTAMP
+       SELECT ${sqlText(p.id)}, ${sqlText(orgId)}, ${sqlText(p.name)}, ${sqlText(p.domain)}, 2360, 'id', CURRENT_TIMESTAMP
        WHERE NOT EXISTS (
          SELECT 1 FROM projects
-         WHERE organization_id = '${orgId}' AND lower(trim(domain)) = '${escapedDomain}' AND archived_at IS NULL
+         WHERE organization_id = ${sqlText(orgId)} AND lower(trim(domain)) = ${sqlText(p.domain)} AND archived_at IS NULL
        )
        AND EXISTS (
          SELECT 1 FROM fleet_roster_members rm
          JOIN fleet_roster_versions v ON v.id = rm.version_id
-         WHERE v.id = '${approvedRoster.id}'
-           AND v.organization_id = '${orgId}'
-           AND rm.canonical_host = '${escapedDomain}'
+         WHERE v.id = ${sqlText(approvedRoster.id)}
+           AND v.organization_id = ${sqlText(orgId)}
+           AND rm.canonical_host = ${sqlText(p.domain)}
            AND rm.enrollment_state = 'active'
            AND v.id = (
              SELECT id FROM fleet_roster_versions
-             WHERE organization_id = '${orgId}'
+             WHERE organization_id = ${sqlText(orgId)}
                AND approved_at IS NOT NULL
                AND julianday(approved_at) <= julianday('now')
              ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
@@ -389,31 +446,31 @@ export async function linkFleet(options: {
     );
   }
 
-  // Scoped UPDATE with live write-time effective version predicate and project resolution (Sol F06)
+  // Scoped UPDATE with live write-time effective version predicate and project resolution (Sol F06, V3-01)
   for (const m of membersToLink) {
     sqlStatements.push(`
       UPDATE fleet_roster_members AS m
       SET project_id = (
         SELECT p.id FROM projects AS p
-        WHERE p.organization_id = '${orgId}'
+        WHERE p.organization_id = ${sqlText(orgId)}
           AND p.archived_at IS NULL AND lower(trim(p.domain)) = m.canonical_host
       )
-      WHERE m.id = '${m.memberId}'
-        AND m.version_id = '${approvedRoster.id}'
+      WHERE m.id = ${sqlText(m.memberId)}
+        AND m.version_id = ${sqlText(approvedRoster.id)}
         AND m.version_id = (
           SELECT id FROM fleet_roster_versions
-          WHERE organization_id = '${orgId}'
+          WHERE organization_id = ${sqlText(orgId)}
             AND approved_at IS NOT NULL
             AND julianday(approved_at) <= julianday('now')
           ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
           LIMIT 1
         )
-        AND m.canonical_host = '${m.host.replace(/'/g, "''")}'
+        AND m.canonical_host = ${sqlText(m.host)}
         AND m.enrollment_state = 'active'
         AND m.project_id IS NULL
         AND 1 = (
           SELECT count(*) FROM projects AS p
-          WHERE p.organization_id = '${orgId}'
+          WHERE p.organization_id = ${sqlText(orgId)}
             AND p.archived_at IS NULL AND lower(trim(p.domain)) = m.canonical_host
         )
       RETURNING id, project_id;
@@ -436,7 +493,7 @@ export async function linkFleet(options: {
     FROM fleet_roster_versions v
     LEFT JOIN fleet_roster_members m ON m.version_id = v.id
     LEFT JOIN projects p ON p.id = m.project_id
-    WHERE v.id = '${rosterId}' AND v.organization_id = '${orgId}'
+    WHERE v.id = ${sqlText(rosterId)} AND v.organization_id = ${sqlText(orgId)}
     GROUP BY v.id;
   `;
     const res = runD1Query(query, isRemote);

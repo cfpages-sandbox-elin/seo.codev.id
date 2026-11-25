@@ -62,6 +62,7 @@ export function checkFleetCoverage(options?: {
 
   if (!effectiveRoster) {
     return {
+      status: "no_effective_roster" as const,
       rosterId: null,
       denominator: 0,
       mapped: 0,
@@ -273,6 +274,7 @@ async function main() {
       remote: { type: "boolean", default: true },
       local: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
+      strict: { type: "boolean", default: false },
     },
     allowPositionals: true,
   });
@@ -291,10 +293,20 @@ async function main() {
   }
 
   const isRemote = args.values.local ? false : (args.values.remote ?? true);
+  const isStrict = !!args.values.strict;
   const result = checkFleetCoverage({ remote: isRemote });
 
   if (args.values.json) {
     console.log(JSON.stringify(result, null, 2));
+    if (
+      isStrict &&
+      (!result.rosterId ||
+        result.denominator === 0 ||
+        result.unmapped > 0 ||
+        result.repoQualified < result.denominator)
+    ) {
+      process.exitCode = 1;
+    }
     return;
   }
 
@@ -320,6 +332,15 @@ async function main() {
       `Sample unmapped properties (${Math.min(5, result.unmappedList.length)}):`,
       result.unmappedList.slice(0, 5),
     );
+  }
+  if (
+    isStrict &&
+    (!result.rosterId ||
+      result.denominator === 0 ||
+      result.unmapped > 0 ||
+      result.repoQualified < result.denominator)
+  ) {
+    process.exitCode = 1;
   }
 }
 

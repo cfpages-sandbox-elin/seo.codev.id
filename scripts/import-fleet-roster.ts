@@ -158,16 +158,32 @@ export async function importApprovedRoster(
       .orderBy(projects.createdAt, projects.id);
 
     const domainToProjectMap = new Map<string, string>();
+    const ambiguousHosts = new Set<string>();
     for (const p of orgProjects) {
       if (p.domain) {
         const norm = p.domain
+          .trim()
           .toLowerCase()
           .replace(/^https?:\/\//, "")
           .replace(/\/+$/, "");
-        if (!domainToProjectMap.has(norm)) {
+        if (
+          domainToProjectMap.has(norm) &&
+          domainToProjectMap.get(norm) !== p.id
+        ) {
+          ambiguousHosts.add(norm);
+        } else {
           domainToProjectMap.set(norm, p.id);
         }
       }
+    }
+
+    const rosterAmbiguous = FLEET_MANIFEST_MEMBERS.filter((m) =>
+      ambiguousHosts.has(m.canonicalHost.trim().toLowerCase()),
+    ).map((m) => m.canonicalHost);
+    if (rosterAmbiguous.length > 0) {
+      throw new Error(
+        `AMBIGUOUS_PROJECT_BINDING: Multiple active projects found in organization '${organizationId}' for manifest host(s): ${rosterAmbiguous.join(", ")}.`,
+      );
     }
 
     try {

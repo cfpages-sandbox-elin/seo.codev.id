@@ -200,6 +200,7 @@ function resolveDatabaseId(): string {
 async function d1Query<T = Record<string, unknown>>(
   databaseId: string,
   statement: string,
+  params?: unknown[],
 ): Promise<T[]> {
   const response = await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${accountId}/d1/database/${databaseId}/query`,
@@ -209,18 +210,29 @@ async function d1Query<T = Record<string, unknown>>(
         Authorization: `Bearer ${apiToken}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({ sql: statement }),
+      body: JSON.stringify(
+        params && params.length > 0
+          ? { sql: statement, params }
+          : { sql: statement },
+      ),
     },
   );
   const json = (await response.json()) as {
-    success: boolean;
+    success?: boolean;
     errors?: unknown;
-    result?: { results: T[] }[];
+    result?: { success?: boolean; results?: T[] }[];
   };
-  if (!response.ok || !json.success) {
-    throw new Error(`D1 query failed: ${JSON.stringify(json.errors ?? json)}`);
+  if (
+    !response.ok ||
+    json.success !== true ||
+    !Array.isArray(json.result) ||
+    json.result.length === 0 ||
+    json.result[0]?.success === false ||
+    !Array.isArray(json.result[0]?.results)
+  ) {
+    throw new Error(`D1_QUERY_FAILED: ${JSON.stringify(json.errors ?? json)}`);
   }
-  return json.result?.[0]?.results ?? [];
+  return json.result[0].results;
 }
 
 function tablesByName(modules: Record<string, unknown>[]): Map<string, Table> {
@@ -410,9 +422,18 @@ async function countD1(
 
 type PgDb = ReturnType<typeof drizzlePg>;
 
-// Copy one table from D1 to Postgres, paginating in PK order. `predicate` scopes
-// the read (null = whole table); `upsert` overwrites on PK conflict (--update)
-// vs insert-or-ignore (full migration). Returns read and applied row counts.
+function stableRowDigest(row: Record<string, unknown>): string {
+  const entries = Object.keys(row)
+    .sort()
+    .map((k) => {
+      const val = row[k];
+      if (val instanceof Date) return [k, val.toISOString()];
+      return [k, val ?? null];
+    });
+  return JSON.stringify(entries);
+}
+
+// Copy one table from D1 to Postgres using parameter-bound tuple keyset pagination across PK/unique arbiter keys.
 async function copyTable(
   databaseId: string,
   dest: PgDb,
@@ -421,63 +442,73 @@ async function copyTable(
   pgTable: Table,
   predicate: string | null,
   upsert: boolean,
-): Promise<{ readCount: number; appliedCount: number }> {
-  const pkCols = primaryKeyColumnNames(sqliteTable);
-  const singlePk = pkCols.length === 1 ? pkCols[0] : null;
-  const orderBy = singlePk
-    ? `ORDER BY "${singlePk}" ASC`
-    : primaryKeyOrder(sqliteTable);
-  // Keep each INSERT's bound-parameter count (rows × columns) well under
-  // Postgres's 65535 limit.
+): Promise<{
+  readCount: number;
+  appliedCount: number;
+  contentMismatches: number;
+}> {
+  const keyCols = conflictArbiterNames(sqliteTable);
+  const orderBy =
+    keyCols.length > 0
+      ? `ORDER BY ${keyCols.map((c) => `"${c}" ASC`).join(", ")}`
+      : primaryKeyOrder(sqliteTable);
   const colCount = Object.keys(getTableColumns(pgTable)).length;
   const tablePageSize = PAGE_SIZE_OVERRIDES[name] ?? pageSize;
   const insertBatch = Math.max(
     1,
     Math.min(tablePageSize, Math.floor(50000 / colCount)),
   );
-  const { target, set } = buildUpsert(
-    pgTable,
-    conflictArbiterNames(sqliteTable),
-  );
-  // Upsert needs an arbiter and at least one column to set; without both (e.g. a
-  // table with no PK/unique index, or all-arbiter columns) fall back to ignore.
+  const { target, set } = buildUpsert(pgTable, keyCols);
   const canUpsert = upsert && target.length > 0 && Object.keys(set).length > 0;
+  const pgColsMap = getTableColumns(pgTable);
+  const pgColsByDbName = new Map(
+    Object.entries(pgColsMap).map(([jsKey, col]) => [col.name, { jsKey, col }]),
+  );
 
-  let cursor: unknown = null;
+  let cursorValues: unknown[] | null = null;
   let offset = 0;
   let readCount = 0;
   let appliedCount = 0;
+  let contentMismatches = 0;
+
   for (;;) {
     let where = "";
-    if (singlePk) {
-      const cursorClause =
-        cursor !== null && cursor !== undefined
-          ? `"${singlePk}" > ${
-              typeof cursor === "string"
-                ? `'${String(cursor).replace(/'/g, "''")}'`
-                : cursor
-            }`
-          : "";
+    let params: unknown[] | undefined;
+    if (keyCols.length > 0) {
+      const tupleLhs =
+        keyCols.length === 1
+          ? `"${keyCols[0]}"`
+          : `(${keyCols.map((c) => `"${c}"`).join(", ")})`;
+      const tupleRhs =
+        keyCols.length === 1 ? `?` : `(${keyCols.map(() => "?").join(", ")})`;
+      const cursorClause = cursorValues ? `${tupleLhs} > ${tupleRhs}` : "";
       const parts = [predicate, cursorClause].filter(Boolean);
       where = parts.length > 0 ? `WHERE ${parts.join(" AND ")} ` : "";
+      if (cursorValues) params = cursorValues;
     } else {
       where = predicate ? `WHERE ${predicate} ` : "";
     }
 
-    const query = singlePk
-      ? `SELECT * FROM "${name}" ${where}${orderBy} LIMIT ${tablePageSize}`
-      : `SELECT * FROM "${name}" ${where}${orderBy} LIMIT ${tablePageSize} OFFSET ${offset}`;
+    const query =
+      keyCols.length > 0
+        ? `SELECT * FROM "${name}" ${where}${orderBy} LIMIT ${tablePageSize}`
+        : `SELECT * FROM "${name}" ${where}${orderBy} LIMIT ${tablePageSize} OFFSET ${offset}`;
 
-    const page = await d1Query<Record<string, unknown>>(databaseId, query);
+    const page: Record<string, unknown>[] = await d1Query<
+      Record<string, unknown>
+    >(databaseId, query, params);
     if (page.length === 0) break;
 
-    if (singlePk) {
-      cursor = page[page.length - 1][singlePk];
+    if (keyCols.length > 0) {
+      const lastRow: Record<string, unknown> = page[page.length - 1];
+      cursorValues = keyCols.map((k) => lastRow[k]);
     } else {
       offset += tablePageSize;
     }
 
-    const rows = page.map((row) => convertRow(sqliteTable, row));
+    const rows = page.map((row: Record<string, unknown>) =>
+      convertRow(sqliteTable, row),
+    );
     for (let i = 0; i < rows.length; i += insertBatch) {
       const chunk = rows.slice(i, i + insertBatch);
       const inserted = await (canUpsert
@@ -488,11 +519,38 @@ async function copyTable(
             .returning()
         : dest.insert(pgTable).values(chunk).onConflictDoNothing().returning());
       appliedCount += inserted.length;
+
+      // V3-04: When conflict skips occur (e.g. --allow-nonempty), verify surviving destination payload equals source row
+      if (inserted.length < chunk.length && keyCols.length > 0) {
+        for (const expectedRow of chunk) {
+          const keyPredicates = keyCols
+            .map((colName) => {
+              const entry = pgColsByDbName.get(colName);
+              if (!entry) return null;
+              return sql`${entry.col} = ${expectedRow[entry.jsKey]}`;
+            })
+            .filter(Boolean) as SQL[];
+          if (keyPredicates.length === keyCols.length) {
+            const destRows = await dest
+              .select()
+              .from(pgTable)
+              .where(sql.join(keyPredicates, sql` AND `))
+              .limit(1);
+            if (
+              destRows.length === 0 ||
+              stableRowDigest(destRows[0] as Record<string, unknown>) !==
+                stableRowDigest(expectedRow)
+            ) {
+              contentMismatches++;
+            }
+          }
+        }
+      }
     }
     readCount += page.length;
     if (page.length < tablePageSize) break;
   }
-  return { readCount, appliedCount };
+  return { readCount, appliedCount, contentMismatches };
 }
 
 async function main() {
@@ -560,8 +618,9 @@ async function main() {
 
     const written = new Map<
       string,
-      { readCount: number; appliedCount: number }
+      { readCount: number; appliedCount: number; contentMismatches: number }
     >();
+    let totalContentMismatches = 0;
     for (const name of order) {
       const predicate = updateMode ? deltaPredicate(name, cutoffIso) : null;
       const counts = await copyTable(
@@ -574,24 +633,19 @@ async function main() {
         updateMode,
       );
       written.set(name, counts);
+      totalContentMismatches += counts.contentMismatches;
       const verb = updateMode ? "synced" : "wrote";
       const skippedNote =
         counts.readCount > counts.appliedCount
-          ? ` (read: ${counts.readCount}, skipped: ${counts.readCount - counts.appliedCount})`
+          ? ` (read: ${counts.readCount}, skipped: ${counts.readCount - counts.appliedCount}, contentMismatches: ${counts.contentMismatches})`
           : "";
       console.log(
         `  ${name.padEnd(34)} ${verb} ${String(counts.appliedCount).padStart(7)}${skippedNote}`,
       );
     }
 
-    // Serial PKs (keyword_metrics.id, rank_snapshots.id) were copied with their
-    // explicit D1 ids, but the Postgres sequences still sit at 1. Without advancing
-    // them, post-cutover inserts that omit id and rely on the serial default would
-    // collide with migrated rows — silently dropped for rank_snapshots (untargeted
-    // onConflictDoNothing) and a hard duplicate-key error for keyword_metrics. Bump
-    // each serial column's sequence to max(id) (3-arg setval keeps next id at 1 when
-    // the table is empty).
-    console.log("\nResetting serial sequences...");
+    // V3-04: Monotonic serial sequence advance (never rewind an already higher sequence)
+    console.log("\nAdvancing serial sequences monotonically...");
     for (const name of order) {
       const pgTable = pgTables.get(name)!;
       for (const column of Object.values(getTableColumns(pgTable))) {
@@ -599,19 +653,26 @@ async function main() {
         const col = sql.identifier(column.name);
         const tbl = sql.identifier(name);
         await dest.execute(sql`
-        SELECT setval(
-          pg_get_serial_sequence(${name}, ${column.name}),
-          COALESCE((SELECT max(${col}) FROM ${tbl}), 1),
-          (SELECT max(${col}) FROM ${tbl}) IS NOT NULL
-        )
+        SELECT CASE
+          WHEN (SELECT max(${col}) FROM ${tbl}) IS NOT NULL THEN
+            setval(
+              pg_get_serial_sequence(${name}, ${column.name}),
+              GREATEST(
+                (SELECT COALESCE(last_value, 1) FROM pg_sequences WHERE schemaname = current_schema() AND sequencename = split_part(pg_get_serial_sequence(${name}, ${column.name}), '.', 2)),
+                (SELECT max(${col}) FROM ${tbl})
+              ),
+              true
+            )
+          ELSE NULL
+        END
       `);
-        console.log(`  ${name}.${column.name} sequence reset`);
+        console.log(`  ${name}.${column.name} sequence checked`);
       }
     }
 
-    // Verify: D1 count vs Postgres count per table.
-    console.log("\nVerifying row counts...");
-    let mismatches = 0;
+    // Verify: D1 count + keyed sample content parity vs Postgres per table.
+    console.log("\nVerifying row counts and content parity...");
+    let mismatches = totalContentMismatches;
     for (const name of order) {
       const sourceCount = await countD1(databaseId, name);
       const [{ count }] = await dest

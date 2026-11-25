@@ -241,8 +241,8 @@ function buildExecutionArgv(options: {
   return argv;
 }
 
-function quoteArg(arg: string): string {
-  return /[ \t\n\r"']/.test(arg) ? `'${arg.replaceAll("'", "''")}'` : arg;
+function quotePowerShell(arg: string): string {
+  return "'" + arg.replaceAll("'", "''") + "'";
 }
 
 export const runFleetAuditTool = {
@@ -329,7 +329,7 @@ export const runFleetAuditTool = {
       targetProjectId,
     });
 
-    const executionCommand = `pnpm ${argv.map(quoteArg).join(" ")}`;
+    const executionCommand = `& ${["pnpm", ...argv].map(quotePowerShell).join(" ")}`;
     const message = domain
       ? `Fleet audit plan configured for ${domain} in ${mode} mode.`
       : `Fleet audit plan configured across enrolled properties in ${mode} mode.`;
@@ -360,7 +360,7 @@ export const runFleetAuditTool = {
         argv,
         executionCommand,
       },
-      text: `${message}\nRead-only Execution Plan: \`${executionCommand}\`\nNote: To execute, run this command in a terminal or workflow.`,
+      text: `${message}\nPortable Invocation Contract: executable="pnpm", argv=${JSON.stringify(argv)}\nPowerShell Display Command: \`${executionCommand}\`\nNote: Prefer launching executable with argv directly (no shell). Use the PowerShell command strictly inside PowerShell.`,
     });
   },
 };

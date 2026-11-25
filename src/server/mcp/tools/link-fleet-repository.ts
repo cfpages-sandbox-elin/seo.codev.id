@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { fleetRosterMembers } from "@/db/schema";
@@ -164,26 +164,32 @@ export const linkFleetRepositoryTool = {
             AND approved_at IS NOT NULL
             AND (
               CASE
-                WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$'
+                WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$'
                  AND pg_input_is_valid(approved_at || '+00', 'timestamptz') THEN (approved_at || '+00')::timestamptz <= CURRENT_TIMESTAMP
-                WHEN pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz <= CURRENT_TIMESTAMP
+                WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$'
+                 AND pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz <= CURRENT_TIMESTAMP
                 ELSE false
               END
             )
           ORDER BY (
             CASE
-              WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$'
+              WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$'
                AND pg_input_is_valid(approved_at || '+00', 'timestamptz') THEN (approved_at || '+00')::timestamptz
-              WHEN pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz
+              WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$'
+               AND pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz
               ELSE NULL
             END
-          ) DESC NULLS LAST, id DESC
+          ) DESC NULLS LAST, id COLLATE "C" DESC
           LIMIT 1
         )`
       : sql`(
           SELECT id FROM fleet_roster_versions
           WHERE organization_id = ${orgId}
             AND approved_at IS NOT NULL
+            AND (
+              (approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND approved_at = strftime('%Y-%m-%d %H:%M:%S', approved_at))
+              OR (approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' AND substr(approved_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(approved_at, 1, 19)))
+            )
             AND julianday(approved_at) <= julianday('now')
           ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
           LIMIT 1
@@ -191,14 +197,16 @@ export const linkFleetRepositoryTool = {
 
     const currentSlug = member.repoName?.trim();
     const currentRoot = normalizeGitRelativePath(member.publishRoot);
+    const rootStillMatches =
+      member.publishRoot === null
+        ? isNull(fleetRosterMembers.publishRoot)
+        : eq(fleetRosterMembers.publishRoot, member.publishRoot);
 
     if (
       currentSlug === cleanSlug &&
       (cleanRoot === undefined || currentRoot === cleanRoot)
     ) {
-      // Sol Round 24 R24-11: verify the mapping still matches the requested publishRoot and effective member
-      const expectedVerifyRoot =
-        cleanRoot !== undefined ? cleanRoot : currentRoot;
+      // Sol Round 24 R24-11, V4-07: verify the mapping still matches exact raw root and effective member
       const verifyEffective = await db
         .select({
           id: fleetRosterMembers.id,
@@ -212,7 +220,7 @@ export const linkFleetRepositoryTool = {
             eq(fleetRosterMembers.versionId, effectiveVersionSubquery),
             eq(fleetRosterMembers.enrollmentState, "active"),
             eq(fleetRosterMembers.repoName, cleanSlug),
-            sql`coalesce(${fleetRosterMembers.publishRoot}, '.') = ${expectedVerifyRoot}`,
+            rootStillMatches,
           ),
         )
         .limit(1);
@@ -243,7 +251,7 @@ export const linkFleetRepositoryTool = {
       updateSet.publishRoot = cleanRoot;
     }
 
-    // Sol Round 24 R24-11: Atomic write-time assertion that versionId is currently effective and guarded against concurrent mutation
+    // Sol Round 24 R24-11, V4-07: Atomic write-time assertion using raw old publishRoot value in CAS
     const updateRes = await db
       .update(fleetRosterMembers)
       .set(updateSet)
@@ -253,8 +261,10 @@ export const linkFleetRepositoryTool = {
           eq(fleetRosterMembers.versionId, approvedRoster.id),
           eq(fleetRosterMembers.enrollmentState, "active"),
           eq(fleetRosterMembers.versionId, effectiveVersionSubquery),
-          sql`coalesce(${fleetRosterMembers.repoName}, '') = ${member.repoName ?? ""}`,
-          sql`coalesce(${fleetRosterMembers.publishRoot}, '.') = ${currentRoot}`,
+          member.repoName === null
+            ? isNull(fleetRosterMembers.repoName)
+            : eq(fleetRosterMembers.repoName, member.repoName),
+          rootStillMatches,
         ),
       )
       .returning({

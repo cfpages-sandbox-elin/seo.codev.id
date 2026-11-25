@@ -128,17 +128,20 @@ export async function getAggregatedFleetIssues(options: {
     );
   }
 
-  // Sol Round 18 F2, Round 19 C1: Bind repository qualification strictly to effective approved roster version with full source mapping
-  const allRosterVersions = runD1Query(
-    `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';`,
-    isRemote,
-  );
-  const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
-  const effectiveRosterId = effectiveRoster?.id ?? null;
+  // Sol Round 18 F2, Round 19 C1, V1-02: Bind repository qualification strictly to effective approved roster version (skip in edge-only mode)
+  let effectiveRosterId: string | null = null;
+  if (sourceMode !== "edge") {
+    const allRosterVersions = runD1Query(
+      `SELECT id, version_tag, approved_at, domain_count FROM fleet_roster_versions WHERE organization_id = 'shared-workspace';`,
+      isRemote,
+    );
+    const effectiveRoster = selectEffectiveRosterVersion(allRosterVersions);
+    effectiveRosterId = effectiveRoster?.id ?? null;
+  }
 
   const repoDiagnosticProof = effectiveRosterId
     ? `EXISTS (
-        SELECT 1 FROM fleet_roster_members m
+        SELECT COUNT(*) FROM fleet_roster_members m
         JOIN fleet_run_items fri ON fri.audit_id = a.id AND fri.member_id = m.id AND fri.project_id = p.id AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed'
         JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = p.organization_id AND fr.status = 'completed'
         JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = p.id AND lower(trim(fs.canonical_host)) = lower(trim(m.canonical_host)) AND fs.series_key = 'diagnostic'
@@ -179,6 +182,10 @@ export async function getAggregatedFleetIssues(options: {
         ? `AND a.workflow_instance_id LIKE 'github-audit-%' AND ${repoDiagnosticProof}`
         : "";
 
+  const domainFilterCteCondition = options.domain
+    ? `AND lower(trim(p.domain)) = ${sqlText(options.domain.toLowerCase().trim())}`
+    : "";
+
   const partitionClause =
     sourceMode === "edge" || sourceMode === "repository"
       ? "a.project_id"
@@ -190,16 +197,17 @@ export async function getAggregatedFleetIssues(options: {
              CASE WHEN a.workflow_instance_id LIKE 'github-audit-%' THEN 'repository' ELSE 'edge' END AS source,
              ROW_NUMBER() OVER (
                PARTITION BY ${partitionClause}
-               ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
+               ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id COLLATE BINARY DESC
              ) AS audit_rank
       FROM audits a
       JOIN projects p ON p.id = a.project_id
       WHERE a.status = 'completed'
         AND p.organization_id = 'shared-workspace'
         AND p.archived_at IS NULL
+        ${domainFilterCteCondition}
         AND (
           a.workflow_instance_id NOT LIKE 'github-audit-%' OR a.workflow_instance_id IS NULL
-          OR ${repoDiagnosticProof}
+          ${sourceMode !== "edge" ? `OR ${repoDiagnosticProof}` : ""}
         )
         ${sourceFilterCondition}
     )
