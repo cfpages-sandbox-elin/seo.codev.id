@@ -94,4 +94,13 @@ describe("page-analyzer inert and edge case parsing", () => {
     expect(res.h1s).toEqual(["Live"]);
     expect(res.links[0]?.targetUrl).toBe("https://example.com/dir/next");
   });
+
+  it("preserves visible text and links when tag-like sequences appear in quoted attributes (Sol Round 22 F02)", () => {
+    const html = `<p data-example="<noscript>">Catalogue</p><a href="/about">About us</a>`;
+    const res = analyzeHtml(html, "https://example.com/dir/", 200, 0);
+    expect(res.wordCount).toBeGreaterThanOrEqual(2);
+    expect(res.links.map((l) => l.targetUrl)).toContain(
+      "https://example.com/about",
+    );
+  });
 });

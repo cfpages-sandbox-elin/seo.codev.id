@@ -461,8 +461,25 @@ async function main() {
           failedCount++;
           continue;
         }
+
+        let parsedStartUrl: URL;
+        try {
+          parsedStartUrl = new URL(`https://${cleanHost}`);
+          if (parsedStartUrl.hostname !== cleanHost) {
+            throw new Error(
+              `Hostname mismatch: expected '${cleanHost}', got '${parsedStartUrl.hostname}'`,
+            );
+          }
+        } catch (e: any) {
+          console.error(
+            `[ERROR] Invalid start URL for project ${project.id} (${cleanHost}): ${e?.message}`,
+          );
+          failedCount++;
+          continue;
+        }
+
         const auditId = crypto.randomUUID();
-        const startUrl = `https://${cleanHost}`;
+        const startUrl = parsedStartUrl.toString();
 
         const config = {
           maxPages,
@@ -474,7 +491,7 @@ async function main() {
           `[DISPATCH] Launching audit on ${project.domain} (${startUrl}) [ID: ${auditId}]`,
         );
 
-        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits for the same project
+        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits for the same project and requires unarchived project
         const insertSql = `
           INSERT INTO audits (
             id, project_id, started_by_user_id, start_url,
@@ -488,6 +505,10 @@ async function main() {
           WHERE NOT EXISTS (
             SELECT 1 FROM audits
             WHERE project_id = ${sqlText(project.id)} AND status = 'running'
+          )
+          AND EXISTS (
+            SELECT 1 FROM projects
+            WHERE id = ${sqlText(project.id)} AND archived_at IS NULL
           );
         `;
         runD1Query(insertSql, isRemote);

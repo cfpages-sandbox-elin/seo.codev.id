@@ -169,10 +169,12 @@ export async function loadPersistedCursor(): Promise<LoadedCursorState> {
   }
 }
 
+export type CursorSaveResult = "applied" | "conflict" | "error";
+
 export async function savePersistedCursor(
   cursor: WatchdogCursor,
   expectedRevision?: number | null,
-): Promise<boolean> {
+): Promise<CursorSaveResult> {
   try {
     const isPg = getDatabaseProvider() === "postgres";
     const nowIso = new Date().toISOString();
@@ -196,9 +198,9 @@ export async function savePersistedCursor(
 
       if (res.length > 0) {
         sweepCursor = cursor;
-        return true;
+        return "applied";
       }
-      return false;
+      return "conflict";
     }
 
     if (expectedRevision === null) {
@@ -215,9 +217,9 @@ export async function savePersistedCursor(
 
       if (res.length > 0) {
         sweepCursor = cursor;
-        return true;
+        return "applied";
       }
-      return false;
+      return "conflict";
     }
 
     const existing = await db.query.watchdogCursor.findFirst({
@@ -243,9 +245,9 @@ export async function savePersistedCursor(
 
       if (res.length > 0) {
         sweepCursor = cursor;
-        return true;
+        return "applied";
       }
-      return false;
+      return "conflict";
     } else {
       const res = await db
         .insert(watchdogCursor)
@@ -260,12 +262,13 @@ export async function savePersistedCursor(
 
       if (res.length > 0) {
         sweepCursor = cursor;
-        return true;
+        return "applied";
       }
-      return false;
+      return "conflict";
     }
-  } catch {
-    return false;
+  } catch (error) {
+    console.error("Audit watchdog: database error saving cursor:", error);
+    return "error";
   }
 }
 
@@ -368,19 +371,23 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
 
   // Sol Round 21 F08: Update cursor for next sweep AFTER processing stale batch
   if (loaded.revision !== -1) {
-    let saved = false;
+    let saveResult: CursorSaveResult = "conflict";
     if (stale.length > 0) {
       const last = stale[stale.length - 1];
-      saved = await savePersistedCursor(
+      saveResult = await savePersistedCursor(
         { startedAt: last.startedAt, id: last.id },
         loaded.revision,
       );
     } else {
-      saved = await savePersistedCursor(null, loaded.revision);
+      saveResult = await savePersistedCursor(null, loaded.revision);
     }
-    if (!saved) {
+    if (saveResult === "conflict") {
       console.warn(
         "Audit watchdog: cursor was not advanced due to revision conflict",
+      );
+    } else if (saveResult === "error") {
+      console.error(
+        "Audit watchdog: cursor failed to advance due to database error",
       );
     }
   }
@@ -412,7 +419,7 @@ async function getStaleRunningAudits(
   const cursorPredicate = cursor
     ? isPg
       ? sql`(${audits.startedAt}::timestamptz > ${cursor.startedAt}::timestamptz OR (${audits.startedAt}::timestamptz = ${cursor.startedAt}::timestamptz AND ${audits.id} > ${cursor.id}))`
-      : sql`(julianday(${audits.startedAt}) > julianday(${cursor.startedAt}) OR (julianday(${audits.startedAt}) = julianday(${cursor.startedAt}) AND ${audits.id} > ${cursor.id}))`
+      : sql`(${audits.startedAt} > ${cursor.startedAt} OR (${audits.startedAt} = ${cursor.startedAt} AND ${audits.id} > ${cursor.id}))`
     : undefined;
 
   return db.query.audits.findMany({
@@ -424,7 +431,7 @@ async function getStaleRunningAudits(
     ),
     orderBy: isPg
       ? [sql`${audits.startedAt}::timestamptz ASC`, sql`${audits.id} ASC`]
-      : [sql`julianday(${audits.startedAt}) ASC`, sql`${audits.id} ASC`],
+      : [asc(audits.startedAt), asc(audits.id)],
     columns: {
       id: true,
       workflowInstanceId: true,

@@ -41,6 +41,7 @@ export const getFleetMatrixTool = {
       .object({
         rosterVersion: z.string(),
         totalDomains: z.number(),
+        filteredCount: z.number().optional(),
         gradedCount: z.number(),
         medianScore: z.number().nullable(),
         criticalIncidentsCount: z.number(),
@@ -60,6 +61,7 @@ export const getFleetMatrixTool = {
     }
     const overview = await FleetService.getOverview(orgId);
     let domains: FleetDomainSummary[] = overview.domains;
+    const fleetTotalDomains = overview.totalDomains;
     if (args.domain) {
       const target = args.domain.toLowerCase().trim();
       domains = domains.filter(
@@ -69,14 +71,17 @@ export const getFleetMatrixTool = {
     return mcpResponse({
       structuredContent: {
         rosterVersion: overview.rosterVersion,
-        totalDomains: domains.length,
+        totalDomains: fleetTotalDomains,
+        filteredCount: domains.length,
         gradedCount: overview.gradedCount,
         medianScore: overview.medianScore,
         criticalIncidentsCount: overview.criticalIncidentsCount,
         gradeDistribution: overview.gradeDistribution,
         domains,
       },
-      text: `Retrieved fleet matrix with ${domains.length} domain entries for organization '${orgId}'.`,
+      text: args.domain
+        ? `Retrieved fleet matrix row for domain '${args.domain}' (${domains.length} match found, fleet total: ${fleetTotalDomains}).`
+        : `Retrieved fleet matrix with ${domains.length} domain entries for organization '${orgId}'.`,
     });
   },
 };

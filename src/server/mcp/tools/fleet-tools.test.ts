@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
-import { getFleetIssuesTool, runFleetAuditTool } from "./fleet-tools";
+import {
+  getFleetIssuesTool,
+  getFleetMatrixTool,
+  linkFleetRepositoryTool,
+  runFleetAuditTool,
+} from "./fleet-tools";
 import { makeToolContext } from "./tool-test-support";
 
 vi.mock("cloudflare:workers", () => ({ env: {} }));
@@ -228,6 +233,78 @@ describe("Fleet MCP Tools", () => {
       expect(schema.domain.safeParse("a".repeat(255) + ".com").success).toBe(
         false,
       );
+    });
+  });
+
+  describe("link_fleet_repository", () => {
+    it("validates canonical domain input in link_fleet_repository schema", () => {
+      const schema = linkFleetRepositoryTool.config.inputSchema;
+      expect(schema.domain.safeParse("a.id").success).toBe(true);
+      expect(schema.domain.safeParse("kaca.co.id").success).toBe(true);
+      expect(schema.domain.safeParse("-invalid.com").success).toBe(false);
+      expect(schema.domain.safeParse("https://kaca.co.id").success).toBe(false);
+    });
+
+    it("rejects non-operator caller with member role (Sol Round 22 F03)", async () => {
+      const memberContext = makeToolContext({
+        organizationId: "shared-workspace",
+        role: "member",
+      });
+      await expect(
+        linkFleetRepositoryTool.handler(
+          {
+            domain: "kaca.co.id",
+            repoName: "cfpages-syamsulalam-net/kaca-co-id",
+          },
+          memberContext,
+        ),
+      ).rejects.toThrow(
+        /linking fleet repositories requires 'owner' or 'admin' role/,
+      );
+    });
+
+    it("rejects caller outside shared-workspace organization", async () => {
+      const foreignContext = makeToolContext({
+        organizationId: "foreign_org",
+        role: "owner",
+      });
+      await expect(
+        linkFleetRepositoryTool.handler(
+          {
+            domain: "kaca.co.id",
+            repoName: "cfpages-syamsulalam-net/kaca-co-id",
+          },
+          foreignContext,
+        ),
+      ).rejects.toThrow(/shared-workspace/);
+    });
+
+    it("rejects invalid canonical domain in handler", async () => {
+      await expect(
+        linkFleetRepositoryTool.handler(
+          {
+            domain: "-invalid.com",
+            repoName: "cfpages-syamsulalam-net/kaca-co-id",
+          },
+          toolContext,
+        ),
+      ).rejects.toThrow(/Invalid canonical hostname/);
+    });
+  });
+
+  describe("get_fleet_matrix", () => {
+    it("validates canonical domain input in get_fleet_matrix schema", () => {
+      const schema = getFleetMatrixTool.config.inputSchema;
+      expect(schema.domain.safeParse("a.id").success).toBe(true);
+      expect(schema.domain.safeParse("kaca.co.id").success).toBe(true);
+      expect(schema.domain.safeParse("-invalid.com").success).toBe(false);
+    });
+
+    it("rejects caller outside shared-workspace organization", async () => {
+      const foreignContext = makeToolContext({ organizationId: "foreign_org" });
+      await expect(
+        getFleetMatrixTool.handler({}, foreignContext),
+      ).rejects.toThrow(/shared-workspace/);
     });
   });
 });

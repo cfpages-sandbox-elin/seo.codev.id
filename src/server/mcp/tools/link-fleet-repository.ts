@@ -41,8 +41,9 @@ const linkFleetRepositoryInputSchema = {
     .string()
     .trim()
     .optional()
-    .default(".")
-    .describe("Optional repository-relative publish directory (default: '.')."),
+    .describe(
+      "Optional repository-relative publish directory (preserves current mapping if omitted).",
+    ),
   expectedRosterId: z
     .string()
     .trim()
@@ -86,6 +87,14 @@ export const linkFleetRepositoryTool = {
       );
     }
 
+    // Sol Round 22 F03: Operator permission check (owner or admin only)
+    const role = context.auth?.role;
+    if (!role || (role !== "owner" && role !== "admin")) {
+      throw new Error(
+        `Unauthorized: linking fleet repositories requires 'owner' or 'admin' role in organization '${orgId}'; current role is '${role ?? "none"}'.`,
+      );
+    }
+
     const domain = args.domain.toLowerCase().trim();
     if (!isValidCanonicalHostname(domain)) {
       throw new Error(
@@ -94,7 +103,11 @@ export const linkFleetRepositoryTool = {
     }
 
     const cleanSlug = normalizeRepoSlug(args.repoName);
-    const cleanRoot = normalizeGitRelativePath(args.publishRoot ?? ".");
+    // Sol Round 22 F10: If publishRoot is omitted or undefined, preserve existing root rather than resetting to '.'
+    const cleanRoot =
+      args.publishRoot !== undefined
+        ? normalizeGitRelativePath(args.publishRoot)
+        : undefined;
 
     const approvedRoster = await FleetRepository.getApprovedRoster(orgId);
     if (!approvedRoster) {
@@ -141,41 +154,57 @@ export const linkFleetRepositoryTool = {
       );
     }
 
+    const effectiveRoot =
+      cleanRoot ?? normalizeGitRelativePath(member.publishRoot);
     const currentSlug = member.repoName?.trim();
     const currentRoot = normalizeGitRelativePath(member.publishRoot);
 
-    if (currentSlug === cleanSlug && currentRoot === cleanRoot) {
+    if (currentSlug === cleanSlug && currentRoot === effectiveRoot) {
       return mcpResponse({
         structuredContent: {
           status: "unchanged",
           domain,
           repoName: cleanSlug,
-          publishRoot: cleanRoot,
+          publishRoot: effectiveRoot,
           memberId: member.id,
           versionId: approvedRoster.id,
         },
-        text: `Repository mapping for '${domain}' is already linked to '${cleanSlug}' (root: '${cleanRoot}') in roster '${approvedRoster.id}'.`,
+        text: `Repository mapping for '${domain}' is already linked to '${cleanSlug}' (root: '${effectiveRoot}') in roster '${approvedRoster.id}'.`,
       });
     }
 
-    await db
+    // Sol Round 22 F04: Atomic in-statement roster assertion with RETURNING id
+    const updateRes = await db
       .update(fleetRosterMembers)
       .set({
         repoName: cleanSlug,
-        publishRoot: cleanRoot,
+        publishRoot: effectiveRoot,
       })
-      .where(eq(fleetRosterMembers.id, member.id));
+      .where(
+        and(
+          eq(fleetRosterMembers.id, member.id),
+          eq(fleetRosterMembers.versionId, approvedRoster.id),
+          eq(fleetRosterMembers.enrollmentState, "active"),
+        ),
+      )
+      .returning({ id: fleetRosterMembers.id });
+
+    if (!updateRes || updateRes.length === 0) {
+      throw new Error(
+        `Failed to link repository for '${domain}': member was modified or roster '${approvedRoster.id}' was superseded concurrently.`,
+      );
+    }
 
     return mcpResponse({
       structuredContent: {
         status: "linked",
         domain,
         repoName: cleanSlug,
-        publishRoot: cleanRoot,
+        publishRoot: effectiveRoot,
         memberId: member.id,
         versionId: approvedRoster.id,
       },
-      text: `Successfully linked '${domain}' to repository '${cleanSlug}' (root: '${cleanRoot}') in roster '${approvedRoster.id}'.`,
+      text: `Successfully linked '${domain}' to repository '${cleanSlug}' (root: '${effectiveRoot}') in roster '${approvedRoster.id}'.`,
     });
   },
 };

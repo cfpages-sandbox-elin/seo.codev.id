@@ -295,6 +295,13 @@ async function remove(auditId: string, projectId: string) {
   }
 
   if (audit.status === "running") {
+    // Sol Round 22 F11: Direct repository audits use synthetic marker github-audit-* and run out-of-band on Node.js CLI.
+    // Deleting the row cleans up the audit without attempting to contact Cloudflare Workflows.
+    if (audit.workflowInstanceId?.startsWith("github-audit-")) {
+      await AuditRepository.deleteAuditForProject(auditId, projectId);
+      return;
+    }
+
     if (!audit.workflowInstanceId) {
       throw new AppError(
         "CONFLICT",

@@ -20,7 +20,7 @@ const statement = {
   // GSC/GA4 connect, re-point, disconnect.
   integration: ["manage"],
   // Helicopter view across the 87-domain portfolio fleet.
-  fleet: ["view"],
+  fleet: ["view", "manage"],
 } as const;
 
 export const orgAccessControl = createAccessControl(statement);
@@ -31,13 +31,13 @@ export const orgRoles = {
     billing: ["manage"],
     project: ["create", "delete"],
     integration: ["manage"],
-    fleet: ["view"],
+    fleet: ["view", "manage"],
   }),
   admin: orgAccessControl.newRole({
     ...adminAc.statements,
     project: ["create", "delete"],
     integration: ["manage"],
-    fleet: ["view"],
+    fleet: ["view", "manage"],
   }),
   // Defined from day one so exposing it later is UI-only; not offered in the
   // invite picker yet. Members can view everything and run research, but not

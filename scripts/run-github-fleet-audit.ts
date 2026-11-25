@@ -369,6 +369,7 @@ export function findMatchingCompletedAudit(
        AND a.workflow_instance_id LIKE 'github-audit-%'
        AND a.pages_total > 0
        AND a.pages_crawled >= a.pages_total
+       AND json_valid(a.config)
        AND json_extract(a.config, '$.source') = 'github_repository_direct'
        AND json_extract(a.config, '$.commitSha') = ${sqlText(commitSha)}
        AND json_extract(a.config, '$.repoName') = ${sqlText(repoName)}
@@ -637,16 +638,6 @@ async function auditRepository(
 
   const candidateFiles = htmlFiles.slice(0, maxPages);
 
-  // Build alias-to-canonical URL map for fast lookup
-  const aliasToCanonicalUrl = new Map<string, string>();
-  for (const file of htmlFiles) {
-    const pageUrl = pathToUrl(file.path);
-    const encoded = file.path.split("/").map(encodeURIComponent).join("/");
-    aliasToCanonicalUrl.set(normalizeRoute(pageUrl), pageUrl);
-    aliasToCanonicalUrl.set(normalizeRoute(`${domain}/${encoded}`), pageUrl);
-    aliasToCanonicalUrl.set(normalizeRoute(`/${encoded}`), pageUrl);
-  }
-
   // Handle stale recovery (> 2 hours old without completion) strictly for repository-lane audits (Sol R3)
   executeD1SqlStatements(
     [
@@ -699,7 +690,20 @@ async function auditRepository(
     WHERE NOT EXISTS (
       SELECT 1 FROM audits
       WHERE project_id = ${sqlText(projectId)} AND status = 'running'
-    );`,
+    )
+    ${
+      mapping?.expectedRosterVersionId && mapping?.expectedMemberId
+        ? `AND EXISTS (
+             SELECT 1 FROM projects p
+             JOIN fleet_roster_members rm ON rm.project_id = p.id AND rm.id = ${sqlText(mapping.expectedMemberId)}
+             JOIN fleet_roster_versions v ON v.id = rm.version_id
+             WHERE p.id = ${sqlText(projectId)} AND p.archived_at IS NULL
+               AND rm.enrollment_state = 'active'
+               AND rm.repo_name = ${sqlText(repoName)}
+               AND rm.version_id = ${sqlText(mapping.expectedRosterVersionId)}
+           )`
+        : ""
+    };`,
     ],
     isRemote,
   );
@@ -1474,6 +1478,8 @@ function publishGuardedDiagnosticTriple(
     `INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
      SELECT ${sqlText(runId)}, v.organization_id, v.id, 'v1', 'manual', 'github-audit-runner', ${sqlText(runStatus)}, 1, ${isComplete ? 1 : 0}, ${isComplete ? 0 : 1}, ${sqlText(nowIso)}, ${sqlText(nowIso)}
      FROM fleet_roster_versions v
+     JOIN fleet_roster_members rm ON rm.version_id = v.id AND rm.id = ${sqlText(memberId)} AND rm.enrollment_state = 'active'
+     JOIN projects p ON p.id = rm.project_id AND p.organization_id = v.organization_id AND p.archived_at IS NULL
      WHERE v.id = ${sqlText(versionId)} AND v.organization_id = ${sqlText(organizationId)}
      ON CONFLICT(id) DO UPDATE SET status = ${sqlText(runStatus)}, completed_at = ${sqlText(nowIso)};`,
 
@@ -1501,20 +1507,42 @@ function publishGuardedDiagnosticTriple(
      INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
      SELECT ${sqlText(runItemId)}, ${sqlText(runId)}, member_id, project_id, id, 'diagnostic', ${sqlText(itemStatus)}, 1, ${sqlText(nowIso)}, ${sqlText(nowIso)}
      FROM eligible
+     WHERE 1
      ON CONFLICT(id) DO UPDATE SET status = ${sqlText(itemStatus)}, completed_at = ${sqlText(nowIso)};`,
 
-    `WITH eligible_item AS (
+    `WITH eligible AS (
+       SELECT a.id, p.id AS project_id, m.id AS member_id, m.version_id
+       FROM audits a
+       JOIN projects p ON p.id = a.project_id AND p.archived_at IS NULL
+       JOIN fleet_roster_members m ON m.project_id = p.id AND m.id = ${sqlText(memberId)}
+       JOIN fleet_roster_versions v ON v.id = m.version_id
+       WHERE a.id = ${sqlText(auditId)} AND a.status = 'completed'
+         AND p.organization_id = ${sqlText(organizationId)} AND v.organization_id = ${sqlText(organizationId)}
+         AND m.enrollment_state = 'active' AND m.version_id = ${sqlText(versionId)}
+         AND lower(trim(p.domain)) = lower(trim(m.canonical_host))
+         AND json_valid(a.config)
+         AND json_extract(a.config, '$.source') = 'github_repository_direct'
+         AND json_extract(a.config, '$.repoName') = m.repo_name
+         AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
+         AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
+         AND json_extract(a.config, '$.rosterSource.versionId') = v.id
+         AND json_extract(a.config, '$.rosterSource.memberId') = m.id
+         AND json_extract(a.config, '$.rosterSource.projectId') = p.id
+         AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
+         AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
+     ),
+     eligible_item AS (
        SELECT fri.id AS run_item_id, fri.member_id, fri.project_id
        FROM fleet_run_items fri
-       JOIN fleet_runs fr ON fr.id = fri.run_id
-       JOIN fleet_roster_members rm ON rm.id = fri.member_id AND rm.version_id = fr.roster_version_id
+       JOIN eligible e ON e.id = fri.audit_id AND e.member_id = fri.member_id AND e.project_id = fri.project_id
+       JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = e.version_id
        WHERE fri.id = ${sqlText(runItemId)}
-         AND fri.audit_id = ${sqlText(auditId)}
          AND fri.status IN ('completed', 'partial')
      )
      INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
      SELECT ${sqlText(snapshotId)}, run_item_id, member_id, project_id, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(nowIso)}
      FROM eligible_item
+     WHERE 1
      ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(nowIso)};`,
   ];
 
@@ -1978,6 +2006,7 @@ async function main() {
     let projId: string | undefined;
     let repoName: string | undefined;
     let publishRoot = ".";
+    let isApprovedProvenance = false;
 
     if (!isWorkspace) {
       if (effectiveRoster && !approvedHosts.has(targetDomain)) {
@@ -2004,12 +2033,24 @@ async function main() {
       projId = approvedMember.projectId;
       repoName = approvedMember.repoName;
       publishRoot = approvedMember.publishRoot;
+      isApprovedProvenance = true;
     } else {
-      const fallbackRepo = repoMappings.get(targetDomain);
-      projId = approvedMember?.projectId || projectIdByDomain.get(targetDomain);
-      repoName = approvedMember?.repoName || fallbackRepo?.repoName;
-      publishRoot =
-        approvedMember?.publishRoot || (fallbackRepo?.publishRoot ?? ".");
+      if (
+        approvedMember?.repoName &&
+        isValidRepoSlug(approvedMember.repoName)
+      ) {
+        projId = approvedMember.projectId;
+        repoName = approvedMember.repoName;
+        publishRoot = approvedMember.publishRoot;
+        isApprovedProvenance = true;
+      } else {
+        const fallbackRepo = repoMappings.get(targetDomain);
+        projId =
+          approvedMember?.projectId || projectIdByDomain.get(targetDomain);
+        repoName = fallbackRepo?.repoName;
+        publishRoot = fallbackRepo?.publishRoot ?? ".";
+        isApprovedProvenance = false;
+      }
     }
 
     if (!projId || !repoName) {
@@ -2020,7 +2061,7 @@ async function main() {
     }
 
     const expectedRosterSource: RosterSource | null =
-      effectiveRoster && approvedMember
+      isApprovedProvenance && effectiveRoster && approvedMember
         ? {
             versionId: effectiveRoster.id,
             memberId: approvedMember.memberId,
@@ -2071,8 +2112,12 @@ async function main() {
           repoName,
           publishRoot,
           projectId: projId,
-          expectedRosterVersionId: effectiveRoster?.id,
-          expectedMemberId: approvedMember?.memberId,
+          expectedRosterVersionId: isApprovedProvenance
+            ? effectiveRoster?.id
+            : undefined,
+          expectedMemberId: isApprovedProvenance
+            ? approvedMember?.memberId
+            : undefined,
         },
         head,
       });
@@ -2081,7 +2126,7 @@ async function main() {
     const candidateDomains =
       !isWorkspace && effectiveRoster
         ? Array.from(approvedHosts)
-        : Array.from(repoMappings.keys());
+        : Array.from(new Set([...approvedHosts, ...repoMappings.keys()]));
 
     for (const dom of candidateDomains) {
       if (limit !== undefined && plannedActions.length >= limit) {
@@ -2094,6 +2139,7 @@ async function main() {
       let projId: string | undefined;
       let repoName: string | undefined;
       let publishRoot = ".";
+      let isApprovedProvenance = false;
 
       if (!isWorkspace) {
         if (
@@ -2106,18 +2152,29 @@ async function main() {
         projId = approvedMember.projectId;
         repoName = approvedMember.repoName;
         publishRoot = approvedMember.publishRoot;
+        isApprovedProvenance = true;
       } else {
-        const fallbackRepo = repoMappings.get(dom);
-        projId = approvedMember?.projectId || projectIdByDomain.get(dom);
-        repoName = approvedMember?.repoName || fallbackRepo?.repoName;
-        publishRoot =
-          approvedMember?.publishRoot || (fallbackRepo?.publishRoot ?? ".");
+        if (
+          approvedMember?.repoName &&
+          isValidRepoSlug(approvedMember.repoName)
+        ) {
+          projId = approvedMember.projectId;
+          repoName = approvedMember.repoName;
+          publishRoot = approvedMember.publishRoot;
+          isApprovedProvenance = true;
+        } else {
+          const fallbackRepo = repoMappings.get(dom);
+          projId = approvedMember?.projectId || projectIdByDomain.get(dom);
+          repoName = fallbackRepo?.repoName;
+          publishRoot = fallbackRepo?.publishRoot ?? ".";
+          isApprovedProvenance = false;
+        }
       }
 
       if (projId && repoName) {
         try {
           const expectedRosterSource: RosterSource | null =
-            effectiveRoster && approvedMember
+            isApprovedProvenance && effectiveRoster && approvedMember
               ? {
                   versionId: effectiveRoster.id,
                   memberId: approvedMember.memberId,
@@ -2165,8 +2222,12 @@ async function main() {
                 repoName,
                 publishRoot,
                 projectId: projId,
-                expectedRosterVersionId: effectiveRoster?.id,
-                expectedMemberId: approvedMember?.memberId,
+                expectedRosterVersionId: isApprovedProvenance
+                  ? effectiveRoster?.id
+                  : undefined,
+                expectedMemberId: isApprovedProvenance
+                  ? approvedMember?.memberId
+                  : undefined,
               },
               head,
             });

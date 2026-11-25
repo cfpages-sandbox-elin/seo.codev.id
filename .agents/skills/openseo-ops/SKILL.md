@@ -1,9 +1,9 @@
 ---
 name: openseo-ops
-description: "Sovereign operational skills for OpenSEO (seo.codev.id) on Cloudflare Workers edge. Governs fleet observability (/onsite), approved roster synchronization (import-fleet-roster, link-github-fleet), full-depth dual-lane site audits (commit-pinned GitHub Direct Audit Engine & edge SiteAuditWorkflow), D1 migrations, Alchemy v2 deployments, DataForSEO BYOK cost tracking, and programmatic Model Context Protocol (MCP) execution across all 78 registered tools."
+description: "Sovereign operational skills for OpenSEO (seo.codev.id) on Cloudflare Workers edge. Governs fleet observability (/onsite), approved roster synchronization (import-fleet-roster, link-github-fleet), full-depth dual-lane site audits (commit-pinned GitHub Direct Audit Engine & edge SiteAuditWorkflow), D1 migrations, Alchemy v2 deployments, DataForSEO BYOK cost tracking, and programmatic Model Context Protocol (MCP) execution across all 80 registered tools."
 metadata:
   author: Syamsul Alam & Gemini 4 Hydrogen
-  version: "1.7.1"
+  version: "1.8.0"
   internal: true
 ---
 
@@ -35,7 +35,7 @@ flowchart LR
 
 ### 1.1 App Worker (`open-seo-selfhost`)
 - Handles incoming user requests, TanStack Router server-side rendering, and `/onsite` Aggregated Fleet View.
-- Serves the native MCP endpoint at `https://seo.codev.id/mcp` with **78 registered tools** across 8 capability families.
+- Serves the native MCP endpoint at `https://seo.codev.id/mcp` with **80 registered tools** across 8 capability families.
 - Authenticated at the edge:
   - **Self-Hosted Production (`AUTH_MODE=cloudflare_access`)**: Protected by Cloudflare Zero Trust Access Google SSO (Tier 1 Owner-Only). Browser users sign in via Google OAuth. Headless MCP clients authenticate by passing an authenticated session token via cookie (`Cookie: CF_Authorization=<token>`). Cloudflare Access edge verifies this session and passes the signed JWT assertion (`Cf-Access-Jwt-Assertion` containing valid nonempty `sub` and `email` identity claims) to the origin Worker. The repository origin verifier requires these explicit `sub` and `email` claims; Service Token authentication workflows require a dedicated Service Auth policy and separately configured/verified Stage 2 identity admission.
   - **Local Development / Test Runner (`AUTH_MODE=local_noauth`)**: Trusted local no-auth environment on `localhost:3001` (Vite dev server default) or in-memory mocks. Local Wrangler workflow dispatch defaults to port `8787`.
@@ -125,7 +125,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
   2. Ingests pages and issues in bounded $\le 9$-statement chunks ($\le 14,999$ UTF-8 bytes total per serialized batch envelope, strictly respecting Windows CreateProcessW 30,000 character limits). Binds string fields to safe character limits and serialized byte limits ($\le 10,000$ bytes per page statement) and detailsJson to bounded UTF-8 bytes (max 3,499) preserving valid structured JSON.
   3. Guards child writes so that `audit_pages` and `audit_issues` only insert when the parent audit is `status = 'running'`, and validates that issue `page_id` references belong to the same attempt.
   4. Verifies child row count integrity and asserts zero orphaned page references before the final atomic compare-and-set UPDATE with `RETURNING id`.
-  5. On count mismatch, invalid child references, or state conflict, throws immediately. Incomplete source acquisition ends with audit status `failed` and an isolated diagnostic item which can be `partial` (they are distinct).
+  5. On count mismatch, invalid child references, or state conflict, throws immediately. Incomplete source acquisition or interrupted storage ends with audit status `failed`; intentional capped input (e.g. `--max-pages`) completes with `status = 'completed'` up to the requested budget. Diagnostic fleet item publication and reused audits strictly require parent `status = 'completed'` and item `status = 'completed'`.
 - **Diagnostic Fleet Series Integration**: Writes `fleet_runs` (`requester_id = 'github-audit-runner'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`), and `fleet_snapshots` (`series_key = 'diagnostic'`, unmeasured pillars `NULL`). Reused audits strictly verify the exact triple (`r.status = 'completed'`, `fri.status = 'completed'`, matching `project_id`, matching `member_id`, and exactly 1 verified diagnostic attempt per member) bound to the effective roster version; repair failures abort without falling back to a redundant Git crawl.
 - **Evidence Boundary**: Records source-only evidence. Unmeasured runtime properties (`status_code`, `response_time_ms`, `crawl_depth`) remain `NULL` and `in_sitemap` is `0`. Runtime-only issue reporters (`deep-page`, `slow-response`) are excluded.
 
@@ -133,7 +133,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **Purpose**: Full live HTTP validation, external third-party crawls, robots.txt enforcement, and real edge TTFB latency measurement. (Note: neither `run-fleet-audits.ts` nor `run_site_audit` publishes official weekly fleet snapshots; official weekly baseline grading is reserved for dedicated aggregate grading publishers).
 - **Control Plane (`SiteAuditWorkflow`):** Cloudflare Workflow managing phase ordering, retries, and failure states on `open-seo-selfhost-audit`.
 - **Data Plane (`AuditScratchpad`):** SQLite-backed Durable Object instance per audit (`idFromName(auditId)`). Manages URL frontier leases in chunks of up to 200 URLs (`CHUNK_SIZE = 200`), with a 90-second soft discovery/crawl cutoff for starting new fetches, and 25-page persistence blocks after initial block.
-- **Limits, Defaults & Robots Scope**: Edge crawler defaults to 500 pages (max 10,000 for self-hosted instances) and concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`). Respects `robots.txt` disallow rules and hostname boundaries. Fleet edge CLI hard-codes `renderJavaScript: false`. JavaScript-rendered crawls up to 1,000 pages (`RENDERED_MAX_AUDIT_PAGES`) via Cloudflare Browser Run require the UI or single-site MCP input. When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots; if an in-flight audit exceeds 20 minutes (15m pause + 5m overdue drain), the runner terminates queue drain.
+- **Limits, Defaults & Robots Scope**: Edge crawler defaults to 500 pages (max 10,000 for self-hosted instances) and concurrency 2 (allowed range 1–5), requiring exactly one execution scope (`--domain`, `--all`, or `--limit`). Respects `robots.txt` disallow rules and hostname boundaries. Fleet edge CLI hard-codes `renderJavaScript: false`. JavaScript-rendered crawls up to 1,000 pages (`RENDERED_MAX_AUDIT_PAGES`) via Cloudflare Browser Run require the UI or single-site MCP input. `run_fleet_audit` performs single-target preflight validation for `--domain` immediately; bulk planning (`--all` or `--limit`) emits a remote D1 plan containing `--roster-id` where per-member slug and root validation is deferred to CLI runtime. When the 15-minute polling deadline is exceeded on in-flight audits, admission pauses to protect concurrency slots; if an in-flight audit exceeds 20 minutes (15m pause + 5m overdue drain), the runner terminates queue drain.
 
 ---
 
@@ -350,7 +350,7 @@ console.log("Execution argv:", auditPlan.structuredContent?.argv);
 
 ### Playbook 2E: Fleet Telemetry & Inventory Inspection
 Repository results require the newest completed direct audit with qualifying diagnostic lineage in the active effective roster. Edge results cover active workspace projects. The coverage CLI denominator includes unlinked active roster members. Its mapped count may include supplemental repository hints. The status CLI counts active workspace projects.
-GitHub authentication uses ambient `gh api` identity plus raw-download `gh auth token` and explicit `GITHUB_TOKEN` fallback.
+GitHub authentication uses ambient `gh api` identity for tree discovery, while the raw download fallback calls `gh auth token` first and falls back to explicit `GITHUB_TOKEN` directly.
 ```powershell
 # View fleet status summary with mutually exclusive coverage stats (completed, running, failed, never_audited)
 # Supports --local or default remote D1 execution
@@ -415,7 +415,7 @@ const transport = new StreamableHTTPClientTransport(
 
 await client.connect(transport);
 try {
-  // Discover available tools across all 78 registered tools
+  // Discover available tools across all 80 registered tools
   const tools = await client.listTools();
   console.log(`Discovered ${tools.tools.length} MCP tools`);
 
@@ -816,7 +816,7 @@ try {
      ```
   5. Delete audit and release capacity:
      ```ts
-     // Requires owner or admin authorization. If an edge audit is running, terminates the associated Cloudflare Workflow instance before deletion. Direct repository audits run out-of-band; a running row with null instance ID is rejected by this deletion path.
+     // Requires owner or admin authorization. If an edge audit is running, terminates the associated Cloudflare Workflow instance before deletion. Direct repository audits run out-of-band with synthetic instance marker github-audit-* and are cleanly deleted from DB without calling Cloudflare Workflows.
      await client.callTool({
        name: "delete_site_audit",
        arguments: {
@@ -827,11 +827,72 @@ try {
      ```
 
 > [!NOTE]
-> **Resolution & Deletion Invariants**: `resolveAudit` reads an explicit project-bound ID or the project's latest attempt regardless of status, ordered deterministically by `julianday(started_at) DESC, id DESC` on SQLite/D1 and `started_at DESC, id DESC` on PostgreSQL. Direct repository source pages store HTTP status as NULL, so filtering `get_audit_pages` by `statusCode: 200` excludes direct repository pages. `delete_site_audit` cancels running edge Workflows when a workflow instance handle is available in Cloudflare Workflows; direct repository audits run out-of-band and a running row with a null instance ID cannot be cancelled via Workflows.
+> **Resolution & Deletion Invariants**: `resolveAudit` reads an explicit project-bound ID or the project's latest attempt regardless of status, ordered deterministically by `julianday(started_at) DESC, id DESC` on SQLite/D1 and `started_at DESC, id DESC` on PostgreSQL. Direct repository source pages store HTTP status as NULL, so filtering `get_audit_pages` by `statusCode: 200` excludes direct repository pages. `delete_site_audit` cancels running edge Workflows when a workflow instance handle is available in Cloudflare Workflows; direct repository audits run out-of-band with synthetic marker `github-audit-*` and are deleted directly without contacting Cloudflare Workflows. A running row with a null instance ID cannot be cancelled via Workflows.
 > **Authentication & Watchdog Invariants**:
-> - **Authentication Lanes**: Public self-hosted MCP uses Cloudflare Access session cookie → Access edge → signed origin assertion (validating issuer, audience, subject, and email claims). Git discovery uses ambient `gh` CLI identity; raw/blob archive requests use `gh auth token` fallback to `process.env.GITHUB_TOKEN`.
+> - **Authentication Lanes**: Public self-hosted MCP uses Cloudflare Access session cookie → Access edge → signed origin assertion (validating issuer, audience, subject, and email claims). Git discovery uses ambient `gh` CLI identity; raw/blob archive requests call `gh auth token` first, falling back to `process.env.GITHUB_TOKEN` directly.
 > - **Attempt Expiration vs Reservation**: The 2-hour TTL for abandoned repository audits is enforced exclusively by the background watchdog reconciler (`auditReconciler.ts`), not by the CLI reservation phase. Reservation asserts no other currently running attempt exists for the project on the target DB.
 > **Crawler Access Credentials**: When a project requires authentication or custom request headers, configure crawler credentials (such as Shopify storefront password or basic auth) in the UI under Settings → Crawler Access. Once saved, invoking `run_site_audit` automatically looks up and attaches any valid, unexpired credentials configured for the target start host via `AuditService.startAudit`, passing sealed access to the Workflow. The edge fleet CLI (`run-fleet-audits.ts`) passes `access: null` by default.
+
+### Playbook 7: Fleet Operations, Matrix Inspection, and Repository Linking (`link_fleet_repository`, `get_fleet_matrix`, `run_fleet_audit`, `get_fleet_issues`)
+- **MCP Tools**: `link_fleet_repository`, `get_fleet_matrix`, `run_fleet_audit`, `get_fleet_issues`
+- **Organization Constraint**: Strictly restricted to `shared-workspace`.
+- **Operator Permission Gate**: `link_fleet_repository` requires `role === "owner"` or `role === "admin"`; callers with `role === "member"` are rejected with unauthorized error.
+- **Workflows**:
+  1. Inspect fleet overview matrix across all 87 enrolled properties:
+     ```ts
+     // Fetch complete 87-domain overview matrix:
+     const matrix = await client.callTool({
+       name: "get_fleet_matrix",
+       arguments: {},
+     });
+     console.log(`Roster: ${matrix.structuredContent?.rosterVersion}, Total domains: ${matrix.structuredContent?.totalDomains}`);
+
+     // Filter by single domain (returns fleet totals plus filtered count and single-row detail):
+     const single = await client.callTool({
+       name: "get_fleet_matrix",
+       arguments: { domain: "kaca.co.id" },
+     });
+     console.log(`Matched: ${single.structuredContent?.filteredCount}, Fleet total: ${single.structuredContent?.totalDomains}`);
+     ```
+  2. Link or update approved repository mapping in effective roster:
+     Note: `link-github-fleet.ts` binds projects to roster members, whereas `link_fleet_repository` updates the approved GitHub repository mapping and publish root for a member in the approved roster.
+     Omitting `publishRoot` preserves the current directory mapping; pass `.` to explicitly reset to the repository root.
+     Passing `expectedRosterId` guards against concurrent roster supersession:
+     ```ts
+     await client.callTool({
+       name: "link_fleet_repository",
+       arguments: {
+         domain: "kaca.co.id",
+         repoName: "cfpages-syamsulalam-net/kaca-co-id",
+         // publishRoot is optional: omitted preserves current root, "." sets repo root
+         expectedRosterId: "roster_v1",
+       },
+     });
+     ```
+  3. Plan fleet audit execution (emits executable CLI command with `--roster-id` for remote D1 execution):
+     ```ts
+     const plan = await client.callTool({
+       name: "run_fleet_audit",
+       arguments: {
+         mode: "repository_direct",
+         domain: "kaca.co.id",
+         maxPages: 500,
+       },
+     });
+     console.log("Execute command:", plan.structuredContent?.executionCommand);
+     ```
+  4. Triage fleet issues with sovereign skill routing:
+     ```ts
+     const issues = await client.callTool({
+       name: "get_fleet_issues",
+       arguments: {
+         source: "all",
+         severity: "critical",
+         limit: 50,
+       },
+     });
+     console.log("Critical fleet issues:", issues.structuredContent?.totalIssues);
+     ```
 
 ---
 
