@@ -354,7 +354,10 @@ export function findMatchingCompletedAudit(
   const rows = runD1Query(
     `SELECT a.id, a.config,
             (
-              SELECT COUNT(*)
+              SELECT CASE
+                WHEN COUNT(DISTINCT r.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1 THEN 1
+                ELSE 0
+              END
               FROM fleet_runs r
               JOIN fleet_run_items fri ON fri.run_id = r.id
               JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
@@ -378,6 +381,12 @@ export function findMatchingCompletedAudit(
        AND a.workflow_instance_id LIKE 'github-audit-%'
        AND a.pages_total > 0
        AND a.pages_crawled >= a.pages_total
+       AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+       AND NOT EXISTS (
+         SELECT 1 FROM audit_issues i
+         WHERE i.audit_id = a.id AND i.page_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id)
+       )
        AND json_valid(a.config)
        AND json_extract(a.config, '$.source') = 'github_repository_direct'
        AND json_extract(a.config, '$.commitSha') = ${sqlText(commitSha)}
@@ -1560,9 +1569,11 @@ function publishGuardedDiagnosticTriple(
            ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
            LIMIT 1
          )
+         AND a.workflow_instance_id LIKE 'github-audit-%'
          AND json_valid(a.config)
          AND json_extract(a.config, '$.source') = 'github_repository_direct'
          AND json_extract(a.config, '$.repoName') = m.repo_name
+         AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
          AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
          AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
          AND json_extract(a.config, '$.rosterSource.versionId') = v.id
@@ -1597,7 +1608,7 @@ function publishGuardedDiagnosticTriple(
      ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(nowIso)};`,
   ];
 
-  executeD1SqlStatements(diagnosticSql, isRemote);
+  executeD1SqlBatches(diagnosticSql, isRemote, { atomic: true });
   const isVerified = verifyDiagnosticTriple(
     runId,
     runItemId,
@@ -1668,7 +1679,10 @@ function verifyDiagnosticTriple(
       AND r.status = ${sqlText(expectedRunStatus)}
       AND i.status = ${sqlText(expectedItemStatus)}
       AND 1 = (
-        SELECT count(*)
+        SELECT CASE
+          WHEN COUNT(DISTINCT fr.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1 THEN 1
+          ELSE 0
+        END
         FROM fleet_run_items fri
         JOIN fleet_runs fr ON fr.id = fri.run_id
         JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
@@ -1875,8 +1889,11 @@ async function main() {
       archive: { type: "boolean" },
       "max-pages": { type: "string", short: "m", default: "10000" },
       "roster-id": { type: "string" },
+      "expected-member": { type: "string" },
+      "expected-project": { type: "string" },
       "expected-repo": { type: "string" },
       "expected-root": { type: "string" },
+      "scan-budget": { type: "string" },
       remote: { type: "boolean", default: true },
       local: { type: "boolean", default: false },
     },
@@ -1957,6 +1974,19 @@ async function main() {
   if (scopeCount !== 1) {
     console.error(
       "[ERROR] Missing or conflicting execution scope. Specify exactly one of --domain <canonical-host>, --all, or --limit <n>.",
+    );
+    process.exit(1);
+  }
+
+  if (
+    !targetDomain &&
+    (args.values["expected-member"] ||
+      args.values["expected-project"] ||
+      args.values["expected-repo"] ||
+      args.values["expected-root"])
+  ) {
+    console.error(
+      "[ERROR] --expected-member, --expected-project, --expected-repo, and --expected-root are strictly single-target options and cannot be combined with bulk execution.",
     );
     process.exit(1);
   }
@@ -2163,6 +2193,27 @@ async function main() {
       process.exit(1);
     }
 
+    const expectedMember = args.values["expected-member"]
+      ? String(args.values["expected-member"]).trim()
+      : undefined;
+    const expectedProject = args.values["expected-project"]
+      ? String(args.values["expected-project"]).trim()
+      : undefined;
+
+    if (expectedMember && approvedMember?.memberId !== expectedMember) {
+      console.error(
+        `[ERROR] TARGET_BINDING_MISMATCH: Planned roster member '${expectedMember}' does not match live member '${approvedMember?.memberId}' for domain '${targetDomain}'.`,
+      );
+      process.exit(1);
+    }
+
+    if (expectedProject && projId !== expectedProject) {
+      console.error(
+        `[ERROR] TARGET_BINDING_MISMATCH: Planned project ID '${expectedProject}' does not match live project ID '${projId}' for domain '${targetDomain}'.`,
+      );
+      process.exit(1);
+    }
+
     const expectedRosterSource: RosterSource | null =
       isApprovedProvenance && effectiveRoster && approvedMember
         ? {
@@ -2232,10 +2283,25 @@ async function main() {
         : Array.from(new Set([...approvedHosts, ...repoMappings.keys()]))
     ).sort((a, b) => a.localeCompare(b));
 
+    const rawScanBudget = args.values["scan-budget"];
+    const scanLimit = rawScanBudget
+      ? parseInt(String(rawScanBudget), 10)
+      : limit !== undefined
+        ? Math.max(limit * 10, 20)
+        : Infinity;
+    let scannedCandidates = 0;
+
     for (const dom of candidateDomains) {
       if (limit !== undefined && plannedActions.length >= limit) {
         break;
       }
+      if (scannedCandidates >= scanLimit) {
+        console.log(
+          `[SCAN BUDGET] Candidate scan limit reached (${scanLimit} candidates scanned). Halting further candidate discovery.`,
+        );
+        break;
+      }
+      scannedCandidates++;
       const approvedMember = approvedMembersByHost.get(dom);
       const isEligible = isWorkspace || approvedHosts.has(dom);
       if (!isEligible) continue;

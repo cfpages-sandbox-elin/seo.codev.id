@@ -191,13 +191,17 @@ describe("Fleet MCP Tools", () => {
         "--remote",
         "--max-pages",
         "500",
+        "--expected-member",
+        "member_1",
+        "--expected-project",
+        "proj_1",
         "--expected-repo",
         "cfpages-syamsulalam-net/kaca-co-id",
         "--expected-root",
         ".",
       ]);
       expect(data.executionCommand).toContain(
-        "run-github-fleet-audit.ts --domain kaca.co.id --roster-id roster_v1 --remote --max-pages 500 --expected-repo cfpages-syamsulalam-net/kaca-co-id --expected-root .",
+        "run-github-fleet-audit.ts --domain kaca.co.id --roster-id roster_v1 --remote --max-pages 500 --expected-member member_1 --expected-project proj_1 --expected-repo cfpages-syamsulalam-net/kaca-co-id --expected-root .",
       );
     });
 

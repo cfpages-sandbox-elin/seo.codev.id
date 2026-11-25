@@ -164,14 +164,16 @@ export const linkFleetRepositoryTool = {
             AND approved_at IS NOT NULL
             AND (
               CASE
-                WHEN approved_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (approved_at || '+00')::timestamptz <= CURRENT_TIMESTAMP
+                WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$'
+                 AND pg_input_is_valid(approved_at || '+00', 'timestamptz') THEN (approved_at || '+00')::timestamptz <= CURRENT_TIMESTAMP
                 WHEN pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz <= CURRENT_TIMESTAMP
                 ELSE false
               END
             )
           ORDER BY (
             CASE
-              WHEN approved_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (approved_at || '+00')::timestamptz
+              WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$'
+               AND pg_input_is_valid(approved_at || '+00', 'timestamptz') THEN (approved_at || '+00')::timestamptz
               WHEN pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz
               ELSE NULL
             END

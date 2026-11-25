@@ -129,16 +129,28 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **Diagnostic Fleet Series Integration**: Writes `fleet_runs` (`requester_id = 'github-audit-runner'`), `fleet_run_items` (`primary_series_key = 'diagnostic'`), and `fleet_snapshots` (`series_key = 'diagnostic'`, unmeasured pillars `NULL`). Reused audits strictly verify the exact triple (`r.status = 'completed'`, `fri.status = 'completed'`, matching `project_id`, matching `member_id`, and exactly 1 verified diagnostic attempt per member) bound to the effective roster version; repair failures abort without falling back to a redundant Git crawl.
 - **Evidence Boundary**: Records source-only evidence. Unmeasured runtime properties (`status_code`, `response_time_ms`, `crawl_depth`) remain `NULL` and `in_sitemap` is `0`. Runtime-only issue reporters (`deep-page`, `slow-response`) are excluded.
 
-### Runner Scope, Concurrency & Defaults Reference
-| Runner | Default Pages | Max Pages | Concurrency | Scope Flags | Scope Modifiers & Options | Operational Availability |
+### Runner Scope, Concurrency & CLI Parser Reference
+| Runner / Script | Default Pages | Max Pages | Concurrency | Scope Flags | Scope Modifiers & Options | Execution Backend |
 |---|---|---|---|---|---|---|
-| **Edge HTTP Runner** (`scripts/run-fleet-audits.ts`) | 500 | 10,000 | 2 (1–5) | Exactly one of `--domain <host>`, `--all`, or `--limit <n>` | `--roster-id <id>`, `--no-skip-recent`, `--concurrency <n>`, `--expected-project <id>` | Shipped live production crawler |
-| **Repository Direct Runner** (`scripts/run-github-fleet-audit.ts`) | 10,000 | 10,000 | Host-side paced | Exactly one of `--domain <host>`, `--all`, or `--limit <n>` | `--workspace` (audits wider inventory; conflicts with `--roster-id`), `--roster-id <id>`, `--force`, `--archive`, `--expected-repo <slug>`, `--expected-root <path>` | Shipped diagnostic source audit |
+| **Edge HTTP Runner** (`scripts/run-fleet-audits.ts`) | 500 | 10,000 | 2 (1–5) | Exactly one of `--domain` / `-d <host>`, `--all`, or `--limit` / `-l <n>` | `--roster-id <id>` (opts into effective-roster filtering), `--skip-recent` / `--no-skip-recent` (single-domain bypasses recency), `--concurrency` / `-c <n>`, `--expected-project <id>`, `--expected-member <id>`, `--remote` (default) \| `--local` | Shipped live production crawler |
+| **Repository Direct Runner** (`scripts/run-github-fleet-audit.ts`) | 10,000 | 10,000 | Host-side paced | Exactly one of `--domain` / `-d <host>`, `--all` / `-a`, or `--limit` / `-l <n>` | `--workspace` / `-w` (audits wider inventory; conflicts with `--roster-id`), `--roster-id <id>`, `--force` / `-f`, `--archive`, `--max-pages` / `-m <n>` (1–10,000), `--scan-budget <n>`, `--expected-repo <slug>`, `--expected-root <path>`, `--expected-member <id>`, `--expected-project <id>`, `--remote` (default) \| `--local` | Shipped diagnostic source audit |
+| **Fleet Project Linker** (`scripts/link-github-fleet.ts`) | N/A | N/A | N/A | Target org (default `shared-workspace`) | `--dry-run`, `--org-id <id>`, `--remote` \| `--local` (default) | Local D1 inventory mapping |
+| **Roster Importer** (`scripts/import-fleet-roster.ts`) | N/A | N/A | N/A | `<orgId>` (positional) | `--approval <file>`, `--help` / `-h` | Roster version bootstrap |
+| **Archive Audit Benchmark** (`scripts/benchmark-archive-audit.ts`) | N/A | N/A | N/A | Direct repo mapping | `--repo <slug>`, `--domain <host>`, `--root <path>` | In-memory parse performance |
+| **Fleet Repos Inspector** (`scripts/check-fleet-repos.ts`) | N/A | N/A | N/A | All mapped inventory | `--json`, `--remote` (default) \| `--local` | Coverage diagnostics |
+| **Fleet Issues CLI** (`scripts/fleet-issues.ts`) | N/A | N/A | N/A | Filtered search | `--domain <host>`, `--severity <crit\|warn\|info>`, `--type <slug>`, `--source <all\|edge\|repo>`, `--limit <n>`, `--json`, `--csv <file>`, `--remote` (default) \| `--local` | Fleet-wide issue extraction |
+| **D1 to Postgres Migrator** (`scripts/migrate-d1-to-postgres.ts`) | 5,000 | 50,000 | Serial chunked | Schema / single table | `--table <name>` (scopes preview, preflight, copy, sequences, and verify to single table), `--dry-run`, `--allow-nonempty`, `--page-size <1–50000>` (default 5000), `--update`, `--since-hours <1–8760>` (default 12), `--help` | Keyset-paginated store copy |
 | **Weekly Fleet Baseline Publisher** | N/A | N/A | Scheduled | Fleet-wide | External scheduled service consuming `fleetCalculations.ts` contracts | Dedicated background grading publisher |
 
+**Audit Terminal Outcome Dispositions**:
+- `PAGE_BUDGET_REACHED`: Candidate URL list exceeded `--max-pages` ceiling before crawl completion (persists as `failed`, skipped from diagnostic fleet series).
+- `REPOSITORY_BLOB_UNREAD`: An individual selected file could not be retrieved or parsed from GitHub (persists as `failed`).
+- `CHUNK_WRITE_FAILED`: Fallback failure during D1 batch statement persistence or finalization CAS.
+- **Coverage Numerators**: Edge numerator counts completed edge audits for active roster-linked projects. Repository numerator additionally requires current diagnostic lineage (`COUNT(DISTINCT r.id) = 1 AND COUNT(DISTINCT i.id) = 1 AND COUNT(DISTINCT s.id) = 1`).
+
 **Database Migration & Cutover Runbooks**:
-- Simple D1 to PostgreSQL Migration: [d1-to-postgres-simple.md](file:///C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/docs/maintainers/runbooks/d1-to-postgres-simple.md)
-- Detailed Cutover & Reversion Guide: [d1-to-postgres-detailed.md](file:///C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/docs/maintainers/runbooks/d1-to-postgres-detailed.md)
+- Simple D1 to PostgreSQL Migration: [docs/maintainers/runbooks/d1-to-postgres-simple.md](file:///C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/docs/maintainers/runbooks/d1-to-postgres-simple.md)
+- Detailed Cutover & Reversion Guide: [docs/maintainers/runbooks/d1-to-postgres-detailed.md](file:///C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/docs/maintainers/runbooks/d1-to-postgres-detailed.md)
 
 ### Lane 2: Edge HTTP Workflow Crawler (`SiteAuditWorkflow`) — Live Runtime & Fleet Grading Lane
 - **Purpose**: Full live HTTP validation, external third-party crawls, robots.txt enforcement, and real edge TTFB latency measurement. (Note: neither `run-fleet-audits.ts` nor `run_site_audit` publishes official weekly fleet snapshots; official weekly baseline grading is reserved for dedicated aggregate grading publishers).
@@ -997,7 +1009,7 @@ ightarrow$ triage via `get_fleet_issues` with sovereign skill routing. |
 - `get_business_reviews`: Retrieve customer reviews and star ratings (`projectId`, `businessName` [string], `cid` [optional], `placeId` [optional], `near` [optional], `locationCode` [optional int], `languageCode` [optional str], `depth` [optional int], `sortBy` [optional], `includeOtherSources` [boolean], `taskId` [resumption string]).
 - `get_business_updates`: Retrieve posts and updates from Google Business Profile (`projectId`, `businessName` [string], `cid` [optional], `placeId` [optional], `near` [optional], `locationCode` [optional int], `languageCode` [optional str], `depth` [optional int], `taskId` [resumption string]).
 - `list_business_categories`: Search valid Google Business categories (`projectId`, `query`, `limit` [optional int]).
-- `get_local_rank_grid`: Generate geo-grid rank distribution across geographic coordinates (`projectId`, `keyword`, `target`, `center` [`{ latitude, longitude }`], `gridSize` [3 or 5], `spacingKm` [0.25–10], `device` [optional], `zoom` [4–18], `languageCode` [optional str]).
+- `get_local_rank_grid`: Generate geo-grid rank distribution across geographic coordinates (`projectId`, `keyword`, `target` [`{ name: string }`], `center` [`{ latitude: number, longitude: number }`], `gridSize` [3 or 5], `spacingKm` [0.25–10], `device` [optional], `zoom` [4–18], `languageCode` [optional str]).
 
 ### Family 6: GA4, Search Console & Search Opportunities (12 tools)
 - `get_google_analytics_organic_overview`: High-level organic traffic and engagement metrics (`projectId`, `startDate`, `endDate`, `trend` [optional boolean]).
@@ -1017,12 +1029,12 @@ ightarrow$ triage via `get_fleet_issues` with sovereign skill routing. |
 - `run_site_audit`: Trigger live edge HTTP site crawl on auxiliary worker (`projectId`, `url`, `maxPages` [default 50], `renderJavaScript` [boolean, carries hosted rendering billing note when true], `runLighthouse` [boolean]).
 - `list_site_audits`: List historical crawl runs for a project (`projectId`).
 - `delete_site_audit`: Delete a historical crawl run and associated pages/issues (`projectId`, `auditId`; cancels running edge workflow instance when handle present; direct repository audits run out-of-band and a running row with null instance ID is rejected by this deletion path).
-- `get_audit_status`: Query active crawl phase, progress percentage, and page counts (`projectId`, `auditId`).
+- `get_audit_status`: Query active crawl phase, progress percentage, and page counts (`projectId`, `auditId` [optional; omission selects the project's newest active or completed attempt and reconciles stuck runs]).
 - `get_audit_issues`: Query detected issues for an audit with severity filtering (`projectId`, `auditId` [optional; omission selects project's newest attempt regardless of status], `severity` [optional], `issueType` [optional], `limit` [1–1000, default 200]).
 - `get_audit_pages`: Retrieve crawled URL records and page-level metadata (`projectId`, `auditId` [optional; omission selects project's newest attempt], `fetchClass` [optional], `statusCode` [optional], `urlContains` [optional], `limit` [1–1000, default 100]; note that direct repository source pages store HTTP status as NULL).
 - `get_fleet_issues`: Query aggregated technical SEO issues across the entire enrolled fleet (`domain` [canonical host, optional], `severity` [`"critical"` | `"warning"` | `"info"`, optional], `issueType` [optional], `source` [`"all"` | `"edge"` | `"repository"` | `"both"`, default `"all"`], `limit` [1–200, default 50]).
 - `run_fleet_audit`: Generate execution plan for fleet-wide audits across enrolled properties (requires exactly one selector: `domain`, `limit` [1–100], or `all: true`; `mode` [`"repository_direct"` | `"edge_workflow"`, default `"repository_direct"`], `maxPages` [10–10,000, default 2000], `concurrency` [1–5, default 2, emitted only in edge_workflow mode]; requires shared-workspace and approved roster; validates repo slug and publish root; emitted CLI targets D1 by default).
-- `get_fleet_matrix`: Retrieve the complete 87-domain OpenSEO fleet overview matrix, including per-pillar health scores, grades, dispositions, and comparison metrics across all enrolled properties (`domain` [canonical host, optional]).
+- `get_fleet_matrix`: Retrieve the OpenSEO fleet overview matrix for the effective approved roster, including per-pillar health scores, grades, dispositions, and comparison metrics across all enrolled properties; exact-domain filter returns zero or one row while leaving fleet-level totals unchanged (`domain` [canonical host, optional]).
 - `link_fleet_repository`: Link or update the approved GitHub repository mapping and publish root for an enrolled fleet roster member in OpenSEO (`domain` [canonical host, required], `repoName` [owner/repo slug, required], `publishRoot` [optional relative root, omitted preserves current root, `.` sets repo root], `expectedRosterId` [optional effective roster version ID]).
 
 ### Family 8: Reports, Templates & Backlinks (10 tools)

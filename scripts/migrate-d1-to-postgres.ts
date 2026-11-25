@@ -118,6 +118,12 @@ Flags:
 const dryRun = parsedArgs.values["dry-run"] ?? false;
 const allowNonEmpty = parsedArgs.values["allow-nonempty"] ?? false;
 const updateMode = parsedArgs.values.update ?? false;
+const rawSelectedTable = parsedArgs.values.table;
+if (rawSelectedTable !== undefined && rawSelectedTable.trim() === "") {
+  console.error("Invalid --table value: table name cannot be empty.");
+  process.exit(1);
+}
+const selectedTable = rawSelectedTable?.trim();
 
 const rawPageSize = Number(parsedArgs.values["page-size"]);
 if (
@@ -406,7 +412,7 @@ type PgDb = ReturnType<typeof drizzlePg>;
 
 // Copy one table from D1 to Postgres, paginating in PK order. `predicate` scopes
 // the read (null = whole table); `upsert` overwrites on PK conflict (--update)
-// vs insert-or-ignore (full migration). Returns the row count read from D1.
+// vs insert-or-ignore (full migration). Returns read and applied row counts.
 async function copyTable(
   databaseId: string,
   dest: PgDb,
@@ -415,9 +421,12 @@ async function copyTable(
   pgTable: Table,
   predicate: string | null,
   upsert: boolean,
-): Promise<number> {
-  const orderBy = primaryKeyOrder(sqliteTable);
-  const where = predicate ? `WHERE ${predicate} ` : "";
+): Promise<{ readCount: number; appliedCount: number }> {
+  const pkCols = primaryKeyColumnNames(sqliteTable);
+  const singlePk = pkCols.length === 1 ? pkCols[0] : null;
+  const orderBy = singlePk
+    ? `ORDER BY "${singlePk}" ASC`
+    : primaryKeyOrder(sqliteTable);
   // Keep each INSERT's bound-parameter count (rows × columns) well under
   // Postgres's 65535 limit.
   const colCount = Object.keys(getTableColumns(pgTable)).length;
@@ -434,27 +443,56 @@ async function copyTable(
   // table with no PK/unique index, or all-arbiter columns) fall back to ignore.
   const canUpsert = upsert && target.length > 0 && Object.keys(set).length > 0;
 
+  let cursor: unknown = null;
   let offset = 0;
-  let count = 0;
+  let readCount = 0;
+  let appliedCount = 0;
   for (;;) {
-    const page = await d1Query<Record<string, unknown>>(
-      databaseId,
-      `SELECT * FROM "${name}" ${where}${orderBy} LIMIT ${tablePageSize} OFFSET ${offset}`,
-    );
+    let where = "";
+    if (singlePk) {
+      const cursorClause =
+        cursor !== null && cursor !== undefined
+          ? `"${singlePk}" > ${
+              typeof cursor === "string"
+                ? `'${String(cursor).replace(/'/g, "''")}'`
+                : cursor
+            }`
+          : "";
+      const parts = [predicate, cursorClause].filter(Boolean);
+      where = parts.length > 0 ? `WHERE ${parts.join(" AND ")} ` : "";
+    } else {
+      where = predicate ? `WHERE ${predicate} ` : "";
+    }
+
+    const query = singlePk
+      ? `SELECT * FROM "${name}" ${where}${orderBy} LIMIT ${tablePageSize}`
+      : `SELECT * FROM "${name}" ${where}${orderBy} LIMIT ${tablePageSize} OFFSET ${offset}`;
+
+    const page = await d1Query<Record<string, unknown>>(databaseId, query);
     if (page.length === 0) break;
+
+    if (singlePk) {
+      cursor = page[page.length - 1][singlePk];
+    } else {
+      offset += tablePageSize;
+    }
 
     const rows = page.map((row) => convertRow(sqliteTable, row));
     for (let i = 0; i < rows.length; i += insertBatch) {
       const chunk = rows.slice(i, i + insertBatch);
-      await (canUpsert
-        ? dest.insert(pgTable).values(chunk).onConflictDoUpdate({ target, set })
-        : dest.insert(pgTable).values(chunk).onConflictDoNothing());
+      const inserted = await (canUpsert
+        ? dest
+            .insert(pgTable)
+            .values(chunk)
+            .onConflictDoUpdate({ target, set })
+            .returning()
+        : dest.insert(pgTable).values(chunk).onConflictDoNothing().returning());
+      appliedCount += inserted.length;
     }
-    count += page.length;
-    offset += tablePageSize;
+    readCount += page.length;
     if (page.length < tablePageSize) break;
   }
-  return count;
+  return { readCount, appliedCount };
 }
 
 async function main() {
@@ -470,7 +508,15 @@ async function main() {
 
   const sqliteTables = tablesByName([sqliteSchema]);
   const pgTables = tablesByName([pgSchema]);
-  const order = fkSafeOrder(sqliteTables);
+  const fullOrder = fkSafeOrder(sqliteTables);
+  if (selectedTable) {
+    if (!sqliteTables.has(selectedTable) || !pgTables.has(selectedTable)) {
+      throw new Error(
+        `Unknown migration table: '${selectedTable}'. Table does not exist in schema.`,
+      );
+    }
+  }
+  const order = selectedTable ? [selectedTable] : fullOrder;
   const cutoffIso = new Date(Date.now() - sinceHours * 3_600_000).toISOString();
 
   const mode = updateMode ? `UPDATE — last ${sinceHours}h` : "FULL";
@@ -512,10 +558,13 @@ async function main() {
       }
     }
 
-    const written = new Map<string, number>();
+    const written = new Map<
+      string,
+      { readCount: number; appliedCount: number }
+    >();
     for (const name of order) {
       const predicate = updateMode ? deltaPredicate(name, cutoffIso) : null;
-      const count = await copyTable(
+      const counts = await copyTable(
         databaseId,
         dest,
         name,
@@ -524,9 +573,15 @@ async function main() {
         predicate,
         updateMode,
       );
-      written.set(name, count);
+      written.set(name, counts);
       const verb = updateMode ? "synced" : "wrote";
-      console.log(`  ${name.padEnd(34)} ${verb} ${String(count).padStart(7)}`);
+      const skippedNote =
+        counts.readCount > counts.appliedCount
+          ? ` (read: ${counts.readCount}, skipped: ${counts.readCount - counts.appliedCount})`
+          : "";
+      console.log(
+        `  ${name.padEnd(34)} ${verb} ${String(counts.appliedCount).padStart(7)}${skippedNote}`,
+      );
     }
 
     // Serial PKs (keyword_metrics.id, rank_snapshots.id) were copied with their
@@ -570,7 +625,7 @@ async function main() {
       }
     }
 
-    const total = [...written.values()].reduce((n, v) => n + v, 0);
+    const total = [...written.values()].reduce((n, v) => n + v.appliedCount, 0);
     console.log(
       `\nDone. ${total} rows across ${order.length} tables.` +
         (mismatches === 0

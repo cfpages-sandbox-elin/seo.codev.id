@@ -1,6 +1,7 @@
 import { and, eq, isNull } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
+import { getDatabaseProvider } from "@/db/provider";
 import { projects, fleetRosterMembers } from "@/db/schema";
 import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
@@ -206,7 +207,9 @@ function buildExecutionArgv(options: {
       "--max-pages",
       String(maxPages),
     ];
-    if (domain && boundRosterMember) {
+    if (domain && boundRosterMember && targetProjectId) {
+      argv.push("--expected-member", boundRosterMember.id);
+      argv.push("--expected-project", targetProjectId);
       if (boundRosterMember.repoName) {
         argv.push("--expected-repo", boundRosterMember.repoName.trim());
       }
@@ -231,10 +234,15 @@ function buildExecutionArgv(options: {
     "--concurrency",
     String(concurrency),
   ];
-  if (domain && targetProjectId) {
+  if (domain && boundRosterMember && targetProjectId) {
+    argv.push("--expected-member", boundRosterMember.id);
     argv.push("--expected-project", targetProjectId);
   }
   return argv;
+}
+
+function quoteArg(arg: string): string {
+  return /[ \t\n\r"']/.test(arg) ? `'${arg.replaceAll("'", "''")}'` : arg;
 }
 
 export const runFleetAuditTool = {
@@ -265,6 +273,12 @@ export const runFleetAuditTool = {
     if (!orgId || orgId !== "shared-workspace") {
       throw new Error(
         `Fleet runners are currently constrained to the 'shared-workspace' organization; caller organization '${orgId ?? "unauthenticated"}' is not supported.`,
+      );
+    }
+
+    if (getDatabaseProvider() !== "d1") {
+      throw new Error(
+        `Fleet audit planning requires Cloudflare D1 provider; current provider is '${getDatabaseProvider()}'.`,
       );
     }
 
@@ -315,7 +329,7 @@ export const runFleetAuditTool = {
       targetProjectId,
     });
 
-    const executionCommand = `pnpm ${argv.join(" ")}`;
+    const executionCommand = `pnpm ${argv.map(quoteArg).join(" ")}`;
     const message = domain
       ? `Fleet audit plan configured for ${domain} in ${mode} mode.`
       : `Fleet audit plan configured across enrolled properties in ${mode} mode.`;

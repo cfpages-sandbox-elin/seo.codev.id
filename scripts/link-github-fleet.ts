@@ -209,7 +209,7 @@ export async function linkFleet(options: {
 
     // Scoped strictly to the approved roster version to prevent mutating historical or foreign versions (P1-1)
     existingMembers = runD1Query(
-      `SELECT id, canonical_host, project_id, version_id FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}';`,
+      `SELECT id, canonical_host, project_id, version_id, enrollment_state FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}';`,
       isRemote,
     );
   } catch (err: any) {
@@ -343,6 +343,13 @@ export async function linkFleet(options: {
           ),
         );
     }
+    if (unmappedCount > 0) {
+      console.error(
+        `\n[ERROR] Dry run found ${unmappedCount} active unmapped roster members that cannot be linked to any project.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
     console.log(
       `\nDry run completed cleanly. Run without --dry-run to apply changes.`,
     );
@@ -402,6 +409,7 @@ export async function linkFleet(options: {
           LIMIT 1
         )
         AND m.canonical_host = '${m.host.replace(/'/g, "''")}'
+        AND m.enrollment_state = 'active'
         AND m.project_id IS NULL
         AND 1 = (
           SELECT count(*) FROM projects AS p
@@ -422,7 +430,8 @@ export async function linkFleet(options: {
     const query = `
     SELECT
       COUNT(m.id) AS member_count,
-      COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.project_id IS NULL THEN 1 ELSE 0 END), 0) AS unmapped,
+      COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.enrollment_state = 'active' AND m.project_id IS NULL THEN 1 ELSE 0 END), 0) AS unmapped_active,
+      COALESCE(SUM(CASE WHEN m.id IS NOT NULL AND m.enrollment_state <> 'active' AND m.project_id IS NULL THEN 1 ELSE 0 END), 0) AS unmapped_inactive,
       COALESCE(SUM(CASE WHEN m.project_id IS NOT NULL AND (p.id IS NULL OR p.organization_id <> v.organization_id OR p.archived_at IS NOT NULL OR p.domain IS NULL OR lower(trim(p.domain)) <> m.canonical_host) THEN 1 ELSE 0 END), 0) AS invalid_links
     FROM fleet_roster_versions v
     LEFT JOIN fleet_roster_members m ON m.version_id = v.id
@@ -438,7 +447,8 @@ export async function linkFleet(options: {
     }
     const row = res[0];
     const memberCount = Number(row.member_count ?? 0);
-    const unmapped = Number(row.unmapped ?? 0);
+    const unmappedActive = Number(row.unmapped_active ?? 0);
+    const unmappedInactive = Number(row.unmapped_inactive ?? 0);
     const invalidLinks = Number(row.invalid_links ?? 0);
 
     if (memberCount !== expectedCount) {
@@ -446,9 +456,9 @@ export async function linkFleet(options: {
         `Roster member count mismatch: expected ${expectedCount}, found ${memberCount} for roster ${rosterId}.`,
       );
     }
-    if (unmapped > 0) {
+    if (unmappedActive > 0) {
       throw new Error(
-        `${unmapped} fleet roster members remain unmapped in roster ${rosterId}.`,
+        `${unmappedActive} active fleet roster members remain unmapped in roster ${rosterId} (inactive: ${unmappedInactive}).`,
       );
     }
     if (invalidLinks > 0) {

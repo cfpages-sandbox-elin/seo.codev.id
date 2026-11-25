@@ -21,7 +21,8 @@ WHERE "status" = 'running'
       SELECT "id",
         "project_id",
         CASE
-          WHEN "started_at" ~ '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' THEN ("started_at" || '+00')::timestamptz
+          WHEN "started_at" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$'
+           AND pg_input_is_valid("started_at" || '+00', 'timestamptz') THEN ("started_at" || '+00')::timestamptz
           WHEN pg_input_is_valid("started_at", 'timestamptz') THEN "started_at"::timestamptz
           ELSE NULL
         END AS valid_time,
@@ -29,12 +30,15 @@ WHERE "status" = 'running'
           PARTITION BY "project_id"
           ORDER BY
             CASE
-              WHEN "started_at" ~ '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' THEN 1
+              WHEN "started_at" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$'
+               AND pg_input_is_valid("started_at" || '+00', 'timestamptz') THEN 1
               WHEN pg_input_is_valid("started_at", 'timestamptz') THEN 1
               ELSE 0
             END DESC,
             CASE
-              WHEN "started_at" ~ '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' THEN ("started_at" || '+00')::timestamptz
+              WHEN "started_at" ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$'
+               AND pg_input_is_valid("started_at" || '+00', 'timestamptz')
+              THEN ("started_at" || '+00')::timestamptz
               WHEN pg_input_is_valid("started_at", 'timestamptz') THEN "started_at"::timestamptz
               ELSE NULL
             END DESC NULLS LAST,

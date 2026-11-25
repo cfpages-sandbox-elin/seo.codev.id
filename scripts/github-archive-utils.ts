@@ -369,6 +369,7 @@ export function executeD1SqlBatches(
     maxStatementsPerBatch?: number;
     maxBytesPerBatch?: number;
     repoRoot?: string;
+    atomic?: boolean;
   },
 ): any[] {
   if (!statements || statements.length === 0) return [];
@@ -435,6 +436,12 @@ export function executeD1SqlBatches(
   }
   if (currentBatch.length > 0) {
     batches.push(currentBatch);
+  }
+
+  if (options?.atomic && batches.length > 1) {
+    throw new Error(
+      `Atomic batch requirement violated: payload split into ${batches.length} batches exceeding budget constraints.`,
+    );
   }
 
   const allResults: any[] = [];
@@ -597,7 +604,7 @@ export function parseTarHtmlFiles(
     if (
       isRegularFile &&
       size <= maxEntrySize &&
-      (relPath.endsWith(".html") || relPath.endsWith(".htm")) &&
+      /\.html?$/i.test(relPath) &&
       (!selectedPaths || selectedPaths.has(relPath))
     ) {
       if (contentEnd <= tarBuf.length) {

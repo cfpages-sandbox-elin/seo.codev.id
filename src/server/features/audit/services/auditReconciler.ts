@@ -11,9 +11,9 @@
  *     error is copied into the row before Workflows retention deletes it.
  */
 import { env } from "cloudflare:workers";
-import { and, asc, eq, isNotNull, isNull, sql, type Column, type SQL } from "drizzle-orm";
+import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { db } from "@/db";
-import { audits, projects, watchdogCursor } from "@/db/schema";
+import { audits, projects } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
 import { AuditRepository } from "@/server/features/audit/repositories/AuditRepository";
 import {
@@ -21,6 +21,17 @@ import {
   type AuditErrorInfo,
 } from "@/server/lib/audit/audit-errors";
 import { captureServerEvent } from "@/server/lib/posthog";
+import {
+  loadPersistedCursor,
+  pgBucketExpr,
+  pgNormalizedTimeExpr,
+  pgTimeExpr,
+  savePersistedCursor,
+  sqliteBucketExpr,
+  sqliteNormalizedTimeExpr,
+  type LoadedCursorState,
+  type WatchdogCursor,
+} from "./auditWatchdogCursor";
 
 /**
  * Don't declare an instance "lost" until the audit is comfortably older than
@@ -41,6 +52,8 @@ type RunningAudit = {
   currentPhase: string | null;
 };
 
+let sweepCursor: WatchdogCursor = null;
+
 /**
  * If the audit's workflow instance is dead (errored/terminated) or gone,
  * flip the row to failed with a classified error. Returns the error info
@@ -50,32 +63,30 @@ export async function reconcileRunningAudit(
   audit: RunningAudit,
 ): Promise<AuditErrorInfo | null> {
   if (!audit.workflowInstanceId) return null;
-  // Sol P1-05, R3: Repository runner audits (workflow_instance_id LIKE 'github-audit-%') are executed out-of-band by the CLI runner.
+  // Sol P1-05, R3: Repository runner audits (workflow_instance_id LIKE 'github-audit-%') run out-of-band.
   // If running longer than 2 hours, reclaim the abandoned reservation without querying Cloudflare Workflows.
   if (audit.workflowInstanceId.startsWith("github-audit-")) {
     const GITHUB_AUDIT_TTL_MS = 2 * 60 * 60 * 1000;
-    if (isOlderThan(audit.startedAt, GITHUB_AUDIT_TTL_MS)) {
-      const errorInfo: AuditErrorInfo = {
-        errorCode: "runner_timeout",
-        errorDetail:
-          "GitHub repository audit exceeded max run duration (2h) and was reclaimed.",
-      };
-      const failed = await AuditRepository.failAudit(
-        audit.id,
-        audit.workflowInstanceId,
-        {
-          errorCode: errorInfo.errorCode,
-          errorDetail: errorInfo.errorDetail,
-          failedPhase: audit.currentPhase ?? "analyzing",
-        },
-      );
-      if (failed) return errorInfo;
-      return null;
-    }
-    return null;
+    if (!isOlderThan(audit.startedAt, GITHUB_AUDIT_TTL_MS)) return null;
+    const errorInfo: AuditErrorInfo = {
+      errorCode: "runner_timeout",
+      errorDetail:
+        "GitHub repository audit exceeded max run duration (2h) and was reclaimed.",
+    };
+    const failed = await AuditRepository.failAudit(
+      audit.id,
+      audit.workflowInstanceId,
+      {
+        errorCode: errorInfo.errorCode,
+        errorDetail: errorInfo.errorDetail,
+        failedPhase: audit.currentPhase ?? "analyzing",
+      },
+    );
+    return failed ? errorInfo : null;
   }
 
   let errorInfo: AuditErrorInfo | null = null;
+  let timerId: ReturnType<typeof setTimeout> | undefined;
   try {
     const probePromise = (async () => {
       const instance = await env.SITE_AUDIT_WORKFLOW.get(
@@ -85,7 +96,10 @@ export async function reconcileRunningAudit(
     })();
 
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => reject(new Error("Workflow probe timed out")), 5000);
+      timerId = setTimeout(
+        () => reject(new Error("Workflow probe timed out")),
+        5000,
+      );
     });
 
     const status = await Promise.race([probePromise, timeoutPromise]);
@@ -108,11 +122,7 @@ export async function reconcileRunningAudit(
       };
     }
   } catch (error) {
-    // Instance not found (never created, or expired from Workflows
-    // retention). Past the grace window that means the audit can never
-    // finish — without this branch such rows stay "running" forever.
-    // Transient status/control-plane errors must NOT fail a live audit,
-    // so only a confirmed not-found counts.
+    // Transient status/control-plane errors must NOT fail a live audit; only confirmed not-found counts.
     const message = error instanceof Error ? error.message : String(error);
     if (!/not[ _]?found/i.test(message)) return null;
     if (!isOlderThan(audit.startedAt, INSTANCE_LOST_GRACE_MS)) return null;
@@ -120,6 +130,8 @@ export async function reconcileRunningAudit(
       errorCode: "instance_lost",
       errorDetail: "Workflow instance not found",
     };
+  } finally {
+    if (timerId) clearTimeout(timerId);
   }
   if (!errorInfo) return null;
 
@@ -131,145 +143,7 @@ export async function reconcileRunningAudit(
       failedPhase: audit.currentPhase,
     },
   );
-  if (!didFail) return null;
-  return errorInfo;
-}
-
-type WatchdogCursor = {
-  startedAt: string;
-  id: string;
-} | null;
-
-let sweepCursor: WatchdogCursor = null;
-
-type LoadedCursorState =
-  | { kind: "persisted"; cursor: WatchdogCursor; revision: number }
-  | { kind: "absent"; cursor: null; revision: null }
-  | { kind: "read_error"; cursor: null; revision: null };
-
-async function loadPersistedCursor(): Promise<LoadedCursorState> {
-  try {
-    const row = await db.query.watchdogCursor.findFirst({
-      where: eq(watchdogCursor.id, "singleton"),
-    });
-    if (row) {
-      if (row.startedAt && row.auditId) {
-        return {
-          kind: "persisted",
-          cursor: { startedAt: row.startedAt, id: row.auditId },
-          revision: row.revision,
-        };
-      }
-      // A stored null reset must be honored rather than falling back to process memory
-      return { kind: "persisted", cursor: null, revision: row.revision };
-    }
-    return { kind: "absent", cursor: null, revision: null };
-  } catch {
-    return { kind: "read_error", cursor: null, revision: null };
-  }
-}
-
-type CursorSaveResult = "applied" | "conflict" | "error";
-
-async function savePersistedCursor(
-  cursor: WatchdogCursor,
-  expectedRevision?: number | null,
-): Promise<CursorSaveResult> {
-  try {
-    const isPg = getDatabaseProvider() === "postgres";
-    const nowIso = new Date().toISOString();
-
-    if (expectedRevision !== undefined && expectedRevision !== null) {
-      const res = await db
-        .update(watchdogCursor)
-        .set({
-          startedAt: cursor ? cursor.startedAt : null,
-          auditId: cursor ? cursor.id : null,
-          revision: expectedRevision + 1,
-          updatedAt: isPg ? nowIso : sql`(current_timestamp)`,
-        })
-        .where(
-          and(
-            eq(watchdogCursor.id, "singleton"),
-            eq(watchdogCursor.revision, expectedRevision),
-          ),
-        )
-        .returning({ revision: watchdogCursor.revision });
-
-      if (res.length > 0) {
-        sweepCursor = cursor;
-        return "applied";
-      }
-      return "conflict";
-    }
-
-    if (expectedRevision === null) {
-      const res = await db
-        .insert(watchdogCursor)
-        .values({
-          id: "singleton",
-          startedAt: cursor ? cursor.startedAt : null,
-          auditId: cursor ? cursor.id : null,
-          revision: 1,
-        })
-        .onConflictDoNothing()
-        .returning({ revision: watchdogCursor.revision });
-
-      if (res.length > 0) {
-        sweepCursor = cursor;
-        return "applied";
-      }
-      return "conflict";
-    }
-
-    const existing = await db.query.watchdogCursor.findFirst({
-      where: eq(watchdogCursor.id, "singleton"),
-    });
-
-    if (existing) {
-      const res = await db
-        .update(watchdogCursor)
-        .set({
-          startedAt: cursor ? cursor.startedAt : null,
-          auditId: cursor ? cursor.id : null,
-          revision: existing.revision + 1,
-          updatedAt: isPg ? nowIso : sql`(current_timestamp)`,
-        })
-        .where(
-          and(
-            eq(watchdogCursor.id, "singleton"),
-            eq(watchdogCursor.revision, existing.revision),
-          ),
-        )
-        .returning({ revision: watchdogCursor.revision });
-
-      if (res.length > 0) {
-        sweepCursor = cursor;
-        return "applied";
-      }
-      return "conflict";
-    } else {
-      const res = await db
-        .insert(watchdogCursor)
-        .values({
-          id: "singleton",
-          startedAt: cursor ? cursor.startedAt : null,
-          auditId: cursor ? cursor.id : null,
-          revision: 1,
-        })
-        .onConflictDoNothing()
-        .returning({ revision: watchdogCursor.revision });
-
-      if (res.length > 0) {
-        sweepCursor = cursor;
-        return "applied";
-      }
-      return "conflict";
-    }
-  } catch (error) {
-    console.error("Audit watchdog: database error saving cursor:", error);
-    return "error";
-  }
+  return didFail ? errorInfo : null;
 }
 
 /** Cron watchdog: sweep stale running audits and reconcile each. */
@@ -280,7 +154,6 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
       ? { kind: "persisted", cursor: overrideCursor, revision: -1 }
       : await loadPersistedCursor();
 
-  // If DB read failed, keep fallback method-local without persisting blind CAS
   if (loaded.kind === "read_error") {
     console.warn(
       "[WATCHDOG] Failed to read persisted cursor state; skipping cursor sweep this cycle.",
@@ -301,13 +174,12 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
     stale = await getStaleRunningAudits(cutoff, WATCHDOG_BATCH_LIMIT, null);
   }
 
-  // Reconcile legacy running rows with NULL workflow_instance_id that are older than cutoff
-  // (Sol R1: "Handle historical null IDs via a separately scoped recovery rule.")
+  // Reconcile legacy running rows with NULL workflow_instance_id older than cutoff
   const isPg = getDatabaseProvider() === "postgres";
   const cutoffIso = cutoff.toISOString();
   const nullTimestampPredicate = isPg
-    ? sql`CASE WHEN pg_input_is_valid(${audits.startedAt}, 'timestamptz') THEN ${audits.startedAt}::timestamptz < ${cutoffIso}::timestamptz ELSE false END`
-    : sql`julianday(${audits.startedAt}) < julianday(${cutoffIso})`;
+    ? sql`(${pgTimeExpr(audits.startedAt)} IS NULL OR ${pgTimeExpr(audits.startedAt)} < ${cutoffIso}::timestamptz)`
+    : sql`(julianday(${audits.startedAt}) IS NULL OR julianday(${audits.startedAt}) < julianday(${cutoffIso}))`;
 
   try {
     const nullInstanceAudits = await db.query.audits.findMany({
@@ -318,10 +190,13 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
       ),
       orderBy: isPg
         ? [
-            sql`CASE WHEN pg_input_is_valid(${audits.startedAt}, 'timestamptz') THEN ${audits.startedAt}::timestamptz END ASC NULLS FIRST`,
-            asc(audits.id),
+            sql`${pgTimeExpr(audits.startedAt)} ASC NULLS FIRST`,
+            sql`${audits.id} COLLATE "C" ASC`,
           ]
-        : [sql`julianday(${audits.startedAt}) ASC`, asc(audits.id)],
+        : [
+            sql`julianday(${audits.startedAt}) ASC`,
+            sql`${audits.id} COLLATE BINARY ASC`,
+          ],
       limit: 20,
       columns: {
         id: true,
@@ -336,71 +211,91 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
         failedPhase: legacy.currentPhase,
       });
     }
-  } catch {}
+  } catch (err) {
+    console.error("Audit watchdog: legacy null-instance sweep failed:", err);
+  }
 
-  for (const audit of stale) {
-    try {
-      const errorInfo = await reconcileRunningAudit(audit);
-      if (!errorInfo) continue;
+  const deadline = Date.now() + 20_000;
+  let currentRevision = loaded.revision;
+  let processedAll = true;
 
-      console.log(
-        `Audit watchdog: marked ${audit.id} failed (${errorInfo.errorCode}, phase=${audit.currentPhase})`,
+  for (let i = 0; i < stale.length; i += 5) {
+    if (Date.now() + 5_000 > deadline) {
+      console.warn(
+        "Audit watchdog: tick deadline approaching, stopping batch early",
       );
-      const project = await db.query.projects.findFirst({
-        where: eq(projects.id, audit.projectId),
-      });
-      if (!project) continue;
-      await captureServerEvent({
-        distinctId: audit.startedByUserId,
-        event: "site_audit:complete",
-        organizationId: project.organizationId,
-        properties: {
-          project_id: audit.projectId,
-          status: "failed",
-          reconciled_by: "watchdog",
-          error_code: errorInfo.errorCode,
-          pages_crawled: audit.pagesCrawled,
-          pages_total: audit.pagesTotal,
-        },
-      });
-    } catch (error) {
-      // One unreconcilable audit must not stop the sweep.
-      console.error(`Audit watchdog: failed to reconcile ${audit.id}:`, error);
+      processedAll = false;
+      break;
+    }
+    const group = stale.slice(i, i + 5);
+    await Promise.allSettled(
+      group.map(async (audit) => {
+        try {
+          const errorInfo = await reconcileRunningAudit(audit);
+          if (!errorInfo) return;
+
+          console.log(
+            `Audit watchdog: marked ${audit.id} failed (${errorInfo.errorCode}, phase=${audit.currentPhase})`,
+          );
+          const project = await db.query.projects.findFirst({
+            where: eq(projects.id, audit.projectId),
+          });
+          if (!project) return;
+          captureServerEvent({
+            distinctId: audit.startedByUserId,
+            event: "site_audit:complete",
+            organizationId: project.organizationId,
+            properties: {
+              project_id: audit.projectId,
+              status: "failed",
+              reconciled_by: "watchdog",
+              error_code: errorInfo.errorCode,
+              pages_crawled: audit.pagesCrawled,
+              pages_total: audit.pagesTotal,
+            },
+          }).catch(() => {});
+        } catch (error) {
+          console.error(
+            `Audit watchdog: failed to reconcile ${audit.id}:`,
+            error,
+          );
+        }
+      }),
+    );
+
+    if (currentRevision !== null && currentRevision !== -1) {
+      const last = group[group.length - 1];
+      const nextCursor: WatchdogCursor = {
+        startedAt: last.startedAt,
+        id: last.id,
+      };
+      const saved = await savePersistedCursor(nextCursor, currentRevision);
+      if (saved.result === "applied") {
+        sweepCursor = nextCursor;
+        currentRevision++;
+      } else {
+        console.warn(
+          `Audit watchdog: cursor save yielded '${saved.result}', halting advance`,
+        );
+        processedAll = false;
+        break;
+      }
     }
   }
 
-  // Sol Round 21 F08: Update cursor for next sweep AFTER processing stale batch
-  if (loaded.revision !== -1) {
-    let saveResult: CursorSaveResult = "conflict";
-    if (stale.length > 0) {
-      const last = stale[stale.length - 1];
-      saveResult = await savePersistedCursor(
-        { startedAt: last.startedAt, id: last.id },
-        loaded.revision,
-      );
-    } else {
-      saveResult = await savePersistedCursor(null, loaded.revision);
-    }
-    if (saveResult === "conflict") {
-      console.warn(
-        "Audit watchdog: cursor was not advanced due to revision conflict",
-      );
-    } else if (saveResult === "error") {
-      console.error(
-        "Audit watchdog: cursor failed to advance due to database error",
-      );
+  if (
+    processedAll &&
+    currentRevision !== null &&
+    currentRevision !== -1 &&
+    (stale.length === 0 || stale.length < WATCHDOG_BATCH_LIMIT)
+  ) {
+    const wrapped = await savePersistedCursor(null, currentRevision);
+    if (wrapped.result === "applied") {
+      sweepCursor = null;
     }
   }
 }
 
-/**
- * Running audits started before the cutoff — watchdog candidates. Timestamps
- * are stored as text, so this compares lexicographically: PG rows use ISO
- * with a "T", D1-default rows use "YYYY-MM-DD HH:MM:SS" (space < "T", so a
- * same-day ISO cutoff would misorder against D1 rows without the reformat).
- * Sol R1: Uses (startedAt, id) keyset pagination and tiebreaker so later stranded rows
- * are never starved by earlier stalled rows.
- */
 async function getStaleRunningAudits(
   cutoff: Date,
   limit: number,
@@ -408,27 +303,24 @@ async function getStaleRunningAudits(
 ) {
   const isPg = getDatabaseProvider() === "postgres";
   const edgeCutoffIso = cutoff.toISOString();
-  // Sol Round 18 F4: Repository audits (github-audit-*) have a 2-hour TTL.
-  // Sweep them in the same keyset cursor pass so crashed CLI runners never lock projects indefinitely.
   const repoCutoffIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
-  // Sol R24-02: Guarded UTC timestamp evaluation for PostgreSQL session time-zone and malformed input safety
-  const pgTime = (expr: SQL | Column | string | null | undefined) => sql`(
-    CASE
-      WHEN ${expr} ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (${expr} || '+00')::timestamptz
-      WHEN pg_input_is_valid(${expr}, 'timestamptz') THEN (${expr})::timestamptz
-      ELSE NULL
-    END
-  )`;
-
   const stalenessPredicate = isPg
-    ? sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND (${pgTime(audits.startedAt)} IS NULL OR ${pgTime(audits.startedAt)} < ${edgeCutoffIso}::timestamptz)) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND (${pgTime(audits.startedAt)} IS NULL OR ${pgTime(audits.startedAt)} < ${repoCutoffIso}::timestamptz))))`
+    ? sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND (${pgTimeExpr(audits.startedAt)} IS NULL OR ${pgTimeExpr(audits.startedAt)} < ${edgeCutoffIso}::timestamptz)) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND (${pgTimeExpr(audits.startedAt)} IS NULL OR ${pgTimeExpr(audits.startedAt)} < ${repoCutoffIso}::timestamptz))))`
     : sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND (julianday(${audits.startedAt}) IS NULL OR julianday(${audits.startedAt}) < julianday(${edgeCutoffIso}))) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND (julianday(${audits.startedAt}) IS NULL OR julianday(${audits.startedAt}) < julianday(${repoCutoffIso})))))`;
 
   const cursorPredicate = cursor
     ? isPg
-      ? sql`(${pgTime(audits.startedAt)} > ${pgTime(cursor.startedAt)} OR (${pgTime(audits.startedAt)} = ${pgTime(cursor.startedAt)} AND ${audits.id} > ${cursor.id}))`
-      : sql`(${audits.startedAt} > ${cursor.startedAt} OR (${audits.startedAt} = ${cursor.startedAt} AND ${audits.id} > ${cursor.id}))`
+      ? sql`(
+          ${pgBucketExpr(audits.startedAt)} > ${pgBucketExpr(cursor.startedAt)}
+          OR (${pgBucketExpr(audits.startedAt)} = ${pgBucketExpr(cursor.startedAt)} AND ${pgNormalizedTimeExpr(audits.startedAt)} > ${pgNormalizedTimeExpr(cursor.startedAt)})
+          OR (${pgBucketExpr(audits.startedAt)} = ${pgBucketExpr(cursor.startedAt)} AND ${pgNormalizedTimeExpr(audits.startedAt)} = ${pgNormalizedTimeExpr(cursor.startedAt)} AND ${audits.id} COLLATE "C" > ${cursor.id} COLLATE "C")
+        )`
+      : sql`(
+          ${sqliteBucketExpr(audits.startedAt)} > ${sqliteBucketExpr(cursor.startedAt)}
+          OR (${sqliteBucketExpr(audits.startedAt)} = ${sqliteBucketExpr(cursor.startedAt)} AND ${sqliteNormalizedTimeExpr(audits.startedAt)} > ${sqliteNormalizedTimeExpr(cursor.startedAt)})
+          OR (${sqliteBucketExpr(audits.startedAt)} = ${sqliteBucketExpr(cursor.startedAt)} AND ${sqliteNormalizedTimeExpr(audits.startedAt)} = ${sqliteNormalizedTimeExpr(cursor.startedAt)} AND ${audits.id} COLLATE BINARY > ${cursor.id} COLLATE BINARY)
+        )`
     : undefined;
 
   return db.query.audits.findMany({
@@ -439,8 +331,16 @@ async function getStaleRunningAudits(
       cursorPredicate,
     ),
     orderBy: isPg
-      ? [sql`${pgTime(audits.startedAt)} ASC NULLS FIRST`, sql`${audits.id} ASC`]
-      : [asc(audits.startedAt), asc(audits.id)],
+      ? [
+          sql`${pgBucketExpr(audits.startedAt)} ASC`,
+          sql`${pgNormalizedTimeExpr(audits.startedAt)} ASC`,
+          sql`${audits.id} COLLATE "C" ASC`,
+        ]
+      : [
+          sql`${sqliteBucketExpr(audits.startedAt)} ASC`,
+          sql`${sqliteNormalizedTimeExpr(audits.startedAt)} ASC`,
+          sql`${audits.id} COLLATE BINARY ASC`,
+        ],
     columns: {
       id: true,
       workflowInstanceId: true,
@@ -456,8 +356,6 @@ async function getStaleRunningAudits(
 }
 
 function isOlderThan(startedAt: string, ageMs: number): boolean {
-  // D1-default timestamps ("YYYY-MM-DD HH:MM:SS") lack the T/Z; normalize so
-  // Date.parse reads them as UTC, matching the PG ISO format.
   const parsed = Date.parse(
     startedAt.includes("T") ? startedAt : `${startedAt.replace(" ", "T")}Z`,
   );

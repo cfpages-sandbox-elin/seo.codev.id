@@ -42,6 +42,35 @@ interface RawFleetData {
   runItems: RawFleetRunItem[];
 }
 
+function isProjectDomainMatch(
+  liveProjectDomain: string | null | undefined,
+  canonicalHost: string,
+  aliasesJson: string | null,
+): boolean {
+  if (!liveProjectDomain) return false;
+  const normProjectDomain = liveProjectDomain
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/+$/, "");
+  if (normProjectDomain === canonicalHost.trim().toLowerCase()) {
+    return true;
+  }
+  if (!aliasesJson) return false;
+  try {
+    const aliases: unknown = JSON.parse(aliasesJson);
+    return (
+      Array.isArray(aliases) &&
+      aliases.some(
+        (a: unknown) =>
+          typeof a === "string" && a.trim().toLowerCase() === normProjectDomain,
+      )
+    );
+  } catch {
+    return false;
+  }
+}
+
 export const FleetRepository = {
   /**
    * Retrieves the currently approved fleet roster version for an organization (Sol PV-2).
@@ -72,7 +101,7 @@ export const FleetRepository = {
       const tB = parseUtcTimestampMs(b.approvedAt);
       const diff = (isNaN(tB) ? 0 : tB) - (isNaN(tA) ? 0 : tA);
       if (diff !== 0) return diff;
-      return b.id.localeCompare(a.id);
+      return b.id === a.id ? 0 : b.id > a.id ? 1 : -1;
     });
 
     return sorted[0] ?? null;
@@ -113,33 +142,15 @@ export const FleetRepository = {
 
     const validatedMembers = memberRows.map(
       ({ member, liveProjectId, liveProjectDomain }) => {
-        let effectiveProjectId = liveProjectId ?? null;
-        if (effectiveProjectId && liveProjectDomain) {
-          const normProjectDomain = liveProjectDomain
-            .trim()
-            .toLowerCase()
-            .replace(/^https?:\/\//, "")
-            .replace(/\/+$/, "");
-          const normMemberHost = member.canonicalHost.trim().toLowerCase();
-          let matches = normProjectDomain === normMemberHost;
-          if (!matches && member.aliasesJson) {
-            try {
-              const aliases: unknown = JSON.parse(member.aliasesJson);
-              if (Array.isArray(aliases)) {
-                matches = aliases.some(
-                  (a: unknown) =>
-                    typeof a === "string" &&
-                    a.trim().toLowerCase() === normProjectDomain,
-                );
-              }
-            } catch {
-              // ignore malformed aliases
-            }
-          }
-          if (!matches) {
-            effectiveProjectId = null;
-          }
-        }
+        const effectiveProjectId =
+          liveProjectId &&
+          isProjectDomainMatch(
+            liveProjectDomain,
+            member.canonicalHost,
+            member.aliasesJson,
+          )
+            ? liveProjectId
+            : null;
         return {
           ...member,
           projectId: effectiveProjectId,
@@ -150,11 +161,11 @@ export const FleetRepository = {
     // Query 3: Run items for this approved roster version joined with runs bounded by window partition (Sol Round 24 P2-07, R24-12)
     const isPg = getDatabaseProvider() === "postgres";
     const friOrder = isPg
-      ? sql`ORDER BY (CASE WHEN fri.completed_at IS NOT NULL THEN (CASE WHEN fri.completed_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (fri.completed_at || '+00')::timestamptz WHEN pg_input_is_valid(fri.completed_at, 'timestamptz') THEN fri.completed_at::timestamptz ELSE NULL END) ELSE NULL END) DESC NULLS LAST, fri.id DESC`
+      ? sql`ORDER BY (CASE WHEN fri.completed_at IS NOT NULL THEN (CASE WHEN fri.completed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$' AND pg_input_is_valid(fri.completed_at || '+00', 'timestamptz') THEN (fri.completed_at || '+00')::timestamptz WHEN pg_input_is_valid(fri.completed_at, 'timestamptz') THEN fri.completed_at::timestamptz ELSE NULL END) ELSE NULL END) DESC NULLS LAST, fri.id DESC`
       : sql`ORDER BY (CASE WHEN fri.completed_at IS NOT NULL THEN julianday(fri.completed_at) ELSE NULL END) DESC NULLS LAST, fri.id DESC`;
 
     const fsOrder = isPg
-      ? sql`ORDER BY (CASE WHEN fs.observed_at IS NOT NULL THEN (CASE WHEN fs.observed_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (fs.observed_at || '+00')::timestamptz WHEN pg_input_is_valid(fs.observed_at, 'timestamptz') THEN fs.observed_at::timestamptz ELSE NULL END) ELSE NULL END) DESC NULLS LAST, fs.id DESC`
+      ? sql`ORDER BY (CASE WHEN fs.observed_at IS NOT NULL THEN (CASE WHEN fs.observed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$' AND pg_input_is_valid(fs.observed_at || '+00', 'timestamptz') THEN (fs.observed_at || '+00')::timestamptz WHEN pg_input_is_valid(fs.observed_at, 'timestamptz') THEN fs.observed_at::timestamptz ELSE NULL END) ELSE NULL END) DESC NULLS LAST, fs.id DESC`
       : sql`ORDER BY (CASE WHEN fs.observed_at IS NOT NULL THEN julianday(fs.observed_at) ELSE NULL END) DESC NULLS LAST, fs.id DESC`;
 
     const runItems = await db
@@ -196,6 +207,12 @@ export const FleetRepository = {
               AND fr.roster_version_id = ${version.id}
               AND rm.enrollment_state = 'active'
               AND fri.project_id = rm.project_id
+              AND fri.status IN ('completed', 'partial', 'failed')
+              AND ${
+                isPg
+                  ? sql`(CASE WHEN fri.completed_at IS NOT NULL AND fri.completed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$' AND pg_input_is_valid(fri.completed_at || '+00', 'timestamptz') THEN (fri.completed_at || '+00')::timestamptz <= CURRENT_TIMESTAMP WHEN fri.completed_at IS NOT NULL AND pg_input_is_valid(fri.completed_at, 'timestamptz') THEN fri.completed_at::timestamptz <= CURRENT_TIMESTAMP ELSE false END)`
+                  : sql`(fri.completed_at IS NOT NULL AND julianday(fri.completed_at) <= julianday('now'))`
+              }
           ) r
           WHERE r.rn <= 30
         )`,
@@ -268,6 +285,12 @@ export const FleetRepository = {
               AND fs.project_id = rm.project_id
               AND rm.enrollment_state = 'active'
               AND lower(trim(fs.canonical_host)) = lower(trim(rm.canonical_host))
+              AND fri.status IN ('completed', 'partial', 'failed')
+              AND ${
+                isPg
+                  ? sql`(CASE WHEN fs.observed_at IS NOT NULL AND fs.observed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]{1,3})?$' AND pg_input_is_valid(fs.observed_at || '+00', 'timestamptz') THEN (fs.observed_at || '+00')::timestamptz <= CURRENT_TIMESTAMP WHEN fs.observed_at IS NOT NULL AND pg_input_is_valid(fs.observed_at, 'timestamptz') THEN fs.observed_at::timestamptz <= CURRENT_TIMESTAMP ELSE false END)`
+                  : sql`(fs.observed_at IS NOT NULL AND julianday(fs.observed_at) <= julianday('now'))`
+              }
           ) s
           WHERE s.rn <= 30
         )`,

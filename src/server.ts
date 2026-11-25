@@ -227,20 +227,10 @@ export default {
       return;
     }
 
-    // Watchdog first: reconcile audits stuck in "running" whose workflow died
-    // without reaching mark-failed (OOM/CPU kills, expired instances). Runs
-    // before the rank loop so a slow tick can't delay or starve it. Its
-    // failure is held until after the rank checks so it can't suppress them,
-    // then rethrown so the invocation still reports as failed.
-    let watchdogError: unknown;
-    try {
-      await withPgClient(() => reconcileStaleAudits());
-    } catch (err) {
-      watchdogError = err;
-      console.error("[cron] Stale-audit reconcile failed:", err);
-    }
-    // Scope a per-request Postgres client for the cron run (no-op in D1 mode).
-    const checks = await Promise.allSettled([
+    // Sol R2: Start watchdog, rank checks, and AI visibility checks independently via Promise.allSettled
+    // so slow watchdog probes can never starve or delay scheduled rank/AI tasks.
+    const [watchdogResult, rankResult, aiResult] = await Promise.allSettled([
+      withPgClient(() => reconcileStaleAudits()),
       SCHEDULED_RANK_CHECKS_PAUSED && isHostedAuthMode(env.AUTH_MODE)
         ? Promise.resolve()
         : withPgClient(() => runScheduledRankChecks(env)),
@@ -250,8 +240,22 @@ export default {
         await runScheduledAiVisibility();
       }),
     ]);
-    for (const result of checks)
-      if (result.status === "rejected") throw result.reason;
-    if (watchdogError) throw watchdogError;
+
+    if (watchdogResult.status === "rejected") {
+      console.error(
+        "[cron] Stale-audit reconcile failed:",
+        watchdogResult.reason,
+      );
+    }
+    if (rankResult.status === "rejected") {
+      console.error("[cron] Scheduled rank checks failed:", rankResult.reason);
+    }
+    if (aiResult.status === "rejected") {
+      console.error("[cron] Scheduled AI visibility failed:", aiResult.reason);
+    }
+
+    if (watchdogResult.status === "rejected") throw watchdogResult.reason;
+    if (rankResult.status === "rejected") throw rankResult.reason;
+    if (aiResult.status === "rejected") throw aiResult.reason;
   },
 };

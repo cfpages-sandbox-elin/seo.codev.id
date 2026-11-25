@@ -150,6 +150,12 @@ export async function getAggregatedFleetIssues(options: {
           AND m.repo_name IS NOT NULL
           AND a.pages_total > 0
           AND a.pages_crawled >= a.pages_total
+          AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+          AND NOT EXISTS (
+            SELECT 1 FROM audit_issues ai
+            WHERE ai.audit_id = a.id AND ai.page_id IS NOT NULL
+              AND NOT EXISTS (SELECT 1 FROM audit_pages ap WHERE ap.id = ai.page_id AND ap.audit_id = a.id)
+          )
           AND CASE WHEN json_valid(a.config) THEN
             json_extract(a.config, '$.source') = 'github_repository_direct'
             AND json_extract(a.config, '$.repoName') = m.repo_name
@@ -162,6 +168,7 @@ export async function getAggregatedFleetIssues(options: {
             AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
             AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
           ELSE 0 END
+        HAVING COUNT(DISTINCT fr.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1
       )`
     : "(1 = 0)";
 

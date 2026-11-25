@@ -178,6 +178,12 @@ export function checkFleetCoverage(options?: {
      WHERE rm.version_id = ${sqlText(effectiveRoster.id)}
        AND rm.enrollment_state = 'active'
        AND rm.repo_name IS NOT NULL
+       AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+       AND NOT EXISTS (
+         SELECT 1 FROM audit_issues ai
+         WHERE ai.audit_id = a.id AND ai.page_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM audit_pages ap WHERE ap.id = ai.page_id AND ap.audit_id = a.id)
+       )
        AND CASE WHEN json_valid(a.config) THEN
          json_extract(a.config, '$.source') = 'github_repository_direct'
          AND json_extract(a.config, '$.repoName') = rm.repo_name
@@ -189,7 +195,9 @@ export function checkFleetCoverage(options?: {
          AND json_extract(a.config, '$.rosterSource.repoName') = rm.repo_name
          AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
           AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(rm.publish_root, '.')
-       ELSE 0 END;`,
+       ELSE 0 END
+     GROUP BY rm.id, a.id
+     HAVING COUNT(DISTINCT r.id) = 1 AND COUNT(DISTINCT i.id) = 1 AND COUNT(DISTINCT s.id) = 1;`,
     isRemote,
   );
   const repoQualifiedMemberIds = new Set(

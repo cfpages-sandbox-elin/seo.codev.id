@@ -135,6 +135,7 @@ async function main() {
         concurrency: { type: "string", short: "c", default: "2" },
         domain: { type: "string", short: "d" },
         "roster-id": { type: "string" },
+        "expected-member": { type: "string" },
         "expected-project": { type: "string" },
         "max-pages": { type: "string", short: "m", default: "500" },
         "skip-recent": { type: "boolean", default: true },
@@ -238,6 +239,16 @@ async function main() {
     process.exit(1);
   }
 
+  if (
+    !targetDomainFilter &&
+    (args.values["expected-member"] || args.values["expected-project"])
+  ) {
+    console.error(
+      "[ERROR] --expected-member and --expected-project are strictly single-target options and cannot be combined with bulk execution.",
+    );
+    process.exit(1);
+  }
+
   console.log("=== OpenSEO Fleet Audit Runner ===");
   console.log(
     `Execution Mode: ${isRemote ? "Remote Production" : "Local Development"}`,
@@ -330,6 +341,21 @@ async function main() {
         `[ERROR] TARGET_BINDING_MISMATCH: Planned project ID '${expectedProject}' does not match live project ID '${candidates[0].id}' for domain '${targetDomainFilter}'.`,
       );
       process.exit(1);
+    }
+    const expectedMember = args.values["expected-member"]
+      ? String(args.values["expected-member"]).trim()
+      : undefined;
+    if (expectedMember && rosterId) {
+      const memberRows = runD1Query(
+        `SELECT id FROM fleet_roster_members WHERE id = ${sqlText(expectedMember)} AND version_id = ${sqlText(rosterId)} AND project_id = ${sqlText(candidates[0].id)} AND enrollment_state = 'active';`,
+        isRemote,
+      );
+      if (!memberRows || memberRows.length === 0) {
+        console.error(
+          `[ERROR] TARGET_BINDING_MISMATCH: Planned member ID '${expectedMember}' is not an active member for project '${candidates[0].id}' in roster '${rosterId}'.`,
+        );
+        process.exit(1);
+      }
     }
   } else {
     // Detect and reject ambiguous duplicate domain bindings across the enrolled fleet
@@ -622,12 +648,12 @@ async function main() {
   console.log(`Skipped (Reservation Busy): ${skippedBusyCount}`);
   console.log(`Active Remaining: ${activeAudits.size}`);
   console.log(`Undispatched Remaining: ${undispatched.length}`);
-  if (
-    failedCount > 0 ||
-    activeAudits.size > 0 ||
-    undispatched.length > 0 ||
-    (targetDomainFilter && completedCount === 0)
-  ) {
+  const incomplete =
+    failedCount +
+    activeAudits.size +
+    undispatched.length +
+    (completedCount === 0 && skippedBusyCount > 0 ? skippedBusyCount : 0);
+  if (incomplete > 0 || (targetDomainFilter && completedCount === 0)) {
     process.exitCode = 1;
   }
 }
