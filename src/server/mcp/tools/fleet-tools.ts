@@ -10,18 +10,10 @@ import { formatMcpTable, type McpTableColumn } from "@/server/mcp/table";
 import { routeIssueToSkill } from "@/server/lib/audit/issue-routing";
 import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
 import {
+  isValidCanonicalHostname,
   pgUtcTimeSql,
   sqliteUtcTimeSql,
 } from "@/server/features/fleet/services/fleetConstants";
-
-const CANONICAL_DOMAIN_REGEX =
-  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
-
-function isValidCanonicalHostname(domain: string): boolean {
-  if (!domain || typeof domain !== "string" || domain.length > 253)
-    return false;
-  return CANONICAL_DOMAIN_REGEX.test(domain);
-}
 
 const fleetIssueItemShape = {
   id: z.string(),
@@ -43,8 +35,8 @@ const getFleetIssuesInputSchema = {
     .string()
     .trim()
     .max(253)
-    .regex(
-      CANONICAL_DOMAIN_REGEX,
+    .refine(
+      isValidCanonicalHostname,
       "Must be a valid canonical hostname without protocol, path, or port",
     )
     .optional()

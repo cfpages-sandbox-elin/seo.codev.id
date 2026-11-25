@@ -6,17 +6,15 @@ import {
   FleetService,
   type FleetDomainSummary,
 } from "@/server/features/fleet/services/FleetService";
-
-const CANONICAL_DOMAIN_REGEX =
-  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+import { isValidCanonicalHostname } from "@/server/features/fleet/services/fleetConstants";
 
 const getFleetMatrixInputSchema = {
   domain: z
     .string()
     .trim()
     .max(253)
-    .regex(
-      CANONICAL_DOMAIN_REGEX,
+    .refine(
+      isValidCanonicalHostname,
       "Must be a valid canonical hostname without protocol, path, or port",
     )
     .optional()

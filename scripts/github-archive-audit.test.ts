@@ -90,12 +90,14 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
       expect(isValidCanonicalHostname("sub.domain.example.com")).toBe(true);
     });
 
-    it("rejects invalid hostnames (edge hyphens, illegal characters, oversized)", () => {
+    it("rejects invalid hostnames (edge hyphens, illegal characters, numeric/octal IPv4 literals, oversized)", () => {
       expect(isValidCanonicalHostname("")).toBe(false);
       expect(isValidCanonicalHostname("-start.com")).toBe(false);
       expect(isValidCanonicalHostname("end-.com")).toBe(false);
       expect(isValidCanonicalHostname("double..dot.com")).toBe(false);
       expect(isValidCanonicalHostname("has_underscore.com")).toBe(false);
+      expect(isValidCanonicalHostname("192.0.2.01")).toBe(false);
+      expect(isValidCanonicalHostname("192.0.2.1")).toBe(false);
       expect(isValidCanonicalHostname("a".repeat(255) + ".com")).toBe(false);
     });
   });

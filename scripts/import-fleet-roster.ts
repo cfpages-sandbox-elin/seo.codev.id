@@ -11,7 +11,7 @@ import { parseArgs } from "node:util";
 import { z } from "zod";
 import { getPlatformProxy } from "wrangler";
 import { drizzle } from "drizzle-orm/d1";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, count, eq, isNull } from "drizzle-orm";
 import {
   fleetRosterMembers,
   fleetRosterVersions,
@@ -143,6 +143,19 @@ export async function importApprovedRoster(
           `CONFLICT: Roster version hash mismatch for ${FLEET_MANIFEST_VERSION}`,
         );
       }
+      const [memberCountRow] = await db
+        .select({ memberCount: count() })
+        .from(fleetRosterMembers)
+        .where(eq(fleetRosterMembers.versionId, existing[0].id));
+      const persistedMembers = Number(memberCountRow?.memberCount ?? 0);
+      if (
+        existing[0].domainCount !== FLEET_MANIFEST_MEMBERS.length ||
+        persistedMembers !== FLEET_MANIFEST_MEMBERS.length
+      ) {
+        throw new Error(
+          `INCOMPLETE_ROSTER_VERSION: Existing roster version '${existing[0].id}' has ${persistedMembers} persisted member(s) and declared domainCount=${existing[0].domainCount} (expected ${FLEET_MANIFEST_MEMBERS.length}).`,
+        );
+      }
       return existing[0].id;
     }
 
@@ -261,14 +274,20 @@ export async function importApprovedRoster(
           ),
         );
       if (retryExisting[0]) {
+        const [retryCountRow] = await db
+          .select({ memberCount: count() })
+          .from(fleetRosterMembers)
+          .where(eq(fleetRosterMembers.versionId, retryExisting[0].id));
+        const persistedRetryMembers = Number(retryCountRow?.memberCount ?? 0);
         if (
           retryExisting[0].manifestHash === manifestHash &&
-          retryExisting[0].domainCount === FLEET_MANIFEST_MEMBERS.length
+          retryExisting[0].domainCount === FLEET_MANIFEST_MEMBERS.length &&
+          persistedRetryMembers === FLEET_MANIFEST_MEMBERS.length
         ) {
           return retryExisting[0].id;
         }
         throw new Error(
-          `CONFLICT: Roster version hash mismatch for ${FLEET_MANIFEST_VERSION} (committed '${retryExisting[0].manifestHash}' vs expected '${manifestHash}')`,
+          `CONFLICT: Roster version mismatch for ${FLEET_MANIFEST_VERSION} (hash '${retryExisting[0].manifestHash}' vs '${manifestHash}', members ${persistedRetryMembers}/${FLEET_MANIFEST_MEMBERS.length})`,
         );
       }
       throw batchErr;

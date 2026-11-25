@@ -5,6 +5,7 @@ import { fleetRosterMembers } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
 import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
 import {
+  isValidCanonicalHostname,
   pgUtcTimeSql,
   sqliteUtcTimeSql,
 } from "@/server/features/fleet/services/fleetConstants";
@@ -13,22 +14,13 @@ import { mcpResponse } from "@/server/mcp/formatters";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { normalizeGitRelativePath, normalizeRepoSlug } from "@/shared/git-repo";
 
-const CANONICAL_DOMAIN_REGEX =
-  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
-
-function isValidCanonicalHostname(domain: string): boolean {
-  if (!domain || typeof domain !== "string" || domain.length > 253)
-    return false;
-  return CANONICAL_DOMAIN_REGEX.test(domain);
-}
-
 const linkFleetRepositoryInputSchema = {
   domain: z
     .string()
     .trim()
     .max(253)
-    .regex(
-      CANONICAL_DOMAIN_REGEX,
+    .refine(
+      isValidCanonicalHostname,
       "Must be a valid canonical hostname without protocol, path, or port",
     )
     .describe(

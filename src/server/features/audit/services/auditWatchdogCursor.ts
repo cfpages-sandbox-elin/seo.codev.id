@@ -27,10 +27,12 @@ type CursorSaveResult = "applied" | "conflict" | "error";
 
 const pgTimeExpr = (expr: SQL | Column | string | null | undefined) => sql`(
   CASE
-    WHEN ${expr} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?$'
+    WHEN substr(${expr}, 1, 4) > '0000'
+     AND ${expr} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?$'
      AND pg_input_is_valid(${expr} || '+00', 'timestamptz')
     THEN (${expr} || '+00')::timestamptz
-    WHEN ${expr} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?Z$'
+    WHEN substr(${expr}, 1, 4) > '0000'
+     AND ${expr} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?Z$'
      AND pg_input_is_valid(${expr}, 'timestamptz')
     THEN (${expr})::timestamptz
     ELSE NULL
@@ -39,13 +41,17 @@ const pgTimeExpr = (expr: SQL | Column | string | null | undefined) => sql`(
 
 const sqliteTimeExpr = (expr: SQL | Column | string | null | undefined) => sql`(
   CASE
-    WHEN substr(${expr}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
+    WHEN instr(${expr}, char(0)) = 0
+     AND substr(${expr}, 1, 4) > '0000'
+     AND substr(${expr}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
      AND substr(${expr}, 12, 2) < '24'
      AND substr(${expr}, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(${expr}, 1, 19))
      AND (length(${expr}) = 19 OR (length(${expr}) BETWEEN 21 AND 23 AND substr(${expr}, 20) GLOB '.[0-9]*' AND substr(${expr}, 21) NOT GLOB '*[^0-9]*'))
      AND julianday(${expr}) IS NOT NULL
     THEN julianday(${expr})
-    WHEN ${expr} LIKE '%Z'
+    WHEN instr(${expr}, char(0)) = 0
+     AND substr(${expr}, 1, 4) > '0000'
+     AND ${expr} GLOB '*Z'
      AND substr(${expr}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
      AND substr(${expr}, 12, 2) < '24'
      AND substr(${expr}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${expr}, 1, 19))
@@ -176,15 +182,15 @@ export async function savePersistedCursor(
   }
 }
 
-/** Query running audits with null workflow instance ID or non-canonical/invalid started_at timestamps (Sol R5). */
+/** Query running audits with null workflow instance ID or non-canonical/invalid started_at timestamps (Sol R5, V4-03, V4-05). */
 export async function findIrregularRunningAudits(
   limit: number,
   cursorId: string | null,
 ) {
   const isPg = getDatabaseProvider() === "postgres";
   const isNullOrInvalid = isPg
-    ? sql`(${audits.workflowInstanceId} IS NULL OR ${pgTimeExpr(audits.startedAt)} IS NULL OR ${audits.startedAt} !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$')`
-    : sql`(${audits.workflowInstanceId} IS NULL OR ${sqliteTimeExpr(audits.startedAt)} IS NULL OR NOT (${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9]Z' AND substr(${audits.startedAt}, 12, 2) < '24'))`;
+    ? sql`(${audits.workflowInstanceId} IS NULL OR ${pgTimeExpr(audits.startedAt)} IS NULL OR substr(${audits.startedAt}, 1, 4) <= '0000' OR ${audits.startedAt} !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$')`
+    : sql`(${audits.workflowInstanceId} IS NULL OR ${sqliteTimeExpr(audits.startedAt)} IS NULL OR instr(${audits.startedAt}, char(0)) > 0 OR substr(${audits.startedAt}, 1, 4) <= '0000' OR NOT (${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9]Z' AND substr(${audits.startedAt}, 12, 2) < '24'))`;
 
   const cursorFilter = cursorId
     ? isPg
@@ -193,7 +199,11 @@ export async function findIrregularRunningAudits(
     : undefined;
 
   return db.query.audits.findMany({
-    where: and(eq(audits.status, "running"), isNullOrInvalid, cursorFilter),
+    where: and(
+      sql`${audits.status} = 'running'`,
+      isNullOrInvalid,
+      cursorFilter,
+    ),
     orderBy: isPg
       ? [sql`${audits.id} COLLATE "C" ASC`]
       : [sql`${audits.id} COLLATE BINARY ASC`],
@@ -207,7 +217,7 @@ export async function findIrregularRunningAudits(
   });
 }
 
-/** Query canonical ISO-Z stale running audits ordered by (started_at, id) keyset index (Sol R5). */
+/** Query canonical ISO-Z stale running audits ordered by (started_at, id) keyset index (Sol R5, V4-03, V4-05). */
 export async function getStaleRunningAudits(
   cutoff: Date,
   limit: number,
@@ -218,8 +228,8 @@ export async function getStaleRunningAudits(
   const repoCutoffIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
   const canonicalFormat = isPg
-    ? sql`${audits.startedAt} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$' AND ${pgTimeExpr(audits.startedAt)} IS NOT NULL`
-    : sql`${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9]Z' AND substr(${audits.startedAt}, 12, 2) < '24' AND ${sqliteTimeExpr(audits.startedAt)} IS NOT NULL`;
+    ? sql`substr(${audits.startedAt}, 1, 4) > '0000' AND ${audits.startedAt} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$' AND ${pgTimeExpr(audits.startedAt)} IS NOT NULL`
+    : sql`instr(${audits.startedAt}, char(0)) = 0 AND substr(${audits.startedAt}, 1, 4) > '0000' AND ${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9]Z' AND substr(${audits.startedAt}, 12, 2) < '24' AND ${sqliteTimeExpr(audits.startedAt)} IS NOT NULL`;
 
   const stalenessPredicate = isPg
     ? sql`${audits.startedAt} COLLATE "C" < ${edgeCutoffIso} COLLATE "C" AND (${audits.workflowInstanceId} NOT LIKE 'github-audit-%' OR ${audits.startedAt} COLLATE "C" < ${repoCutoffIso} COLLATE "C")`
@@ -233,7 +243,7 @@ export async function getStaleRunningAudits(
 
   return db.query.audits.findMany({
     where: and(
-      eq(audits.status, "running"),
+      sql`${audits.status} = 'running'`,
       isNotNull(audits.workflowInstanceId),
       not(isNull(audits.startedAt)),
       canonicalFormat,

@@ -194,17 +194,13 @@ describe("Fleet MCP Tools", () => {
         "--remote",
         "--max-pages",
         "500",
-        "--expected-member",
-        "member_1",
-        "--expected-project",
-        "proj_1",
-        "--expected-repo",
-        "cfpages-syamsulalam-net/kaca-co-id",
-        "--expected-root",
-        ".",
+        "--expected-member=member_1",
+        "--expected-project=proj_1",
+        "--expected-repo=cfpages-syamsulalam-net/kaca-co-id",
+        "--expected-root=.",
       ]);
       expect(data.executionCommand).toBe(
-        "& 'pnpm' 'exec' 'tsx' 'scripts/run-github-fleet-audit.ts' '--domain' 'kaca.co.id' '--roster-id' 'roster_v1' '--remote' '--max-pages' '500' '--expected-member' 'member_1' '--expected-project' 'proj_1' '--expected-repo' 'cfpages-syamsulalam-net/kaca-co-id' '--expected-root' '.'",
+        "& 'pnpm' 'exec' 'tsx' 'scripts/run-github-fleet-audit.ts' '--domain' 'kaca.co.id' '--roster-id' 'roster_v1' '--remote' '--max-pages' '500' '--expected-member=member_1' '--expected-project=proj_1' '--expected-repo=cfpages-syamsulalam-net/kaca-co-id' '--expected-root=.'",
       );
     });
 
@@ -251,12 +247,14 @@ describe("Fleet MCP Tools", () => {
       ).rejects.toThrow(/shared-workspace/);
     });
 
-    it("validates canonical hostnames including single-letter labels like a.id (Sol F6)", () => {
+    it("validates canonical hostnames including single-letter labels like a.id while rejecting numeric IPv4 literals (Sol F6, V1-03)", () => {
       const schema = runFleetAuditTool.config.inputSchema;
       expect(schema.domain.safeParse("a.id").success).toBe(true);
       expect(schema.domain.safeParse("toiletcubicle.co.id").success).toBe(true);
       expect(schema.domain.safeParse("-invalid.com").success).toBe(false);
       expect(schema.domain.safeParse("invalid-.com").success).toBe(false);
+      expect(schema.domain.safeParse("192.0.2.01").success).toBe(false);
+      expect(schema.domain.safeParse("192.0.2.1").success).toBe(false);
       expect(schema.domain.safeParse("a".repeat(255) + ".com").success).toBe(
         false,
       );
@@ -273,19 +271,39 @@ describe("Fleet MCP Tools", () => {
         const data = runFleetAuditTool.config.outputSchema.parse(
           result.structuredContent,
         );
-        expect(data.argv).toContain("--expected-root");
-        expect(data.argv[data.argv.indexOf("--expected-root") + 1]).toBe(
-          "release notes/owner's copy",
+        expect(data.argv).toContain(
+          "--expected-root=release notes/owner's copy",
         );
         expect(data.executionCommand).toContain(
-          "'--expected-root' 'release notes/owner''s copy'",
+          "'--expected-root=release notes/owner''s copy'",
         );
         expect(data.shell).toBe("pwsh");
         expect(data.selection).toBe("bound");
         expect(data.binding?.publishRoot).toBe("release notes/owner's copy");
         expect(data.directNodeExecutable).toBe("node");
         expect(data.directNodeArgv[0]).toBe("./node_modules/tsx/dist/cli.mjs");
-        expect(data.directNodeArgv).toContain("release notes/owner's copy");
+        expect(data.directNodeArgv).toContain(
+          "--expected-root=release notes/owner's copy",
+        );
+      } finally {
+        hoisted.memberPublishRoot = prevRoot;
+      }
+    });
+
+    it("encodes leading-dash publish roots like --site cleanly with equals syntax for Node parseArgs (Sol V3-03)", async () => {
+      const prevRoot = hoisted.memberPublishRoot;
+      hoisted.memberPublishRoot = "--site";
+      try {
+        const result = await runFleetAuditTool.handler(
+          { mode: "repository_direct", domain: "kaca.co.id", maxPages: 500 },
+          toolContext,
+        );
+        const data = runFleetAuditTool.config.outputSchema.parse(
+          result.structuredContent,
+        );
+        expect(data.argv).toContain("--expected-root=--site");
+        expect(data.directNodeArgv).toContain("--expected-root=--site");
+        expect(data.binding?.publishRoot).toBe("--site");
       } finally {
         hoisted.memberPublishRoot = prevRoot;
       }
@@ -302,7 +320,9 @@ describe("Fleet MCP Tools", () => {
         const data = runFleetAuditTool.config.outputSchema.parse(
           result.structuredContent,
         );
-        expect(data.directNodeArgv).toContain('folder/curly\u2019quote/a"b');
+        expect(data.directNodeArgv).toContain(
+          '--expected-root=folder/curly\u2019quote/a"b',
+        );
         expect(data.executionCommand).toContain("[char]0x2019");
         expect(data.executionCommand).not.toContain("\u2019");
       } finally {

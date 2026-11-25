@@ -267,6 +267,13 @@
       "when": 1795618618439,
       "tag": "0037_watchdog_index_and_timestamp_hardening",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1795618619439,
+      "tag": "0038_watchdog_timestamp_strictness",
+      "breakpoints": true
     }
   ]
 }

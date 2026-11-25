@@ -383,6 +383,14 @@ export async function linkFleet(options: {
           ),
         );
     }
+    const declaredCount = Number(approvedRoster.domain_count ?? 0);
+    if (existingMembers.length !== declaredCount) {
+      console.error(
+        `\n[ERROR] Dry run detected incomplete roster materialization: persisted ${existingMembers.length} member row(s) vs declared domain_count ${declaredCount}.`,
+      );
+      process.exitCode = 1;
+      return;
+    }
     if (invalidActiveMembers.length > 0) {
       console.error(
         `\n[ERROR] Dry run detected ${invalidActiveMembers.length} invalid existing active member binding(s):`,

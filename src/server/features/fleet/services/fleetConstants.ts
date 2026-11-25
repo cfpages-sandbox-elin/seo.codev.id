@@ -87,6 +87,34 @@ export function measuredPercent(
   return value;
 }
 
+const CANONICAL_DOMAIN_REGEX =
+  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
+
+/**
+ * Validates canonical FQDN hostname format per RFC 1123/3696 and WHATWG URL normalization:
+ * rejects dotted numeric/octal IPv4 literals (e.g. '192.0.2.01') whose TLD is all-digits
+ * or whose WHATWG URL hostname normalizes differently from its lowercased input.
+ */
+export function isValidCanonicalHostname(domain: string): boolean {
+  if (!domain || typeof domain !== "string" || domain.length > 253) {
+    return false;
+  }
+  if (!CANONICAL_DOMAIN_REGEX.test(domain)) {
+    return false;
+  }
+  const lower = domain.toLowerCase();
+  const labels = lower.split(".");
+  const tld = labels[labels.length - 1] ?? "";
+  if (/^\d+$/.test(tld)) {
+    return false;
+  }
+  try {
+    return new URL(`https://${domain}`).hostname === lower;
+  } catch {
+    return false;
+  }
+}
+
 const utf8Encoder = new TextEncoder();
 
 /**
@@ -105,33 +133,41 @@ export function compareUtf8Binary(a: string, b: string): number {
 }
 
 /**
- * Shared SQLite UTC timestamp parser/validator matching parseUtcTimestampMs (Sol R1).
- * Accepts valid calendar YYYY-MM-DD HH:MM:SS(.sss)? or YYYY-MM-DDTHH:MM:SS(.sss)?Z with hour 00-23.
+ * Shared SQLite UTC timestamp parser/validator matching parseUtcTimestampMs (Sol R1, V4-03).
+ * Accepts valid calendar 0001-9999 YYYY-MM-DD HH:MM:SS(.sss)? or YYYY-MM-DDTHH:MM:SS(.sss)?Z
+ * with hour 00-23, uppercase 'Z' only (GLOB), and zero NUL bytes.
  */
 export function sqliteUtcTimeSql(col: string): string {
-  return `(CASE WHEN substr(${col}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9]' AND substr(${col}, 12, 2) < '24' AND substr(${col}, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(${col}, 1, 19)) AND (length(${col}) = 19 OR (length(${col}) BETWEEN 21 AND 23 AND substr(${col}, 20) GLOB '.[0-9]*' AND substr(${col}, 21) NOT GLOB '*[^0-9]*')) AND julianday(${col}) IS NOT NULL THEN julianday(${col}) WHEN ${col} LIKE '%Z' AND substr(${col}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]' AND substr(${col}, 12, 2) < '24' AND substr(${col}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${col}, 1, 19)) AND (length(${col}) = 20 OR (length(${col}) BETWEEN 22 AND 24 AND substr(${col}, 20, length(${col}) - 20) GLOB '.[0-9]*' AND substr(${col}, 21, length(${col}) - 21) NOT GLOB '*[^0-9]*')) AND julianday(${col}) IS NOT NULL THEN julianday(${col}) ELSE NULL END)`;
+  return `(CASE WHEN instr(${col}, char(0)) = 0 AND substr(${col}, 1, 4) > '0000' AND substr(${col}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9]' AND substr(${col}, 12, 2) < '24' AND substr(${col}, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(${col}, 1, 19)) AND (length(${col}) = 19 OR (length(${col}) BETWEEN 21 AND 23 AND substr(${col}, 20) GLOB '.[0-9]*' AND substr(${col}, 21) NOT GLOB '*[^0-9]*')) AND julianday(${col}) IS NOT NULL THEN julianday(${col}) WHEN instr(${col}, char(0)) = 0 AND substr(${col}, 1, 4) > '0000' AND ${col} GLOB '*Z' AND substr(${col}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]' AND substr(${col}, 12, 2) < '24' AND substr(${col}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${col}, 1, 19)) AND (length(${col}) = 20 OR (length(${col}) BETWEEN 22 AND 24 AND substr(${col}, 20, length(${col}) - 20) GLOB '.[0-9]*' AND substr(${col}, 21, length(${col}) - 21) NOT GLOB '*[^0-9]*')) AND julianday(${col}) IS NOT NULL THEN julianday(${col}) ELSE NULL END)`;
 }
 
 /**
- * Shared PostgreSQL UTC timestamp parser/validator matching parseUtcTimestampMs (Sol R1).
- * Accepts valid calendar YYYY-MM-DD HH:MM:SS(.sss)? or YYYY-MM-DDTHH:MM:SS(.sss)?Z with hour 00-23.
+ * Shared PostgreSQL UTC timestamp parser/validator matching parseUtcTimestampMs (Sol R1, V4-03).
+ * Accepts valid calendar 0001-9999 YYYY-MM-DD HH:MM:SS(.sss)? or YYYY-MM-DDTHH:MM:SS(.sss)?Z with hour 00-23.
  */
 export function pgUtcTimeSql(col: string): string {
-  return `(CASE WHEN ${col} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?$' AND pg_input_is_valid(${col} || '+00', 'timestamptz') THEN (${col} || '+00')::timestamptz WHEN ${col} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?Z$' AND pg_input_is_valid(${col}, 'timestamptz') THEN (${col})::timestamptz ELSE NULL END)`;
+  return `(CASE WHEN substr(${col}, 1, 4) > '0000' AND ${col} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} ([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?$' AND pg_input_is_valid(${col} || '+00', 'timestamptz') THEN (${col} || '+00')::timestamptz WHEN substr(${col}, 1, 4) > '0000' AND ${col} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9](\\.[0-9]{1,3})?Z$' AND pg_input_is_valid(${col}, 'timestamptz') THEN (${col})::timestamptz ELSE NULL END)`;
 }
 
 /**
- * Strict round-trip parser for observed migration formats (Sol F05, R1):
- * Accepts SQLite space-delimited text ("YYYY-MM-DD HH:MM:SS(.sss)?") or ISO-8601 strings with Z,
- * and rejects unzoned T timestamps, timezone offsets, 24:00:00, and impossible rollover dates.
+ * Strict round-trip parser for observed migration formats (Sol F05, R1, V4-03):
+ * Accepts 0001-9999 SQLite space-delimited text ("YYYY-MM-DD HH:MM:SS(.sss)?") or uppercase ISO-8601 strings with Z,
+ * rejecting year 0000, lowercase z, NUL bytes, unzoned T timestamps, timezone offsets, 24:00:00, and rollover dates.
  */
 export function parseUtcTimestampMs(value?: string | null): number {
-  if (!value) return NaN;
+  if (!value || value.includes("\0")) return NaN;
   const m =
     /^(\d{4}-\d{2}-\d{2})([ T])(\d{2}:\d{2}:\d{2})(?:\.(\d{1,3}))?(Z)?$/.exec(
       value,
     );
-  if (!m || (m[2] === "T" && !m[5]) || (m[2] === " " && m[5])) return NaN;
+  if (
+    !m ||
+    m[1].startsWith("0000-") ||
+    (m[2] === "T" && !m[5]) ||
+    (m[2] === " " && m[5])
+  ) {
+    return NaN;
+  }
   const iso = m[1] + "T" + m[3] + "." + (m[4] ?? "").padEnd(3, "0") + "Z";
   const ms = Date.parse(iso);
   return Number.isFinite(ms) && new Date(ms).toISOString() === iso ? ms : NaN;

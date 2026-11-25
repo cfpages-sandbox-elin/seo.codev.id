@@ -7,18 +7,16 @@ import { mcpResponse } from "@/server/mcp/formatters";
 import type { ToolContext } from "@/server/mcp/context";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
+import { isValidCanonicalHostname } from "@/server/features/fleet/services/fleetConstants";
 import { isValidRepoSlug, normalizeGitRelativePath } from "@/shared/git-repo";
-
-const CANONICAL_DOMAIN_REGEX =
-  /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
 
 const runFleetAuditInputSchema = {
   domain: z
     .string()
     .trim()
     .max(253, "Must be at most 253 characters")
-    .regex(
-      CANONICAL_DOMAIN_REGEX,
+    .refine(
+      isValidCanonicalHostname,
       "Must be a valid canonical hostname (e.g. 'toiletcubicle.co.id')",
     )
     .optional()
@@ -208,14 +206,13 @@ function buildExecutionArgv(options: {
       String(maxPages),
     ];
     if (domain && boundRosterMember && targetProjectId) {
-      argv.push("--expected-member", boundRosterMember.id);
-      argv.push("--expected-project", targetProjectId);
+      argv.push(`--expected-member=${boundRosterMember.id}`);
+      argv.push(`--expected-project=${targetProjectId}`);
       if (boundRosterMember.repoName) {
-        argv.push("--expected-repo", boundRosterMember.repoName.trim());
+        argv.push(`--expected-repo=${boundRosterMember.repoName.trim()}`);
       }
       argv.push(
-        "--expected-root",
-        normalizeGitRelativePath(boundRosterMember.publishRoot),
+        `--expected-root=${normalizeGitRelativePath(boundRosterMember.publishRoot)}`,
       );
     }
     return argv;
@@ -235,8 +232,8 @@ function buildExecutionArgv(options: {
     String(concurrency),
   ];
   if (domain && boundRosterMember && targetProjectId) {
-    argv.push("--expected-member", boundRosterMember.id);
-    argv.push("--expected-project", targetProjectId);
+    argv.push(`--expected-member=${boundRosterMember.id}`);
+    argv.push(`--expected-project=${targetProjectId}`);
   }
   return argv;
 }

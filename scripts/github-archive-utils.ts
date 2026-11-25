@@ -5,6 +5,7 @@ import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   compareUtf8Binary,
+  isValidCanonicalHostname,
   parseUtcTimestampMs,
   sqliteUtcTimeSql,
 } from "../src/server/features/fleet/services/fleetConstants";
@@ -14,6 +15,7 @@ import {
   normalizeGitRelativePath,
 } from "../src/shared/git-repo";
 export {
+  isValidCanonicalHostname,
   isValidRepoSlug,
   normalizeRepoSlug,
   normalizeGitRelativePath,
@@ -100,18 +102,6 @@ export function verifyGitBlob(bytes: Buffer, expectedSha: string): void {
       `Git blob identity mismatch: expected ${expectedSha}, got ${actualSha} (${bytes.length} bytes)`,
     );
   }
-}
-
-/**
- * Validates canonical hostname format per RFC 1123 (Sol F6).
- * Accepts labels of length 1-63 without leading/trailing hyphens, capped at 253 chars total.
- */
-export function isValidCanonicalHostname(domain: string): boolean {
-  if (!domain || typeof domain !== "string" || domain.length > 253)
-    return false;
-  return /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i.test(
-    domain,
-  );
 }
 
 export interface GitTreeItem {

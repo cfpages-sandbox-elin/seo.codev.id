@@ -30,11 +30,12 @@ const MANIFEST_PATH = resolve(
   "src/server/features/fleet/data/fleetManifest.json",
 );
 
-function loadEnv(): Record<string, string> {
-  const env: Record<string, string> = { ...process.env } as Record<
-    string,
-    string
-  >;
+function loadEnv(): {
+  env: NodeJS.ProcessEnv;
+  fileEnv: Record<string, string>;
+} {
+  const fileEnv: Record<string, string> = {};
+  const env: NodeJS.ProcessEnv = { ...process.env };
   try {
     const content = readFileSync(ENV_FILE, "utf8");
     for (const rawLine of content.split(/\r?\n/)) {
@@ -46,23 +47,35 @@ function loadEnv(): Record<string, string> {
           .slice(eqIdx + 1)
           .trim()
           .replace(/^['"]|['"]$/g, "");
-        env[key] = val;
+        if (val) {
+          fileEnv[key] = val;
+          env[key] = val;
+          process.env[key] = val;
+        }
       }
     }
   } catch {}
-  return env;
+  const explicitFileGhToken = fileEnv.GH_TOKEN || fileEnv.GITHUB_TOKEN;
+  if (explicitFileGhToken) {
+    env.GH_TOKEN = explicitFileGhToken;
+    process.env.GH_TOKEN = explicitFileGhToken;
+  }
+  return { env, fileEnv };
 }
 
-const envVars = loadEnv();
+const { env: envVars, fileEnv: selfhostFileEnv } = loadEnv();
 function getGitHubToken(): string {
+  const fileToken = selfhostFileEnv.GH_TOKEN || selfhostFileEnv.GITHUB_TOKEN;
+  if (fileToken) return fileToken;
   try {
     const token = execSync("gh auth token", {
       encoding: "utf8",
+      env: envVars,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
     if (token) return token;
   } catch {}
-  return envVars.GITHUB_TOKEN || process.env.GITHUB_TOKEN || "";
+  return envVars.GH_TOKEN || envVars.GITHUB_TOKEN || "";
 }
 
 const GITHUB_TOKEN = getGitHubToken();

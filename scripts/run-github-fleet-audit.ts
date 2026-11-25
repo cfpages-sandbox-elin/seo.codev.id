@@ -49,6 +49,7 @@ import {
 import type { CrawledPageResult } from "../src/server/lib/audit/types";
 import { deterministicAuditRowId } from "../src/server/lib/audit/ids";
 import { getIssueDescriptor } from "../src/shared/audit-issues";
+import { sqliteUtcTimeSql } from "../src/server/features/fleet/services/fleetConstants";
 
 const ENV_FILE = resolve(".env.selfhost");
 const FLEET_MANIFEST_FILE = resolve(
@@ -58,11 +59,12 @@ const PROJECTS_GITHUB_FILE = resolve(
   "C:/Users/THINKPAD/OneDrive/MD/PORTFOLIO/EVIDENCE/PROJECTS_GITHUB.md",
 );
 
-function loadEnv(): Record<string, string> {
-  const env: Record<string, string> = { ...process.env } as Record<
-    string,
-    string
-  >;
+function loadEnv(): {
+  env: NodeJS.ProcessEnv;
+  fileEnv: Record<string, string>;
+} {
+  const fileEnv: Record<string, string> = {};
+  const env: NodeJS.ProcessEnv = { ...process.env };
   try {
     const content = readFileSync(ENV_FILE, "utf8");
     for (const rawLine of content.split(/\r?\n/)) {
@@ -74,27 +76,38 @@ function loadEnv(): Record<string, string> {
           .slice(eqIdx + 1)
           .trim()
           .replace(/^['"]|['"]$/g, "");
-        env[key] = val;
-        process.env[key] = val;
+        if (val) {
+          fileEnv[key] = val;
+          env[key] = val;
+          process.env[key] = val;
+        }
       }
     }
   } catch (err) {
     console.warn("Could not read .env.selfhost:", err);
   }
-  return env;
+  const explicitFileGhToken = fileEnv.GH_TOKEN || fileEnv.GITHUB_TOKEN;
+  if (explicitFileGhToken) {
+    env.GH_TOKEN = explicitFileGhToken;
+    process.env.GH_TOKEN = explicitFileGhToken;
+  }
+  return { env, fileEnv };
 }
 
-const envVars = loadEnv();
+const { env: envVars, fileEnv: selfhostFileEnv } = loadEnv();
 
 function getGitHubToken(): string {
+  const fileToken = selfhostFileEnv.GH_TOKEN || selfhostFileEnv.GITHUB_TOKEN;
+  if (fileToken) return fileToken;
   try {
     const token = execSync("gh auth token", {
       encoding: "utf8",
+      env: envVars,
       stdio: ["pipe", "pipe", "pipe"],
     }).trim();
     if (token) return token;
   } catch {}
-  return process.env.GITHUB_TOKEN || "";
+  return envVars.GH_TOKEN || envVars.GITHUB_TOKEN || "";
 }
 
 const GITHUB_TOKEN = getGitHubToken();
@@ -380,7 +393,7 @@ export function findMatchingCompletedAudit(
                 AND fs.project_id = a.project_id
                 AND fs.member_id = fri.member_id
                 AND rm.project_id = a.project_id
-                AND fs.canonical_host = rm.canonical_host
+                AND lower(trim(fs.canonical_host)) = lower(trim(rm.canonical_host))
                 AND r.organization_id = 'shared-workspace'
                 ${tripleFilter}
             ) AS has_verified_triple
@@ -402,7 +415,7 @@ export function findMatchingCompletedAudit(
        AND json_extract(a.config, '$.repoName') = ${sqlText(repoName)}
        AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = ${sqlText(normalizedRoot)}
        ${rosterSourceSql}
-     ORDER BY julianday(a.completed_at) DESC NULLS LAST, a.id DESC
+     ORDER BY ${sqliteUtcTimeSql("a.completed_at")} DESC NULLS LAST, a.id COLLATE BINARY DESC
      LIMIT 1;`,
     isRemote,
   );
@@ -1588,10 +1601,27 @@ function publishGuardedDiagnosticTriple(
     JOIN audits a ON a.id = ${sAudit}
     JOIN projects pr ON pr.id = a.project_id AND pr.archived_at IS NULL AND pr.organization_id = fr.organization_id
     JOIN fleet_roster_members m ON m.id = ${sMember} AND m.project_id = pr.id AND m.version_id = fr.roster_version_id AND m.enrollment_state = 'active'
+    JOIN fleet_roster_versions v ON v.id = m.version_id AND v.organization_id = fr.organization_id
     WHERE fr.id = ${sRun} AND fr.status = 'completed' AND fr.completed_at = ${sNow}
-      AND fr.roster_version_id = ${buildSqliteEffectiveRosterSql("fr.organization_id")}
+      AND v.id = ${buildSqliteEffectiveRosterSql("fr.organization_id")}
       AND a.status = 'completed' AND a.pages_crawled >= a.pages_total AND a.pages_total > 0
+      AND a.workflow_instance_id LIKE 'github-audit-%'
+      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+      AND NOT EXISTS (SELECT 1 FROM audit_issues i WHERE i.audit_id = a.id AND i.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id))
       AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
+      AND lower(trim(m.canonical_host)) = lower(trim(${sDomain}))
+      AND json_valid(a.config) AND json_extract(a.config, '$.source') = 'github_repository_direct'
+      AND json_extract(a.config, '$.repoName') = m.repo_name
+      AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
+      AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
+      AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
+      AND json_extract(a.config, '$.rosterSource.versionId') = v.id
+      AND json_extract(a.config, '$.rosterSource.memberId') = m.id
+      AND json_extract(a.config, '$.rosterSource.projectId') = pr.id
+      AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
+      AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
+      AND (SELECT COUNT(*) FROM fleet_run_items o WHERE o.audit_id = a.id AND o.primary_series_key = 'diagnostic' AND o.id <> ${sItem}) = 0
+      AND NOT EXISTS (SELECT 1 FROM fleet_snapshots fs_bad WHERE fs_bad.id = ${sSnap} AND (fs_bad.run_item_id <> ${sItem} OR fs_bad.member_id <> m.id OR fs_bad.project_id <> pr.id OR lower(trim(fs_bad.canonical_host)) <> lower(trim(m.canonical_host)) OR fs_bad.series_key <> 'diagnostic'))
     ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = excluded.completed_at;
   `);
   const stmt3 = compactSql(`
@@ -1599,9 +1629,22 @@ function publishGuardedDiagnosticTriple(
     SELECT ${sSnap}, fri.id, fri.member_id, fri.project_id, m.canonical_host, ${score}, ${sGrade}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, fri.completed_at
     FROM fleet_run_items fri
     JOIN fleet_runs fr ON fr.id = fri.run_id
-    JOIN fleet_roster_members m ON m.id = fri.member_id
+    JOIN audits a ON a.id = fri.audit_id
+    JOIN projects pr ON pr.id = fri.project_id AND pr.archived_at IS NULL AND pr.organization_id = fr.organization_id
+    JOIN fleet_roster_members m ON m.id = fri.member_id AND m.project_id = pr.id AND m.version_id = fr.roster_version_id AND m.enrollment_state = 'active'
+    JOIN fleet_roster_versions v ON v.id = m.version_id AND v.organization_id = fr.organization_id
     WHERE fri.id = ${sItem} AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' AND fri.completed_at = ${sNow}
       AND fr.status = 'completed' AND fr.completed_at = ${sNow}
+      AND v.id = ${buildSqliteEffectiveRosterSql("fr.organization_id")}
+      AND a.status = 'completed' AND a.workflow_instance_id LIKE 'github-audit-%'
+      AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
+      AND lower(trim(m.canonical_host)) = lower(trim(${sDomain}))
+      AND json_valid(a.config) AND json_extract(a.config, '$.source') = 'github_repository_direct'
+      AND json_extract(a.config, '$.repoName') = m.repo_name
+      AND json_extract(a.config, '$.rosterSource.versionId') = v.id
+      AND json_extract(a.config, '$.rosterSource.memberId') = m.id
+      AND json_extract(a.config, '$.rosterSource.projectId') = pr.id
+      AND (SELECT COUNT(*) FROM fleet_run_items o WHERE o.audit_id = a.id AND o.primary_series_key = 'diagnostic' AND o.id <> fri.id) = 0
     ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sGrade}, coverage = ${coverage}, observed_at = excluded.observed_at;
   `);
 
@@ -1657,29 +1700,70 @@ function verifyDiagnosticTriple(
   expectedItemStatus = "completed",
   isRemote = true,
 ): boolean {
+  const effectiveVerSql = buildSqliteEffectiveRosterSql("r.organization_id");
   const query = `
     SELECT r.id as run_id, i.id as item_id, s.id as snap_id
     FROM fleet_runs r
     JOIN fleet_run_items i ON i.run_id = r.id
     JOIN fleet_snapshots s ON s.run_item_id = i.id
+    JOIN audits a ON a.id = i.audit_id
+    JOIN projects pr ON pr.id = a.project_id AND pr.archived_at IS NULL
+    JOIN fleet_roster_members m ON m.id = i.member_id
+    JOIN fleet_roster_versions v ON v.id = m.version_id
     WHERE r.id = ${sqlText(runId)}
       AND i.id = ${sqlText(runItemId)}
       AND s.id = ${sqlText(snapshotId)}
       AND r.organization_id = ${sqlText(orgId)}
       AND r.roster_version_id = ${sqlText(rosterId)}
+      AND v.id = ${sqlText(rosterId)}
+      AND v.organization_id = r.organization_id
+      AND v.id = ${effectiveVerSql}
+      AND m.id = ${sqlText(memberId)}
+      AND m.project_id = pr.id
+      AND m.enrollment_state = 'active'
+      AND pr.organization_id = r.organization_id
       AND i.audit_id = ${sqlText(auditId)}
       AND i.member_id = ${sqlText(memberId)}
       AND i.project_id = ${sqlText(projectId)}
       AND s.member_id = ${sqlText(memberId)}
       AND s.project_id = ${sqlText(projectId)}
-      AND s.canonical_host = ${sqlText(canonicalHost)}
+      AND lower(trim(s.canonical_host)) = lower(trim(${sqlText(canonicalHost)}))
+      AND lower(trim(m.canonical_host)) = lower(trim(pr.domain))
+      AND lower(trim(m.canonical_host)) = lower(trim(${sqlText(canonicalHost)}))
       AND i.primary_series_key = 'diagnostic'
       AND s.series_key = 'diagnostic'
       AND r.status = ${sqlText(expectedRunStatus)}
       AND i.status = ${sqlText(expectedItemStatus)}
+      AND a.status = 'completed'
+      AND a.pages_total > 0
+      AND a.pages_crawled >= a.pages_total
+      AND a.workflow_instance_id LIKE 'github-audit-%'
+      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+      AND NOT EXISTS (
+        SELECT 1 FROM audit_issues ai
+        WHERE ai.audit_id = a.id AND ai.page_id IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = ai.page_id AND p2.audit_id = a.id)
+      )
+      AND json_valid(a.config)
+      AND json_extract(a.config, '$.source') = 'github_repository_direct'
+      AND json_extract(a.config, '$.repoName') = m.repo_name
+      AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
+      AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
+      AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
+      AND json_extract(a.config, '$.rosterSource.versionId') = v.id
+      AND json_extract(a.config, '$.rosterSource.memberId') = m.id
+      AND json_extract(a.config, '$.rosterSource.projectId') = pr.id
+      AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
+      AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
       AND 1 = (
         SELECT CASE
-          WHEN COUNT(DISTINCT fr.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1 THEN 1
+          WHEN COUNT(DISTINCT fr.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1
+           AND (
+             SELECT COUNT(*) FROM fleet_run_items fri_all
+             WHERE fri_all.audit_id = ${sqlText(auditId)}
+               AND fri_all.primary_series_key = 'diagnostic'
+           ) = 1
+          THEN 1
           ELSE 0
         END
         FROM fleet_run_items fri
@@ -2073,28 +2157,35 @@ async function main() {
       publishRoot: string;
     }
   >();
+  let rosterUnlinkedOrStaleCount = 0;
   if (effectiveRoster) {
     const rosterRows = runD1Query(
-      `SELECT m.id AS member_id, m.version_id, m.canonical_host, m.project_id, m.repo_name, m.publish_root
+      `SELECT m.id AS member_id, m.version_id, m.canonical_host, m.project_id, m.repo_name, m.publish_root,
+              p.id AS matched_project_id
        FROM fleet_roster_members m
        JOIN fleet_roster_versions v ON v.id = m.version_id
-       JOIN projects p ON p.id = m.project_id
+       LEFT JOIN projects p ON p.id = m.project_id
                       AND p.organization_id = v.organization_id
                       AND p.archived_at IS NULL
                       AND lower(trim(p.domain)) = lower(trim(m.canonical_host))
        WHERE v.id = ${sqlText(effectiveRoster.id)}
          AND v.organization_id = 'shared-workspace'
          AND m.enrollment_state = 'active'
-         AND m.project_id IS NOT NULL
        ORDER BY m.canonical_host ASC, m.id ASC;`,
       isRemote,
     );
     for (const r of rosterRows) {
       const host = r.canonical_host.toLowerCase().trim();
       const activeProjId = projectIdByDomain.get(host);
-      if (!activeProjId || activeProjId !== r.project_id) {
+      if (
+        !r.project_id ||
+        !r.matched_project_id ||
+        !activeProjId ||
+        activeProjId !== r.project_id
+      ) {
+        rosterUnlinkedOrStaleCount++;
         console.warn(
-          `[ROSTER] Stale or mismatched project mapping for host '${host}': roster project_id='${r.project_id}', active project_id='${activeProjId}'. Excluding from approved candidates.`,
+          `[ROSTER] Unlinked or stale project mapping for active member host '${host}': roster project_id='${r.project_id ?? "null"}', active project_id='${activeProjId ?? "none"}'.`,
         );
         continue;
       }
@@ -2121,8 +2212,10 @@ async function main() {
   const plannedActions: FleetAction[] = [];
   let discoveryFailures = 0;
 
-  let unmappedCount = 0;
+  let unmappedCount =
+    !targetDomain && !isWorkspace ? rosterUnlinkedOrStaleCount : 0;
   let reusedCount = 0;
+  let scanBudgetReached = false;
   let candidateDomains: string[] = [];
 
   if (targetDomain) {
@@ -2313,6 +2406,7 @@ async function main() {
         break;
       }
       if (scannedCandidates >= scanLimit) {
+        scanBudgetReached = true;
         console.log(
           `[SCAN BUDGET] Candidate scan limit reached (${scanLimit} candidates scanned). Halting further candidate discovery.`,
         );
@@ -2500,13 +2594,17 @@ async function main() {
   console.log(`======================================================`);
 
   const executedOrReused = successCount + reusedCount;
+  const incompleteBulkWork =
+    !targetDomain &&
+    ((candidateDomains.length === 0 && unmappedCount === 0) ||
+      unmappedCount > 0 ||
+      (scanBudgetReached &&
+        (limit === undefined || plannedActions.length < limit)));
   if (
     failCount > 0 ||
     discoveryFailures > 0 ||
     (targetDomain && executedOrReused === 0) ||
-    (!targetDomain &&
-      (candidateDomains.length === 0 ||
-        (executedOrReused === 0 && unmappedCount > 0)))
+    incompleteBulkWork
   ) {
     process.exit(1);
   }

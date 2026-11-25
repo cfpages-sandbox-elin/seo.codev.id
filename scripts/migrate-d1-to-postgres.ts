@@ -58,6 +58,7 @@
  */
 import { readFileSync } from "node:fs";
 import process from "node:process";
+import { compareUtf8Binary } from "../src/server/features/fleet/services/fleetConstants";
 import { parseArgs as parseCliArgs } from "node:util";
 import {
   getTableColumns,
@@ -69,7 +70,10 @@ import {
   type SQL,
 } from "drizzle-orm";
 import { getTableConfig as getSqliteTableConfig } from "drizzle-orm/sqlite-core";
-import { getTableConfig as getPgTableConfig } from "drizzle-orm/pg-core";
+import {
+  getTableConfig as getPgTableConfig,
+  type AnyPgColumn,
+} from "drizzle-orm/pg-core";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
 import { loadLocalEnv } from "./cli-utils";
@@ -210,6 +214,7 @@ async function d1Query<T = Record<string, unknown>>(
         Authorization: `Bearer ${apiToken}`,
         "Content-Type": "application/json",
       },
+      signal: AbortSignal.timeout(30_000),
       body: JSON.stringify(
         params && params.length > 0
           ? { sql: statement, params }
@@ -240,7 +245,13 @@ async function d1Query<T = Record<string, unknown>>(
   ) {
     throw new Error(`D1_QUERY_FAILED: ${JSON.stringify(json?.errors ?? json)}`);
   }
-  return json.result[0].results;
+  const rows = json.result[0].results;
+  if (
+    !rows.every((r) => r !== null && typeof r === "object" && !Array.isArray(r))
+  ) {
+    throw new Error("D1_QUERY_FAILED: invalid non-object row in results array");
+  }
+  return rows;
 }
 
 function tablesByName(modules: Record<string, unknown>[]): Map<string, Table> {
@@ -450,6 +461,244 @@ function stableRowDigest(row: Record<string, unknown>): string {
   return JSON.stringify(entries);
 }
 
+function compareKeyTuples(a: unknown[], b: unknown[]): number {
+  const len = Math.min(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const va = a[i];
+    const vb = b[i];
+    if (va === vb) continue;
+    if (typeof va === "number" && typeof vb === "number") {
+      return va - vb;
+    }
+    const sa = va instanceof Date ? va.toISOString() : String(va ?? "");
+    const sb = vb instanceof Date ? vb.toISOString() : String(vb ?? "");
+    const cmp = compareUtf8Binary(sa, sb);
+    if (cmp !== 0) return cmp;
+  }
+  return a.length - b.length;
+}
+
+function serializedKeyTuple(
+  row: Record<string, unknown>,
+  keyCols: string[],
+  dbNameToJsKey?: Map<string, string>,
+): string {
+  return JSON.stringify(
+    keyCols.map((c) => {
+      const k = dbNameToJsKey?.get(c) ?? c;
+      const v = row[k];
+      return v instanceof Date ? v.toISOString() : (v ?? null);
+    }),
+  );
+}
+
+async function fetchAllD1Rows(
+  databaseId: string,
+  name: string,
+  sqliteTable: Table,
+  selectColsSql: string,
+  pageSize: number,
+  predicate?: string | null,
+): Promise<Record<string, unknown>[]> {
+  const keyCols = conflictArbiterNames(sqliteTable);
+  const orderBy =
+    keyCols.length > 0
+      ? `ORDER BY ${keyCols.map((c) => `"${c}" ASC`).join(", ")}`
+      : primaryKeyOrder(sqliteTable);
+  const out: Record<string, unknown>[] = [];
+  let cursorValues: unknown[] | null = null;
+  let offset = 0;
+
+  for (;;) {
+    let where = "";
+    let params: unknown[] | undefined;
+    if (keyCols.length > 0) {
+      const tupleLhs =
+        keyCols.length === 1
+          ? `"${keyCols[0]}"`
+          : `(${keyCols.map((c) => `"${c}"`).join(", ")})`;
+      const tupleRhs =
+        keyCols.length === 1 ? `?` : `(${keyCols.map(() => "?").join(", ")})`;
+      const cursorClause = cursorValues ? `${tupleLhs} > ${tupleRhs}` : "";
+      const parts = [predicate, cursorClause].filter(Boolean);
+      where = parts.length > 0 ? `WHERE ${parts.join(" AND ")} ` : "";
+      if (cursorValues) params = cursorValues;
+    } else {
+      where = predicate ? `WHERE ${predicate} ` : "";
+    }
+
+    const query =
+      keyCols.length > 0
+        ? `SELECT ${selectColsSql} FROM "${name}" ${where}${orderBy} LIMIT ${pageSize}`
+        : `SELECT ${selectColsSql} FROM "${name}" ${where}${orderBy} LIMIT ${pageSize} OFFSET ${offset}`;
+    const page: Record<string, unknown>[] = await d1Query<
+      Record<string, unknown>
+    >(databaseId, query, params);
+    if (page.length === 0) break;
+
+    if (keyCols.length > 0) {
+      const lastRow = page[page.length - 1];
+      const nextCursor = keyCols.map((k) => lastRow[k]);
+      if (nextCursor.some((v) => v === null || v === undefined)) {
+        throw new Error(
+          `D1_PAGINATION_STALLED: null/undefined cursor key encountered in table '${name}'.`,
+        );
+      }
+      if (cursorValues && compareKeyTuples(nextCursor, cursorValues) <= 0) {
+        throw new Error(
+          `D1_PAGINATION_STALLED: keyset cursor did not advance cleanly in table '${name}'.`,
+        );
+      }
+      cursorValues = nextCursor;
+    } else {
+      offset += pageSize;
+    }
+
+    out.push(...page);
+    if (page.length < pageSize) break;
+  }
+  return out;
+}
+
+async function verifyTableParity(
+  databaseId: string,
+  dest: PgDb,
+  name: string,
+  sqliteTable: Table,
+  pgTable: Table,
+  pageSize: number,
+): Promise<number> {
+  const sourceCount = await countD1(databaseId, name);
+  const [{ count }] = await dest
+    .select({ count: sql<number>`count(*)::int` })
+    .from(pgTable);
+  const pgCount = Number(count);
+  if (pgCount !== sourceCount) {
+    console.log(`  MISMATCH ${name}: D1 ${sourceCount} vs postgres ${pgCount}`);
+    return 1;
+  }
+  if (sourceCount === 0) return 0;
+
+  const keyCols = conflictArbiterNames(sqliteTable);
+  const pgColsMap = getTableColumns(pgTable);
+  const dbNameToJsKey = new Map(
+    Object.entries(pgColsMap).map(([jsKey, col]) => [col.name, jsKey]),
+  );
+
+  if (sourceCount <= 5_000) {
+    const rawD1Rows = await fetchAllD1Rows(
+      databaseId,
+      name,
+      sqliteTable,
+      "*",
+      Math.min(pageSize, PAGE_SIZE_OVERRIDES[name] ?? pageSize),
+    );
+    const pgRows = (await dest.select().from(pgTable)) as Record<
+      string,
+      unknown
+    >[];
+
+    if (keyCols.length > 0) {
+      const expectedByKey = new Map<string, Record<string, unknown>>();
+      for (const rawRow of rawD1Rows) {
+        const expected = convertRow(sqliteTable, rawRow);
+        const keyId = serializedKeyTuple(expected, keyCols, dbNameToJsKey);
+        expectedByKey.set(keyId, expected);
+      }
+      let tableMismatches = 0;
+      for (const pgRow of pgRows) {
+        const keyId = serializedKeyTuple(pgRow, keyCols, dbNameToJsKey);
+        const expected = expectedByKey.get(keyId);
+        if (!expected) {
+          tableMismatches++;
+          continue;
+        }
+        expectedByKey.delete(keyId);
+        if (
+          name === "watchdog_cursor" &&
+          Number(pgRow.revision ?? 0) >= Number(expected.revision ?? 0)
+        ) {
+          continue;
+        }
+        if (stableRowDigest(pgRow) !== stableRowDigest(expected)) {
+          tableMismatches++;
+        }
+      }
+      tableMismatches += expectedByKey.size;
+      if (tableMismatches > 0) {
+        console.log(
+          `  MISMATCH ${name}: ${tableMismatches} keyset/content parity mismatch(es) between D1 and postgres`,
+        );
+        return tableMismatches;
+      }
+      return 0;
+    }
+
+    const d1Digests = rawD1Rows
+      .map((r) => stableRowDigest(convertRow(sqliteTable, r)))
+      .sort();
+    const pgDigests = pgRows.map((r) => stableRowDigest(r)).sort();
+    let tableMismatches = 0;
+    for (let i = 0; i < Math.max(d1Digests.length, pgDigests.length); i++) {
+      if (d1Digests[i] !== pgDigests[i]) tableMismatches++;
+    }
+    if (tableMismatches > 0) {
+      console.log(
+        `  MISMATCH ${name}: ${tableMismatches} row digest mismatch(es) between D1 and postgres`,
+      );
+      return tableMismatches;
+    }
+    return 0;
+  }
+
+  if (keyCols.length > 0) {
+    const keySelect = keyCols.map((c) => `"${c}"`).join(", ");
+    const d1Keys = await fetchAllD1Rows(
+      databaseId,
+      name,
+      sqliteTable,
+      keySelect,
+      pageSize,
+    );
+    const pgOrderExpr = keyCols.map((colName) => {
+      const jsKey = dbNameToJsKey.get(colName)!;
+      const col = pgColsMap[jsKey]!;
+      return col.dataType === "string"
+        ? sql`${sql.identifier(colName)} COLLATE "C" ASC`
+        : sql`${sql.identifier(colName)} ASC`;
+    });
+    const pgSelectObj: Record<string, AnyPgColumn> = {};
+    for (const colName of keyCols) {
+      const jsKey = dbNameToJsKey.get(colName)!;
+      pgSelectObj[jsKey] = pgColsMap[jsKey] as AnyPgColumn;
+    }
+    const pgKeyRows = (await dest
+      .select(pgSelectObj)
+      .from(pgTable)
+      .orderBy(...pgOrderExpr)) as Record<string, unknown>[];
+
+    const d1Set = new Set(
+      d1Keys.map((r) =>
+        serializedKeyTuple(convertRow(sqliteTable, r), keyCols, dbNameToJsKey),
+      ),
+    );
+    let tableMismatches = 0;
+    for (const pgRow of pgKeyRows) {
+      const keyId = serializedKeyTuple(pgRow, keyCols, dbNameToJsKey);
+      if (!d1Set.delete(keyId)) tableMismatches++;
+    }
+    tableMismatches += d1Set.size;
+    if (tableMismatches > 0) {
+      console.log(
+        `  MISMATCH ${name}: ${tableMismatches} keyset parity mismatch(es) between D1 and postgres`,
+      );
+      return tableMismatches;
+    }
+  }
+
+  return 0;
+}
+
 // Copy one table from D1 to Postgres using parameter-bound tuple keyset pagination across PK/unique arbiter keys.
 async function copyTable(
   databaseId: string,
@@ -518,7 +767,18 @@ async function copyTable(
 
     if (keyCols.length > 0) {
       const lastRow: Record<string, unknown> = page[page.length - 1];
-      cursorValues = keyCols.map((k) => lastRow[k]);
+      const nextCursor = keyCols.map((k) => lastRow[k]);
+      if (nextCursor.some((v) => v === null || v === undefined)) {
+        throw new Error(
+          `D1_PAGINATION_STALLED: null/undefined cursor key encountered in table '${name}'.`,
+        );
+      }
+      if (cursorValues && compareKeyTuples(nextCursor, cursorValues) <= 0) {
+        throw new Error(
+          `D1_PAGINATION_STALLED: keyset cursor did not advance for table '${name}'.`,
+        );
+      }
+      cursorValues = nextCursor;
     } else {
       offset += tablePageSize;
     }
@@ -704,28 +964,28 @@ async function main() {
       }
     }
 
-    // Verify: D1 count + keyed sample content parity vs Postgres per table.
-    console.log("\nVerifying row counts and content parity...");
+    // Verify: D1 count + full keyset & converted row content parity vs Postgres per table (V3-01).
+    console.log(
+      "\nVerifying row counts, keyset parity, and converted content...",
+    );
     let mismatches = totalContentMismatches;
     for (const name of order) {
-      const sourceCount = await countD1(databaseId, name);
-      const [{ count }] = await dest
-        .select({ count: sql<number>`count(*)::int` })
-        .from(pgTables.get(name)!);
-      if (Number(count) !== sourceCount) {
-        mismatches += 1;
-        console.log(
-          `  MISMATCH ${name}: D1 ${sourceCount} vs postgres ${count}`,
-        );
-      }
+      mismatches += await verifyTableParity(
+        databaseId,
+        dest,
+        name,
+        sqliteTables.get(name)!,
+        pgTables.get(name)!,
+        pageSize,
+      );
     }
 
     const total = [...written.values()].reduce((n, v) => n + v.appliedCount, 0);
     console.log(
       `\nDone. ${total} rows across ${order.length} tables.` +
         (mismatches === 0
-          ? " All row counts match."
-          : ` ${mismatches} table(s) mismatched — investigate before cutover.`),
+          ? " All row counts, keysets, and verified row contents match."
+          : ` ${mismatches} table parity error(s) — investigate before cutover.`),
     );
     if (mismatches > 0) process.exitCode = 1;
   } finally {

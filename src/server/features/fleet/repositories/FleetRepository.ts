@@ -43,6 +43,10 @@ type RawFleetSnapshotWithAttempt = RawFleetSnapshot & {
 const pgSafeTs = pgUtcTimeSql;
 const sqliteSafeTs = sqliteUtcTimeSql;
 
+function gradeMatchFor(floorExpr: string): string {
+  return `fs.grade = (CASE WHEN ${floorExpr} >= 90 THEN 'A' WHEN ${floorExpr} >= 80 THEN 'B' WHEN ${floorExpr} >= 70 THEN 'C' WHEN ${floorExpr} >= 60 THEN 'D' ELSE 'F' END)`;
+}
+
 interface RawFleetData {
   version: RawFleetVersion;
   members: RawFleetMember[];
@@ -185,12 +189,21 @@ export const FleetRepository = {
       ? sql`ORDER BY ${fsObservedExpr} DESC NULLS LAST, fs.id COLLATE "C" DESC`
       : sql`ORDER BY ${fsObservedExpr} DESC NULLS LAST, fs.id COLLATE BINARY DESC`;
 
+    const rawWeighted =
+      "(35.0 * fs.score_technical + 15.0 * fs.score_mobile_perf + 10.0 * fs.score_schema + 15.0 * fs.score_on_page + 5.0 * fs.score_ai_readiness + 20.0 * fs.score_internal_links) / 100.0";
+    const pgFloorUncapped = `FLOOR(((${rawWeighted})::numeric + 1e-9))::int`;
+    const sqliteFloorUncapped = `CAST(((${rawWeighted}) + 1e-9) AS INTEGER)`;
+    const pgConfirmedCapSql =
+      "(fs.has_incident_cap = TRUE AND fs.score <= 59 AND fs.incident_reason IS NOT NULL AND trim(fs.incident_reason) ~ '^\\{.*\\}$' AND pg_input_is_valid(fs.incident_reason, 'jsonb') AND lower(coalesce(fs.incident_reason::jsonb->>'kind', '')) IN ('dns_failure','tls_invalid','tcp_timeout','http_5xx','empty_body','malware_defacement','site_down') AND (fs.incident_reason::jsonb->>'expectedIntentVerified') = 'true' AND coalesce(fs.incident_reason::jsonb->'primaryProbe', fs.incident_reason::jsonb->'probe') IS NOT NULL AND coalesce(fs.incident_reason::jsonb->'corroborationProbe', fs.incident_reason::jsonb->'corroboration') IS NOT NULL)";
+    const sqliteConfirmedCapSql =
+      "(fs.has_incident_cap = 1 AND fs.score <= 59 AND json_valid(fs.incident_reason) AND lower(coalesce(json_extract(fs.incident_reason, '$.kind'), '')) IN ('dns_failure','tls_invalid','tcp_timeout','http_5xx','empty_body','malware_defacement','site_down') AND json_extract(fs.incident_reason, '$.expectedIntentVerified') = 1 AND json_type(coalesce(json_extract(fs.incident_reason, '$.primaryProbe'), json_extract(fs.incident_reason, '$.probe'))) = 'object' AND json_type(coalesce(json_extract(fs.incident_reason, '$.corroborationProbe'), json_extract(fs.incident_reason, '$.corroboration'))) = 'object')";
+
     const fsPlausibleOfficial = isPg
       ? sql.raw(
-          `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND fs.grade = (CASE WHEN fs.score >= 90 THEN 'A' WHEN fs.score >= 80 THEN 'B' WHEN fs.score >= 70 THEN 'C' WHEN fs.score >= 60 THEN 'D' ELSE 'F' END) AND ABS((CASE WHEN fs.has_incident_cap THEN LEAST(59, 0.35 * fs.score_technical + 0.15 * fs.score_mobile_perf + 0.10 * fs.score_schema + 0.15 * fs.score_on_page + 0.05 * fs.score_ai_readiness + 0.20 * fs.score_internal_links) ELSE (0.35 * fs.score_technical + 0.15 * fs.score_mobile_perf + 0.10 * fs.score_schema + 0.15 * fs.score_on_page + 0.05 * fs.score_ai_readiness + 0.20 * fs.score_internal_links) END) - fs.score) < 1.001)`,
+          `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND ((NOT fs.has_incident_cap AND (fs.score = ${pgFloorUncapped} OR ABS((${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(pgFloorUncapped)}) OR (${pgConfirmedCapSql} AND (fs.score = LEAST(59, ${pgFloorUncapped}) OR ABS(LEAST(59, ${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(`LEAST(59, ${pgFloorUncapped})`)}) OR (fs.has_incident_cap AND fs.score <= 59 AND (fs.score = ${pgFloorUncapped} OR ABS((${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(pgFloorUncapped)})))`,
         )
       : sql.raw(
-          `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND fs.grade = (CASE WHEN fs.score >= 90 THEN 'A' WHEN fs.score >= 80 THEN 'B' WHEN fs.score >= 70 THEN 'C' WHEN fs.score >= 60 THEN 'D' ELSE 'F' END) AND ABS((CASE WHEN fs.has_incident_cap = 1 THEN MIN(59, 0.35 * fs.score_technical + 0.15 * fs.score_mobile_perf + 0.10 * fs.score_schema + 0.15 * fs.score_on_page + 0.05 * fs.score_ai_readiness + 0.20 * fs.score_internal_links) ELSE (0.35 * fs.score_technical + 0.15 * fs.score_mobile_perf + 0.10 * fs.score_schema + 0.15 * fs.score_on_page + 0.05 * fs.score_ai_readiness + 0.20 * fs.score_internal_links) END) - fs.score) < 1.001)`,
+          `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND ((fs.has_incident_cap = 0 AND (fs.score = ${sqliteFloorUncapped} OR ABS((${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(sqliteFloorUncapped)}) OR (${sqliteConfirmedCapSql} AND (fs.score = MIN(59, ${sqliteFloorUncapped}) OR ABS(MIN(59, ${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(`MIN(59, ${sqliteFloorUncapped})`)}) OR (fs.has_incident_cap = 1 AND fs.score <= 59 AND (fs.score = ${sqliteFloorUncapped} OR ABS((${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(sqliteFloorUncapped)})))`,
         );
 
     const friValidClock = isPg

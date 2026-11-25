@@ -14,13 +14,13 @@ import {
 } from "@/server/lib/audit/audit-errors";
 import { captureServerEvent } from "@/server/lib/posthog";
 import {
-  findIrregularRunningAudits,
   getStaleRunningAudits,
   loadPersistedCursor,
   savePersistedCursor,
   type LoadedCursorState,
   type WatchdogCursor,
 } from "./auditWatchdogCursor";
+import { reconcileIrregularRunningAudits } from "./auditIrregularSweep";
 
 const INSTANCE_LOST_GRACE_MS = 10 * 60 * 1000;
 const STALE_RUNNING_AFTER_MS = 15 * 60 * 1000;
@@ -34,7 +34,6 @@ type RunningAudit = {
   currentPhase: string | null;
 };
 
-let irregularCursorId: string | null = null;
 let sweepInFlight = false;
 let currentSweepToken = 0;
 
@@ -80,8 +79,11 @@ function withTickTimeout<T>(
 export async function reconcileRunningAudit(
   audit: RunningAudit,
   probeTimeoutMs = 5000,
+  remainingMs: () => number = () => probeTimeoutMs,
+  isActive: () => boolean = () => true,
 ): Promise<AuditErrorInfo | null> {
   if (!audit.workflowInstanceId) return null;
+  if (!isActive() || remainingMs() < 250) return null;
   if (audit.workflowInstanceId.startsWith("github-audit-")) {
     const GITHUB_AUDIT_TTL_MS = 2 * 60 * 60 * 1000;
     if (!isOlderThan(audit.startedAt, GITHUB_AUDIT_TTL_MS)) return null;
@@ -90,14 +92,14 @@ export async function reconcileRunningAudit(
       errorDetail:
         "GitHub repository audit exceeded max run duration (2h) and was reclaimed.",
     };
-    const failed = await AuditRepository.failAudit(
-      audit.id,
-      audit.workflowInstanceId,
-      {
+    const failed = await withTickTimeout(
+      AuditRepository.failAudit(audit.id, audit.workflowInstanceId, {
         errorCode: errorInfo.errorCode,
         errorDetail: errorInfo.errorDetail,
         failedPhase: audit.currentPhase ?? "analyzing",
-      },
+      }),
+      Math.min(probeTimeoutMs, remainingMs()),
+      "failGithubAudit",
     );
     return failed ? errorInfo : null;
   }
@@ -149,14 +151,14 @@ export async function reconcileRunningAudit(
   } finally {
     if (timerId) clearTimeout(timerId);
   }
-  if (!errorInfo) return null;
+  if (!errorInfo || !isActive() || remainingMs() < 250) return null;
 
   const didFail = await withTickTimeout(
     AuditRepository.failAudit(audit.id, audit.workflowInstanceId, {
       ...errorInfo,
       failedPhase: audit.currentPhase,
     }),
-    probeTimeoutMs,
+    Math.min(probeTimeoutMs, remainingMs()),
     "failAudit",
   );
   return didFail ? errorInfo : null;
@@ -201,7 +203,13 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
     if (remainingMs() < 2_000) return;
 
     // 1. Progressing cursor sweep of legacy null-instance or non-canonical/invalid timestamp rows
-    await reconcileIrregularRunningAudits(cutoff, remainingMs, isActive);
+    await reconcileIrregularRunningAudits(
+      cutoff,
+      remainingMs,
+      isActive,
+      withTickTimeout,
+      reconcileRunningAudit,
+    );
 
     if (!isActive() || remainingMs() < 2_000) return;
 
@@ -247,6 +255,8 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
               const errorInfo = await reconcileRunningAudit(
                 audit,
                 groupProbeTimeout,
+                remainingMs,
+                isActive,
               );
               if (!errorInfo || !isActive()) return;
 
@@ -338,73 +348,6 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
       currentSweepToken++;
       sweepInFlight = false;
     }
-  }
-}
-
-async function reconcileIrregularRunningAudits(
-  cutoff: Date,
-  remainingMs: () => number,
-  isActive: () => boolean,
-) {
-  try {
-    let irregular = await withTickTimeout(
-      findIrregularRunningAudits(10, irregularCursorId),
-      remainingMs(),
-      "findIrregularAudits",
-    );
-    if (!isActive()) return;
-
-    if (irregular.length === 0 && irregularCursorId !== null) {
-      irregularCursorId = null;
-      if (remainingMs() >= 2_000) {
-        irregular = await withTickTimeout(
-          findIrregularRunningAudits(10, null),
-          remainingMs(),
-          "findIrregularAuditsWrap",
-        );
-      }
-    }
-    if (!isActive()) return;
-
-    for (const row of irregular) {
-      if (!isActive() || remainingMs() < 3_000) break;
-      if (!row.workflowInstanceId) {
-        const parsedMs = parseUtcTimestampMs(row.startedAt);
-        if (!Number.isFinite(parsedMs) || parsedMs < cutoff.getTime()) {
-          await withTickTimeout(
-            AuditRepository.failAudit(row.id, null, {
-              errorCode: "instance_lost",
-              errorDetail: "Legacy running audit has null workflow instance ID",
-              failedPhase: row.currentPhase,
-            }),
-            remainingMs(),
-            "failIrregularNullInstance",
-          );
-        }
-        continue;
-      }
-      const parsedMs = parseUtcTimestampMs(row.startedAt);
-      if (!Number.isFinite(parsedMs)) {
-        await withTickTimeout(
-          AuditRepository.failAudit(row.id, row.workflowInstanceId, {
-            errorCode: "invalid_started_at",
-            errorDetail: "Running audit has malformed started_at timestamp",
-            failedPhase: row.currentPhase,
-          }),
-          remainingMs(),
-          "failIrregularInvalidStartedAt",
-        );
-      } else if (parsedMs < cutoff.getTime()) {
-        await reconcileRunningAudit(row, Math.min(3_000, remainingMs()));
-      }
-    }
-
-    if (isActive()) {
-      irregularCursorId =
-        irregular.length === 10 ? irregular[irregular.length - 1].id : null;
-    }
-  } catch (err) {
-    console.error("Audit watchdog: irregular-row sweep failed:", err);
   }
 }
 
