@@ -243,14 +243,34 @@ export async function linkFleet(options: {
     `Active Approved Roster Version: ${approvedRoster.version_tag} (${approvedRoster.id})`,
   );
 
-  // 3. Determine missing projects and link updates
+  // 3. Determine missing projects and link updates (Sol R24-09: align preview and apply write scope)
+  const activeApprovedRosterHosts = new Set(
+    existingMembers
+      .filter((m) => m.enrollment_state === "active")
+      .map((m) => m.canonical_host.toLowerCase().trim()),
+  );
+
   const missingProjects: Array<{ id: string; domain: string; name: string }> =
     [];
+  const outsideRosterInventory: Array<{
+    domain: string;
+    name: string;
+    source: string;
+  }> = [];
+
   for (const [domain, meta] of targetMap.entries()) {
-    if (!existingProjectDomainMap.has(domain)) {
-      const id = crypto.randomUUID(); // Standard UUID convention (P1-1)
-      missingProjects.push({ id, domain, name: meta.name });
-      existingProjectDomainMap.set(domain, id);
+    if (activeApprovedRosterHosts.has(domain)) {
+      if (!existingProjectDomainMap.has(domain)) {
+        const id = crypto.randomUUID(); // Standard UUID convention (P1-1)
+        missingProjects.push({ id, domain, name: meta.name });
+        existingProjectDomainMap.set(domain, id);
+      }
+    } else {
+      outsideRosterInventory.push({
+        domain,
+        name: meta.name,
+        source: meta.source,
+      });
     }
   }
 
@@ -260,6 +280,7 @@ export async function linkFleet(options: {
     projectId: string;
   }> = [];
   for (const m of existingMembers) {
+    if (m.enrollment_state !== "active") continue;
     const host = m.canonical_host.toLowerCase().trim();
     const currentProjectId = m.project_id;
     const targetProjectId = existingProjectDomainMap.get(host);
@@ -273,8 +294,12 @@ export async function linkFleet(options: {
     (m) => m.project_id !== null,
   ).length;
   const linkableCount = membersToLink.length;
+  const inactiveCount = existingMembers.filter(
+    (m) => m.enrollment_state !== "active",
+  ).length;
   const unmappedCount = existingMembers.filter(
     (m) =>
+      m.enrollment_state === "active" &&
       m.project_id === null &&
       !existingProjectDomainMap.has(m.canonical_host.toLowerCase().trim()),
   ).length;
@@ -283,10 +308,15 @@ export async function linkFleet(options: {
   console.log(`  - Missing projects to insert: ${missingProjects.length}`);
   console.log(`  - Fleet roster members to link: ${linkableCount}`);
   console.log(`  - Already linked roster members: ${alreadyLinkedCount}`);
-  console.log(`  - Unmapped roster members: ${unmappedCount}`);
+  console.log(`  - Inactive / parked roster members: ${inactiveCount}`);
+  console.log(`  - Unmapped active roster members: ${unmappedCount}`);
+  console.log(
+    `  - Outside-roster inventory targets (skipped): ${outsideRosterInventory.length}`,
+  );
 
-  // Sol P2-01: Reconcile complete partition: total must equal alreadyLinked + linkable + unmapped
-  const totalPartition = alreadyLinkedCount + linkableCount + unmappedCount;
+  // Sol P2-01: Reconcile complete partition: total must equal alreadyLinked + linkable + unmapped + inactive
+  const totalPartition =
+    alreadyLinkedCount + linkableCount + unmappedCount + inactiveCount;
   if (totalPartition !== existingMembers.length) {
     throw new Error(
       `Reconciliation partition mismatch: partitioned ${totalPartition} members vs ${existingMembers.length} total members in approved roster.`,

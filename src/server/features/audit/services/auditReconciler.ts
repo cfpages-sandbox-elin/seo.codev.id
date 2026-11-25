@@ -11,7 +11,7 @@
  *     error is copied into the row before Workflows retention deletes it.
  */
 import { env } from "cloudflare:workers";
-import { and, asc, eq, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, eq, isNotNull, isNull, sql, type Column, type SQL } from "drizzle-orm";
 import { db } from "@/db";
 import { audits, projects, watchdogCursor } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
@@ -412,13 +412,22 @@ async function getStaleRunningAudits(
   // Sweep them in the same keyset cursor pass so crashed CLI runners never lock projects indefinitely.
   const repoCutoffIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
 
+  // Sol R24-02: Guarded UTC timestamp evaluation for PostgreSQL session time-zone and malformed input safety
+  const pgTime = (expr: SQL | Column | string | null | undefined) => sql`(
+    CASE
+      WHEN ${expr} ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (${expr} || '+00')::timestamptz
+      WHEN pg_input_is_valid(${expr}, 'timestamptz') THEN (${expr})::timestamptz
+      ELSE NULL
+    END
+  )`;
+
   const stalenessPredicate = isPg
-    ? sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${audits.startedAt}::timestamptz < ${edgeCutoffIso}::timestamptz) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${audits.startedAt}::timestamptz < ${repoCutoffIso}::timestamptz)))`
-    : sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND julianday(${audits.startedAt}) < julianday(${edgeCutoffIso})) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND julianday(${audits.startedAt}) < julianday(${repoCutoffIso}))))`;
+    ? sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND (${pgTime(audits.startedAt)} IS NULL OR ${pgTime(audits.startedAt)} < ${edgeCutoffIso}::timestamptz)) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND (${pgTime(audits.startedAt)} IS NULL OR ${pgTime(audits.startedAt)} < ${repoCutoffIso}::timestamptz))))`
+    : sql`(((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND (julianday(${audits.startedAt}) IS NULL OR julianday(${audits.startedAt}) < julianday(${edgeCutoffIso}))) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND (julianday(${audits.startedAt}) IS NULL OR julianday(${audits.startedAt}) < julianday(${repoCutoffIso})))))`;
 
   const cursorPredicate = cursor
     ? isPg
-      ? sql`(${audits.startedAt}::timestamptz > ${cursor.startedAt}::timestamptz OR (${audits.startedAt}::timestamptz = ${cursor.startedAt}::timestamptz AND ${audits.id} > ${cursor.id}))`
+      ? sql`(${pgTime(audits.startedAt)} > ${pgTime(cursor.startedAt)} OR (${pgTime(audits.startedAt)} = ${pgTime(cursor.startedAt)} AND ${audits.id} > ${cursor.id}))`
       : sql`(${audits.startedAt} > ${cursor.startedAt} OR (${audits.startedAt} = ${cursor.startedAt} AND ${audits.id} > ${cursor.id}))`
     : undefined;
 
@@ -430,7 +439,7 @@ async function getStaleRunningAudits(
       cursorPredicate,
     ),
     orderBy: isPg
-      ? [sql`${audits.startedAt}::timestamptz ASC`, sql`${audits.id} ASC`]
+      ? [sql`${pgTime(audits.startedAt)} ASC NULLS FIRST`, sql`${audits.id} ASC`]
       : [asc(audits.startedAt), asc(audits.id)],
     columns: {
       id: true,

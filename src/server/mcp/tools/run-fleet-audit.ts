@@ -55,6 +55,188 @@ const runFleetAuditInputSchema = {
 
 type RunFleetAuditArgs = z.infer<z.ZodObject<typeof runFleetAuditInputSchema>>;
 
+function parseAndValidateScope(args: RunFleetAuditArgs): string | undefined {
+  const domain = args.domain?.toLowerCase().trim();
+  const selectorCount =
+    Number(domain !== undefined && domain !== "") +
+    Number(args.limit !== undefined) +
+    Number(args.all === true);
+  if (selectorCount === 0) {
+    throw new Error(
+      "An explicit scope is required: provide a target domain, specify --limit, or pass all=true.",
+    );
+  }
+  if (selectorCount > 1) {
+    throw new Error(
+      "Use exactly one selector: choose either target domain, limit, or all=true.",
+    );
+  }
+  return domain || undefined;
+}
+
+async function resolveTargetProject(
+  orgId: string,
+  domain: string,
+): Promise<string> {
+  const activeProjects = await db
+    .select({ id: projects.id })
+    .from(projects)
+    .where(
+      and(
+        eq(projects.organizationId, orgId),
+        eq(projects.domain, domain),
+        isNull(projects.archivedAt),
+      ),
+    )
+    .limit(2);
+  if (activeProjects.length === 0) {
+    throw new Error(
+      `Domain '${domain}' is not enrolled in organization '${orgId}'.`,
+    );
+  }
+  if (activeProjects.length > 1) {
+    throw new Error(
+      `Ambiguous domain binding: multiple active projects (${activeProjects.length}) found for '${domain}' in organization '${orgId}'.`,
+    );
+  }
+  return activeProjects[0].id;
+}
+
+type BoundRosterMember = {
+  id: string;
+  enrollmentState: string;
+  projectId: string | null;
+  repoName: string | null;
+  publishRoot: string | null;
+};
+
+async function resolveAndValidateRosterMember(
+  effectiveRosterId: string,
+  domain: string,
+  targetProjectId: string,
+  mode: string,
+): Promise<BoundRosterMember> {
+  const rosterMember = await db
+    .select({
+      id: fleetRosterMembers.id,
+      enrollmentState: fleetRosterMembers.enrollmentState,
+      projectId: fleetRosterMembers.projectId,
+      repoName: fleetRosterMembers.repoName,
+      publishRoot: fleetRosterMembers.publishRoot,
+    })
+    .from(fleetRosterMembers)
+    .where(
+      and(
+        eq(fleetRosterMembers.versionId, effectiveRosterId),
+        eq(fleetRosterMembers.canonicalHost, domain),
+      ),
+    )
+    .limit(1);
+
+  if (rosterMember.length === 0) {
+    throw new Error(
+      `Domain '${domain}' is not in approved fleet roster '${effectiveRosterId}'.`,
+    );
+  }
+  const bound = rosterMember[0];
+  if (bound.enrollmentState !== "active") {
+    throw new Error(
+      `Domain '${domain}' is '${bound.enrollmentState}' in roster '${effectiveRosterId}'; only active members can be planned for audit.`,
+    );
+  }
+  if (!bound.projectId || bound.projectId !== targetProjectId) {
+    throw new Error(
+      `Domain '${domain}' has mismatched or missing project mapping in roster '${effectiveRosterId}'.`,
+    );
+  }
+  if (mode === "repository_direct") {
+    const repoName = bound.repoName?.trim();
+    if (!repoName) {
+      throw new Error(
+        `Domain '${domain}' has no approved repository mapping in roster '${effectiveRosterId}' for repository_direct mode. Use edge_workflow mode or link an approved repository in the roster.`,
+      );
+    }
+    if (!isValidRepoSlug(repoName)) {
+      throw new Error(
+        `Domain '${domain}' has an invalid repository slug '${bound.repoName}' in roster '${effectiveRosterId}'. Must be 'owner/repo'.`,
+      );
+    }
+    try {
+      normalizeGitRelativePath(bound.publishRoot);
+    } catch (rootErr: unknown) {
+      throw new Error(
+        `Domain '${domain}' has an invalid publish root '${bound.publishRoot}' in roster '${effectiveRosterId}': ${rootErr instanceof Error ? rootErr.message : String(rootErr)}`,
+        { cause: rootErr },
+      );
+    }
+  }
+  return bound;
+}
+
+function buildExecutionArgv(options: {
+  mode: string;
+  scopeArgs: string[];
+  effectiveRosterId: string;
+  maxPages: number;
+  concurrency: number;
+  domain?: string;
+  boundRosterMember?: BoundRosterMember;
+  targetProjectId?: string;
+}): string[] {
+  const {
+    mode,
+    scopeArgs,
+    effectiveRosterId,
+    maxPages,
+    concurrency,
+    domain,
+    boundRosterMember,
+    targetProjectId,
+  } = options;
+
+  if (mode === "repository_direct") {
+    const argv = [
+      "exec",
+      "tsx",
+      "scripts/run-github-fleet-audit.ts",
+      ...scopeArgs,
+      "--roster-id",
+      effectiveRosterId,
+      "--remote",
+      "--max-pages",
+      String(maxPages),
+    ];
+    if (domain && boundRosterMember) {
+      if (boundRosterMember.repoName) {
+        argv.push("--expected-repo", boundRosterMember.repoName.trim());
+      }
+      argv.push(
+        "--expected-root",
+        normalizeGitRelativePath(boundRosterMember.publishRoot),
+      );
+    }
+    return argv;
+  }
+
+  const argv = [
+    "exec",
+    "tsx",
+    "scripts/run-fleet-audits.ts",
+    ...scopeArgs,
+    "--roster-id",
+    effectiveRosterId,
+    "--remote",
+    "--max-pages",
+    String(maxPages),
+    "--concurrency",
+    String(concurrency),
+  ];
+  if (domain && targetProjectId) {
+    argv.push("--expected-project", targetProjectId);
+  }
+  return argv;
+}
+
 export const runFleetAuditTool = {
   name: "run_fleet_audit",
   config: {
@@ -86,49 +268,14 @@ export const runFleetAuditTool = {
       );
     }
 
-    const domain = args.domain?.toLowerCase().trim();
-    const selectorCount =
-      Number(domain !== undefined && domain !== "") +
-      Number(args.limit !== undefined) +
-      Number(args.all === true);
-    if (selectorCount === 0) {
-      throw new Error(
-        "An explicit scope is required: provide a target domain, specify --limit, or pass all=true.",
-      );
-    }
-    if (selectorCount > 1) {
-      throw new Error(
-        "Use exactly one selector: choose either target domain, limit, or all=true.",
-      );
-    }
-
+    const domain = parseAndValidateScope(args);
     const mode = args.mode ?? "repository_direct";
     const maxPages = args.maxPages || 2000;
     const concurrency = args.concurrency || 2;
 
-    let targetProjectId: string | undefined;
-    if (domain) {
-      const activeProjects = await db
-        .select({ id: projects.id })
-        .from(projects)
-        .where(
-          and(
-            eq(projects.organizationId, orgId),
-            eq(projects.domain, domain),
-            isNull(projects.archivedAt),
-          ),
-        )
-        .limit(2);
-      if (activeProjects.length === 0)
-        throw new Error(
-          `Domain '${domain}' is not enrolled in organization '${orgId}'.`,
-        );
-      if (activeProjects.length > 1)
-        throw new Error(
-          `Ambiguous domain binding: multiple active projects (${activeProjects.length}) found for '${domain}' in organization '${orgId}'.`,
-        );
-      targetProjectId = activeProjects[0].id;
-    }
+    const targetProjectId = domain
+      ? await resolveTargetProject(orgId, domain)
+      : undefined;
 
     const effectiveRoster = await FleetRepository.getApprovedRoster(orgId);
     if (!effectiveRoster) {
@@ -137,64 +284,15 @@ export const runFleetAuditTool = {
       );
     }
 
-    if (domain) {
-      const rosterMember = await db
-        .select({
-          id: fleetRosterMembers.id,
-          enrollmentState: fleetRosterMembers.enrollmentState,
-          projectId: fleetRosterMembers.projectId,
-          repoName: fleetRosterMembers.repoName,
-          publishRoot: fleetRosterMembers.publishRoot,
-        })
-        .from(fleetRosterMembers)
-        .where(
-          and(
-            eq(fleetRosterMembers.versionId, effectiveRoster.id),
-            eq(fleetRosterMembers.canonicalHost, domain),
-          ),
-        )
-        .limit(1);
-
-      if (rosterMember.length === 0) {
-        throw new Error(
-          `Domain '${domain}' is not in approved fleet roster '${effectiveRoster.id}'.`,
-        );
-      }
-      if (rosterMember[0].enrollmentState !== "active") {
-        throw new Error(
-          `Domain '${domain}' is '${rosterMember[0].enrollmentState}' in roster '${effectiveRoster.id}'; only active members can be planned for audit.`,
-        );
-      }
-      if (
-        !rosterMember[0].projectId ||
-        rosterMember[0].projectId !== targetProjectId
-      ) {
-        throw new Error(
-          `Domain '${domain}' has mismatched or missing project mapping in roster '${effectiveRoster.id}'.`,
-        );
-      }
-      if (mode === "repository_direct") {
-        const repoName = rosterMember[0].repoName?.trim();
-        if (!repoName) {
-          throw new Error(
-            `Domain '${domain}' has no approved repository mapping in roster '${effectiveRoster.id}' for repository_direct mode. Use edge_workflow mode or link an approved repository in the roster.`,
-          );
-        }
-        if (!isValidRepoSlug(repoName)) {
-          throw new Error(
-            `Domain '${domain}' has an invalid repository slug '${rosterMember[0].repoName}' in roster '${effectiveRoster.id}'. Must be 'owner/repo'.`,
-          );
-        }
-        try {
-          normalizeGitRelativePath(rosterMember[0].publishRoot);
-        } catch (rootErr: unknown) {
-          throw new Error(
-            `Domain '${domain}' has an invalid publish root '${rosterMember[0].publishRoot}' in roster '${effectiveRoster.id}': ${rootErr instanceof Error ? rootErr.message : String(rootErr)}`,
-            { cause: rootErr },
-          );
-        }
-      }
-    }
+    const boundRosterMember =
+      domain && targetProjectId
+        ? await resolveAndValidateRosterMember(
+            effectiveRoster.id,
+            domain,
+            targetProjectId,
+            mode,
+          )
+        : undefined;
 
     const planId = "plan_" + crypto.randomUUID();
     const scopeArgs: string[] = [];
@@ -206,34 +304,16 @@ export const runFleetAuditTool = {
       scopeArgs.push("--all");
     }
 
-    let argv: string[] = [];
-    if (mode === "repository_direct") {
-      argv = [
-        "exec",
-        "tsx",
-        "scripts/run-github-fleet-audit.ts",
-        ...scopeArgs,
-        "--roster-id",
-        effectiveRoster.id,
-        "--remote",
-        "--max-pages",
-        String(maxPages),
-      ];
-    } else {
-      argv = [
-        "exec",
-        "tsx",
-        "scripts/run-fleet-audits.ts",
-        ...scopeArgs,
-        "--roster-id",
-        effectiveRoster.id,
-        "--remote",
-        "--max-pages",
-        String(maxPages),
-        "--concurrency",
-        String(concurrency),
-      ];
-    }
+    const argv = buildExecutionArgv({
+      mode,
+      scopeArgs,
+      effectiveRosterId: effectiveRoster.id,
+      maxPages,
+      concurrency,
+      domain,
+      boundRosterMember,
+      targetProjectId,
+    });
 
     const executionCommand = `pnpm ${argv.join(" ")}`;
     const message = domain
@@ -246,7 +326,21 @@ export const runFleetAuditTool = {
         planId,
         organizationId: orgId,
         mode,
+        selection: domain ? "bound" : "deferred",
         targetDomain: domain ?? null,
+        binding:
+          domain && boundRosterMember
+            ? {
+                rosterId: effectiveRoster.id,
+                memberId: boundRosterMember.id,
+                projectId: targetProjectId ?? null,
+                domain,
+                repoName: boundRosterMember.repoName?.trim() ?? null,
+                publishRoot: normalizeGitRelativePath(
+                  boundRosterMember.publishRoot,
+                ),
+              }
+            : null,
         message,
         executable: "pnpm",
         argv,

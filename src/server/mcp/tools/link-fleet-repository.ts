@@ -156,13 +156,26 @@ export const linkFleetRepositoryTool = {
     }
 
     const isPg = getDatabaseProvider() === "postgres";
+    // Sol R24-02: Guarded UTC timestamp evaluation for PostgreSQL session time-zone and malformed input safety
     const effectiveVersionSubquery = isPg
       ? sql`(
           SELECT id FROM fleet_roster_versions
           WHERE organization_id = ${orgId}
             AND approved_at IS NOT NULL
-            AND approved_at::timestamptz <= CURRENT_TIMESTAMP
-          ORDER BY approved_at::timestamptz DESC NULLS LAST, id DESC
+            AND (
+              CASE
+                WHEN approved_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (approved_at || '+00')::timestamptz <= CURRENT_TIMESTAMP
+                WHEN pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz <= CURRENT_TIMESTAMP
+                ELSE false
+              END
+            )
+          ORDER BY (
+            CASE
+              WHEN approved_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (approved_at || '+00')::timestamptz
+              WHEN pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz
+              ELSE NULL
+            END
+          ) DESC NULLS LAST, id DESC
           LIMIT 1
         )`
       : sql`(
@@ -181,7 +194,9 @@ export const linkFleetRepositoryTool = {
       currentSlug === cleanSlug &&
       (cleanRoot === undefined || currentRoot === cleanRoot)
     ) {
-      // Sol Round 24 P1-02: verify the mapping still matches the effective member in the database
+      // Sol Round 24 R24-11: verify the mapping still matches the requested publishRoot and effective member
+      const expectedVerifyRoot =
+        cleanRoot !== undefined ? cleanRoot : currentRoot;
       const verifyEffective = await db
         .select({
           id: fleetRosterMembers.id,
@@ -195,6 +210,7 @@ export const linkFleetRepositoryTool = {
             eq(fleetRosterMembers.versionId, effectiveVersionSubquery),
             eq(fleetRosterMembers.enrollmentState, "active"),
             eq(fleetRosterMembers.repoName, cleanSlug),
+            sql`coalesce(${fleetRosterMembers.publishRoot}, '.') = ${expectedVerifyRoot}`,
           ),
         )
         .limit(1);
@@ -225,7 +241,7 @@ export const linkFleetRepositoryTool = {
       updateSet.publishRoot = cleanRoot;
     }
 
-    // Sol Round 24 P1-02: Atomic write-time assertion that versionId is currently effective
+    // Sol Round 24 R24-11: Atomic write-time assertion that versionId is currently effective and guarded against concurrent mutation
     const updateRes = await db
       .update(fleetRosterMembers)
       .set(updateSet)
@@ -235,6 +251,8 @@ export const linkFleetRepositoryTool = {
           eq(fleetRosterMembers.versionId, approvedRoster.id),
           eq(fleetRosterMembers.enrollmentState, "active"),
           eq(fleetRosterMembers.versionId, effectiveVersionSubquery),
+          sql`coalesce(${fleetRosterMembers.repoName}, '') = ${member.repoName ?? ""}`,
+          sql`coalesce(${fleetRosterMembers.publishRoot}, '.') = ${currentRoot}`,
         ),
       )
       .returning({

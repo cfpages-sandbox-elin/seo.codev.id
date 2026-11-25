@@ -113,10 +113,13 @@ export const getFleetIssuesTool = {
     const source = args.source ?? "all";
     const limit = args.limit ?? 50;
     const isPg = getDatabaseProvider() === "postgres";
+    // Sol R24-02: Guarded UTC timestamp evaluation for PostgreSQL session time-zone and malformed input safety
     const completedTimeFor = (alias: string) =>
       isPg
-        ? sql.raw(`${alias}.completed_at::timestamptz`)
-        : sql.raw(`julianday(${alias}.completed_at)`);
+        ? sql.raw(
+            `(CASE WHEN ${alias}.completed_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (${alias}.completed_at || '+00')::timestamptz WHEN pg_input_is_valid(${alias}.completed_at, 'timestamptz') THEN (${alias}.completed_at)::timestamptz ELSE NULL END)`,
+          )
+        : sql.raw(`(CASE WHEN ${alias}.completed_at IS NOT NULL THEN julianday(${alias}.completed_at) ELSE NULL END)`);
 
     // Sol Round 18 F2, Round 21 F13: Bind repository qualification strictly to effective approved roster version (skip for edge-only)
     let approvedRosterId: string | undefined;

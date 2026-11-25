@@ -9,22 +9,26 @@ CREATE TABLE IF NOT EXISTS `watchdog_cursor` (
 UPDATE `audits`
 SET `status` = 'failed',
     `current_phase` = 'failed',
+    `failed_phase` = COALESCE(`current_phase`, 'running'),
     `error_code` = 'MIGRATION_CONCURRENCY_RECONCILED',
     `completed_at` = COALESCE(`completed_at`, CURRENT_TIMESTAMP)
 WHERE `status` = 'running'
-  AND `id` NOT IN (
-    SELECT a1.`id`
-    FROM `audits` a1
-    WHERE a1.`status` = 'running'
-      AND NOT EXISTS (
-        SELECT 1 FROM `audits` a2
-        WHERE a2.`project_id` = a1.`project_id`
-          AND a2.`status` = 'running'
-          AND (
-            julianday(a2.`started_at`) > julianday(a1.`started_at`)
-            OR (julianday(a2.`started_at`) = julianday(a1.`started_at`) AND a2.`id` > a1.`id`)
-          )
-      )
+  AND `id` IN (
+    WITH ranked AS (
+      SELECT `id`,
+        `project_id`,
+        CASE WHEN julianday(`started_at`) IS NOT NULL THEN julianday(`started_at`) ELSE NULL END AS valid_time,
+        ROW_NUMBER() OVER (
+          PARTITION BY `project_id`
+          ORDER BY
+            CASE WHEN julianday(`started_at`) IS NOT NULL THEN 1 ELSE 0 END DESC,
+            julianday(`started_at`) DESC,
+            `id` DESC
+        ) AS rn
+      FROM `audits`
+      WHERE `status` = 'running'
+    )
+    SELECT `id` FROM ranked WHERE rn > 1 OR valid_time IS NULL
   );
 --> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS `audits_project_running_idx` ON `audits` (`project_id`) WHERE status = 'running';

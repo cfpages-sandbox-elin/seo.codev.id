@@ -9,30 +9,41 @@ CREATE TABLE IF NOT EXISTS "watchdog_cursor" (
 UPDATE "audits"
 SET "status" = 'failed',
     "current_phase" = 'failed',
+    "failed_phase" = COALESCE("current_phase", 'running'),
     "error_code" = 'MIGRATION_CONCURRENCY_RECONCILED',
     "completed_at" = COALESCE(
       "completed_at",
       to_char(CURRENT_TIMESTAMP AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')
     )
 WHERE "status" = 'running'
-  AND "id" NOT IN (
-    SELECT a1."id"
-    FROM "audits" a1
-    WHERE a1."status" = 'running'
-      AND NOT EXISTS (
-        SELECT 1 FROM "audits" a2
-        WHERE a2."project_id" = a1."project_id"
-          AND a2."status" = 'running'
-          AND (
-            (CASE WHEN pg_input_is_valid(a2."started_at", 'timestamptz') THEN a2."started_at"::timestamptz END >
-             CASE WHEN pg_input_is_valid(a1."started_at", 'timestamptz') THEN a1."started_at"::timestamptz END)
-            OR (
-              (CASE WHEN pg_input_is_valid(a2."started_at", 'timestamptz') THEN a2."started_at"::timestamptz END =
-               CASE WHEN pg_input_is_valid(a1."started_at", 'timestamptz') THEN a1."started_at"::timestamptz END)
-              AND a2."id" > a1."id"
-            )
-          )
-      )
+  AND "id" IN (
+    WITH ranked AS (
+      SELECT "id",
+        "project_id",
+        CASE
+          WHEN "started_at" ~ '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' THEN ("started_at" || '+00')::timestamptz
+          WHEN pg_input_is_valid("started_at", 'timestamptz') THEN "started_at"::timestamptz
+          ELSE NULL
+        END AS valid_time,
+        ROW_NUMBER() OVER (
+          PARTITION BY "project_id"
+          ORDER BY
+            CASE
+              WHEN "started_at" ~ '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' THEN 1
+              WHEN pg_input_is_valid("started_at", 'timestamptz') THEN 1
+              ELSE 0
+            END DESC,
+            CASE
+              WHEN "started_at" ~ '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}' THEN ("started_at" || '+00')::timestamptz
+              WHEN pg_input_is_valid("started_at", 'timestamptz') THEN "started_at"::timestamptz
+              ELSE NULL
+            END DESC NULLS LAST,
+            "id" DESC
+        ) AS rn
+      FROM "audits"
+      WHERE "status" = 'running'
+    )
+    SELECT "id" FROM ranked WHERE rn > 1 OR valid_time IS NULL
   );
 --> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS "audits_project_running_idx" ON "audits" ("project_id") WHERE status = 'running';

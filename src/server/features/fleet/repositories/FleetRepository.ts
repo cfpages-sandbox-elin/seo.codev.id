@@ -147,14 +147,14 @@ export const FleetRepository = {
       },
     );
 
-    // Query 3: Run items for this approved roster version joined with runs bounded by window partition (Sol Round 24 P2-07)
+    // Query 3: Run items for this approved roster version joined with runs bounded by window partition (Sol Round 24 P2-07, R24-12)
     const isPg = getDatabaseProvider() === "postgres";
     const friOrder = isPg
-      ? sql`ORDER BY (CASE WHEN fri.completed_at IS NOT NULL THEN fri.completed_at::timestamptz ELSE NULL END) DESC NULLS LAST, fri.id DESC`
+      ? sql`ORDER BY (CASE WHEN fri.completed_at IS NOT NULL THEN (CASE WHEN fri.completed_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (fri.completed_at || '+00')::timestamptz WHEN pg_input_is_valid(fri.completed_at, 'timestamptz') THEN fri.completed_at::timestamptz ELSE NULL END) ELSE NULL END) DESC NULLS LAST, fri.id DESC`
       : sql`ORDER BY (CASE WHEN fri.completed_at IS NOT NULL THEN julianday(fri.completed_at) ELSE NULL END) DESC NULLS LAST, fri.id DESC`;
 
     const fsOrder = isPg
-      ? sql`ORDER BY (CASE WHEN fs.observed_at IS NOT NULL THEN fs.observed_at::timestamptz ELSE NULL END) DESC NULLS LAST, fs.id DESC`
+      ? sql`ORDER BY (CASE WHEN fs.observed_at IS NOT NULL THEN (CASE WHEN fs.observed_at ~ '^\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}' THEN (fs.observed_at || '+00')::timestamptz WHEN pg_input_is_valid(fs.observed_at, 'timestamptz') THEN fs.observed_at::timestamptz ELSE NULL END) ELSE NULL END) DESC NULLS LAST, fs.id DESC`
       : sql`ORDER BY (CASE WHEN fs.observed_at IS NOT NULL THEN julianday(fs.observed_at) ELSE NULL END) DESC NULLS LAST, fs.id DESC`;
 
     const runItems = await db
@@ -191,14 +191,18 @@ export const FleetRepository = {
                    ) as rn
             FROM fleet_run_items fri
             JOIN fleet_runs fr ON fr.id = fri.run_id
-            WHERE fr.organization_id = ${organizationId} AND fr.roster_version_id = ${version.id}
+            JOIN fleet_roster_members rm ON rm.id = fri.member_id AND rm.version_id = fr.roster_version_id
+            WHERE fr.organization_id = ${organizationId}
+              AND fr.roster_version_id = ${version.id}
+              AND rm.enrollment_state = 'active'
+              AND fri.project_id = rm.project_id
           ) r
           WHERE r.rn <= 30
         )`,
       )
       .orderBy(desc(fleetRunItems.completedAt), desc(fleetRunItems.id));
 
-    // Query 4: Snapshots for this approved roster version bounded by series-aware window function (Sol Round 24 P2-07)
+    // Query 4: Snapshots for this approved roster version bounded by series-aware window function (Sol Round 24 P2-07, R24-12)
     const rawSnapshots = await db
       .select({
         id: fleetSnapshots.id,
@@ -256,7 +260,14 @@ export const FleetRepository = {
             FROM fleet_snapshots fs
             JOIN fleet_run_items fri ON fri.id = fs.run_item_id
             JOIN fleet_runs fr ON fr.id = fri.run_id
-            WHERE fr.organization_id = ${organizationId} AND fr.roster_version_id = ${version.id}
+            JOIN fleet_roster_members rm ON rm.id = fs.member_id AND rm.version_id = fr.roster_version_id
+            WHERE fr.organization_id = ${organizationId}
+              AND fr.roster_version_id = ${version.id}
+              AND fs.member_id = fri.member_id
+              AND fs.project_id = fri.project_id
+              AND fs.project_id = rm.project_id
+              AND rm.enrollment_state = 'active'
+              AND lower(trim(fs.canonical_host)) = lower(trim(rm.canonical_host))
           ) s
           WHERE s.rn <= 30
         )`,

@@ -220,17 +220,26 @@ const normalizeRoute = (urlOrPath: string): string => {
   let s = urlOrPath
     .split("#")[0]
     .split("?")[0]
-    .replace(/^https?:\/\//, "");
+    .replace(/^https?:\/\//i, "");
   const slashIdx = s.indexOf("/");
   if (slashIdx === -1) {
-    return s.toLowerCase();
+    return `${s.toLowerCase()}/`;
   }
   const host = s.slice(0, slashIdx).toLowerCase();
   let path = s.slice(slashIdx);
+  const hasTrailingSlash = path.length > 1 && path.endsWith("/");
   try {
     path = decodeURI(path);
   } catch {}
-  path = path.replace(/\/+$/, "");
+  path = path.replace(/\/+/g, "/");
+  if (path === "/") {
+    return `${host}/`;
+  }
+  if (hasTrailingSlash && !path.endsWith("/")) {
+    path = path + "/";
+  } else if (!hasTrailingSlash && path.endsWith("/")) {
+    path = path.slice(0, -1);
+  }
   return `${host}${path}`;
 };
 
@@ -772,8 +781,14 @@ async function auditRepository(
         .pipeThrough(capBytes(100 * 1024 * 1024, "compressed archive"))
         .pipeThrough(decompressGzipStream())
         .pipeThrough(capBytes(250 * 1024 * 1024, "expanded archive"));
-      const decompressed = await streamToBuffer(tarStream);
-      archiveHtmlMap = parseTarHtmlFiles(decompressed);
+      let decompressed: Buffer | null = await streamToBuffer(tarStream);
+      const candidatePaths = new Set(candidateFiles.map((f) => f.path));
+      archiveHtmlMap = parseTarHtmlFiles(
+        decompressed,
+        10 * 1024 * 1024,
+        candidatePaths,
+      );
+      decompressed = null; // Sol R24-06: release expanded archive buffer immediately
       console.log(
         `[ARCHIVE] Extracted ${archiveHtmlMap.size} HTML files from archive in memory.`,
       );
@@ -1860,6 +1875,8 @@ async function main() {
       archive: { type: "boolean" },
       "max-pages": { type: "string", short: "m", default: "10000" },
       "roster-id": { type: "string" },
+      "expected-repo": { type: "string" },
+      "expected-root": { type: "string" },
       remote: { type: "boolean", default: true },
       local: { type: "boolean", default: false },
     },
@@ -2059,8 +2076,10 @@ async function main() {
 
   let unmappedCount = 0;
   let reusedCount = 0;
+  let candidateDomains: string[] = [];
 
   if (targetDomain) {
+    candidateDomains = [targetDomain];
     const approvedMember = approvedMembersByHost.get(targetDomain);
     let projId: string | undefined;
     let repoName: string | undefined;
@@ -2115,6 +2134,31 @@ async function main() {
     if (!projId || !repoName) {
       console.error(
         `[ERROR] Domain '${targetDomain}' is not found among enrolled projects or repository mappings.`,
+      );
+      process.exit(1);
+    }
+
+    // Sol R24-08: Assert bound single-target plan tuple if provided
+    const expectedRepo = args.values["expected-repo"]
+      ? String(args.values["expected-repo"]).trim()
+      : undefined;
+    const expectedRoot = args.values["expected-root"]
+      ? normalizeGitRelativePath(String(args.values["expected-root"]).trim())
+      : undefined;
+
+    if (expectedRepo && repoName !== expectedRepo) {
+      console.error(
+        `[ERROR] TARGET_BINDING_MISMATCH: Planned repository '${expectedRepo}' does not match live mapping '${repoName}' for domain '${targetDomain}'.`,
+      );
+      process.exit(1);
+    }
+
+    if (
+      expectedRoot &&
+      normalizeGitRelativePath(publishRoot) !== expectedRoot
+    ) {
+      console.error(
+        `[ERROR] TARGET_BINDING_MISMATCH: Planned publish root '${expectedRoot}' does not match live root '${normalizeGitRelativePath(publishRoot)}' for domain '${targetDomain}'.`,
       );
       process.exit(1);
     }
@@ -2182,7 +2226,7 @@ async function main() {
       });
     }
   } else {
-    const candidateDomains = (
+    candidateDomains = (
       !isWorkspace && effectiveRoster
         ? Array.from(approvedHosts)
         : Array.from(new Set([...approvedHosts, ...repoMappings.keys()]))
@@ -2372,7 +2416,16 @@ async function main() {
   console.log(`  - Discovery failures: ${discoveryFailures}`);
   console.log(`======================================================`);
 
-  if (failCount > 0 || discoveryFailures > 0) {
+  const executedOrReused = successCount + reusedCount;
+  if (
+    failCount > 0 ||
+    discoveryFailures > 0 ||
+    (targetDomain && executedOrReused === 0) ||
+    (!targetDomain &&
+      candidateDomains.length > 0 &&
+      executedOrReused === 0 &&
+      unmappedCount > 0)
+  ) {
     process.exit(1);
   }
 }

@@ -58,6 +58,7 @@
  */
 import { readFileSync } from "node:fs";
 import process from "node:process";
+import { parseArgs as parseCliArgs } from "node:util";
 import {
   getTableColumns,
   getTableName,
@@ -71,7 +72,7 @@ import { getTableConfig as getSqliteTableConfig } from "drizzle-orm/sqlite-core"
 import { getTableConfig as getPgTableConfig } from "drizzle-orm/pg-core";
 import { drizzle as drizzlePg } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
-import { loadLocalEnv, parseArgs } from "./cli-utils";
+import { loadLocalEnv } from "./cli-utils";
 // The Node-safe raw barrels (not ../src/db/schema, the provider-aware one, which
 // imports cloudflare:workers). Importing the barrels keeps the table list in sync
 // automatically if a schema file is later added.
@@ -80,16 +81,74 @@ import * as pgSchema from "../src/db/pg/schema";
 
 loadLocalEnv();
 
-const args = parseArgs(process.argv.slice(2));
-const dryRun = args["dry-run"] === "true";
-const allowNonEmpty = args["allow-nonempty"] === "true";
-const pageSize = Number(args["page-size"]) || 5000;
+let parsedArgs;
+try {
+  parsedArgs = parseCliArgs({
+    args: process.argv.slice(2),
+    options: {
+      "dry-run": { type: "boolean", default: false },
+      "allow-nonempty": { type: "boolean", default: false },
+      "page-size": { type: "string", default: "5000" },
+      update: { type: "boolean", default: false },
+      "since-hours": { type: "string", default: "12" },
+      table: { type: "string" },
+      help: { type: "boolean", default: false },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+} catch (err: any) {
+  console.error(`Invalid CLI arguments: ${err?.message || err}`);
+  process.exit(1);
+}
+
+if (parsedArgs.values.help) {
+  console.log(`Usage: pnpm exec tsx scripts/migrate-d1-to-postgres.ts [flags]
+Flags:
+  --dry-run         Report D1 row counts only; write nothing.
+  --allow-nonempty  Proceed even if the target already has rows (default: abort).
+  --page-size N     Rows per D1 API page (default 5000, 1..50000).
+  --update          Delta/catch-up sync: only rows changed within the window (default 12h).
+  --since-hours N   Window for --update (default 12, positive number <= 8760).
+  --table <name>    Migrate single table only.
+  --help            Show this help text.`);
+  process.exit(0);
+}
+
+const dryRun = parsedArgs.values["dry-run"] ?? false;
+const allowNonEmpty = parsedArgs.values["allow-nonempty"] ?? false;
+const updateMode = parsedArgs.values.update ?? false;
+
+const rawPageSize = Number(parsedArgs.values["page-size"]);
+if (
+  !Number.isSafeInteger(rawPageSize) ||
+  rawPageSize < 1 ||
+  rawPageSize > 50000
+) {
+  console.error(
+    `Invalid --page-size: '${parsedArgs.values["page-size"]}'. Must be an integer between 1 and 50000.`,
+  );
+  process.exit(1);
+}
+const pageSize = rawPageSize;
+
+const rawSinceHours = Number(parsedArgs.values["since-hours"]);
+if (
+  !Number.isFinite(rawSinceHours) ||
+  rawSinceHours <= 0 ||
+  rawSinceHours > 8760
+) {
+  console.error(
+    `Invalid --since-hours: '${parsedArgs.values["since-hours"]}'. Must be a positive number <= 8760.`,
+  );
+  process.exit(1);
+}
+const sinceHours = rawSinceHours;
+
 // Tables whose rows are big enough that the default page size would build a
 // multi-gigabyte D1 HTTP response and a multi-gigabyte INSERT. `reports.html`
 // is capped at REPORT_MAX_HTML_BYTES (500 KB) per row.
 const PAGE_SIZE_OVERRIDES: Record<string, number> = { reports: 20 };
-const updateMode = args["update"] === "true";
-const sinceHours = Number(args["since-hours"]) || 12;
 
 const accountId = process.env.CLOUDFLARE_ACCOUNT_ID;
 const apiToken = process.env.CLOUDFLARE_API_TOKEN;
@@ -100,6 +159,24 @@ const connectionString = process.env.POSTGRES_DATABASE_URL;
 // matches this pattern, so it is left untouched.
 const SPACE_TIMESTAMP = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/u;
 const toIsoText = (value: string) => `${value.replace(" ", "T")}.000Z`;
+
+// Sol R24-03: Restrict ISO text conversion strictly to known timestamp columns
+// so business text (like page titles or descriptions) is never corrupted.
+const TIMESTAMP_COLUMN_NAMES = new Set([
+  "created_at",
+  "updated_at",
+  "started_at",
+  "completed_at",
+  "observed_at",
+  "approved_at",
+  "archived_at",
+  "last_active_at",
+  "expires_at",
+  "verified_at",
+  "checked_at",
+  "dispatched_at",
+  "fetched_at",
+]);
 
 function resolveDatabaseId(): string {
   const override = process.env.CLOUDFLARE_D1_DATABASE_ID?.trim();
@@ -299,7 +376,12 @@ function convertRow(
       continue;
     }
     let value = column.mapFromDriverValue(raw);
-    if (typeof value === "string" && SPACE_TIMESTAMP.test(value)) {
+    // Sol R24-03: Only normalize timestamps on known timestamp columns to preserve business text
+    if (
+      TIMESTAMP_COLUMN_NAMES.has(column.name) &&
+      typeof value === "string" &&
+      SPACE_TIMESTAMP.test(value)
+    ) {
       value = toIsoText(value);
     }
     out[jsKey] = value;

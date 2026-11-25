@@ -135,6 +135,7 @@ async function main() {
         concurrency: { type: "string", short: "c", default: "2" },
         domain: { type: "string", short: "d" },
         "roster-id": { type: "string" },
+        "expected-project": { type: "string" },
         "max-pages": { type: "string", short: "m", default: "500" },
         "skip-recent": { type: "boolean", default: true },
         "no-skip-recent": { type: "boolean", default: false },
@@ -317,6 +318,16 @@ async function main() {
     if (candidates.length > 1) {
       console.error(
         `[ERROR] Ambiguous domain binding: multiple active projects (${candidates.length}) found for '${targetDomainFilter}'.`,
+      );
+      process.exit(1);
+    }
+    // Sol R24-08: Assert bound single-target plan project ID if provided
+    const expectedProject = args.values["expected-project"]
+      ? String(args.values["expected-project"]).trim()
+      : undefined;
+    if (expectedProject && candidates[0].id !== expectedProject) {
+      console.error(
+        `[ERROR] TARGET_BINDING_MISMATCH: Planned project ID '${expectedProject}' does not match live project ID '${candidates[0].id}' for domain '${targetDomainFilter}'.`,
       );
       process.exit(1);
     }
@@ -611,7 +622,12 @@ async function main() {
   console.log(`Skipped (Reservation Busy): ${skippedBusyCount}`);
   console.log(`Active Remaining: ${activeAudits.size}`);
   console.log(`Undispatched Remaining: ${undispatched.length}`);
-  if (failedCount > 0 || activeAudits.size > 0 || undispatched.length > 0) {
+  if (
+    failedCount > 0 ||
+    activeAudits.size > 0 ||
+    undispatched.length > 0 ||
+    (targetDomainFilter && completedCount === 0)
+  ) {
     process.exitCode = 1;
   }
 }

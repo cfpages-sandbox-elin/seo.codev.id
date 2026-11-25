@@ -19,8 +19,14 @@ export function sanitizeNoscript(html: string): string {
       continue;
     }
 
-    if (/^<script\b/i.test(html.slice(i, i + 8))) {
-      let endOpen = i + 7;
+    // 2. Raw text & RCDATA elements: <script>, <style>, <textarea>, <title>, <xmp> (Sol R24-04)
+    // Their contents are NOT parsed as HTML tags, so any "<noscript>" inside them is inert/literal text
+    const rawMatch = /^<(script|style|textarea|title|xmp)\b/i.exec(
+      html.slice(i, i + 10),
+    );
+    if (rawMatch) {
+      const tagName = rawMatch[1].toLowerCase();
+      let endOpen = i + rawMatch[0].length;
       let inQuote: string | null = null;
       while (endOpen < len) {
         const ch = html[endOpen];
@@ -37,23 +43,27 @@ export function sanitizeNoscript(html: string): string {
         result += html.slice(i);
         break;
       }
-      const scriptCloseMatch = /<\/script\s*>/i.exec(html.slice(endOpen + 1));
-      if (!scriptCloseMatch) {
+      const closeRegex = new RegExp(`</${tagName}\\s*>`, "i");
+      const closeMatch = closeRegex.exec(html.slice(endOpen + 1));
+      if (!closeMatch) {
         result += html.slice(i);
         break;
       }
-      const closeEnd =
-        endOpen + 1 + scriptCloseMatch.index + scriptCloseMatch[0].length;
+      const closeEnd = endOpen + 1 + closeMatch.index + closeMatch[0].length;
       result += html.slice(i, closeEnd);
       i = closeEnd;
       continue;
     }
 
     // 3. Real inert <noscript ...> ... </noscript>
-    if (/^<noscript\b/i.test(html.slice(i, i + 10))) {
+    // Sol R24-04: Must match exact tag delimiter (whitespace, '/', '>', or EOF), NOT <noscript-placeholder>
+    if (/^<noscript(?=[\s/>]|$)/i.test(html.slice(i, i + 10))) {
       const noscriptCloseMatch = /<\/noscript\s*>/i.exec(html.slice(i));
       if (!noscriptCloseMatch) {
-        break;
+        // Sol R24-04: If unclosed, do not discard the rest of document
+        result += html[i];
+        i++;
+        continue;
       }
       i += noscriptCloseMatch.index + noscriptCloseMatch[0].length;
       continue;

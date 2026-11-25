@@ -130,11 +130,11 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 - **Evidence Boundary**: Records source-only evidence. Unmeasured runtime properties (`status_code`, `response_time_ms`, `crawl_depth`) remain `NULL` and `in_sitemap` is `0`. Runtime-only issue reporters (`deep-page`, `slow-response`) are excluded.
 
 ### Runner Scope, Concurrency & Defaults Reference
-| Runner | Default Pages | Max Pages | Concurrency | Scope Flags | Operational Availability |
-|---|---|---|---|---|---|
-| **Edge HTTP Runner** (`scripts/run-fleet-audits.ts`) | 500 | 10,000 | 2 (1–5) | Exactly one of `--domain`, `--all`, or `--limit`; optional `--roster-id` | Shipped live production crawler |
-| **Repository Direct Runner** (`scripts/run-github-fleet-audit.ts`) | 10,000 | 10,000 | Host-side paced | Optional `--domain`, `--limit`, `--workspace` | Shipped diagnostic source audit |
-| **Weekly Fleet Baseline Publisher** | N/A | N/A | Scheduled | Fleet-wide | External scheduled service consuming `fleetCalculations.ts` contracts |
+| Runner | Default Pages | Max Pages | Concurrency | Scope Flags | Scope Modifiers & Options | Operational Availability |
+|---|---|---|---|---|---|---|
+| **Edge HTTP Runner** (`scripts/run-fleet-audits.ts`) | 500 | 10,000 | 2 (1–5) | Exactly one of `--domain <host>`, `--all`, or `--limit <n>` | `--roster-id <id>`, `--no-skip-recent`, `--concurrency <n>`, `--expected-project <id>` | Shipped live production crawler |
+| **Repository Direct Runner** (`scripts/run-github-fleet-audit.ts`) | 10,000 | 10,000 | Host-side paced | Exactly one of `--domain <host>`, `--all`, or `--limit <n>` | `--workspace` (audits wider inventory; conflicts with `--roster-id`), `--roster-id <id>`, `--force`, `--archive`, `--expected-repo <slug>`, `--expected-root <path>` | Shipped diagnostic source audit |
+| **Weekly Fleet Baseline Publisher** | N/A | N/A | Scheduled | Fleet-wide | External scheduled service consuming `fleetCalculations.ts` contracts | Dedicated background grading publisher |
 
 **Database Migration & Cutover Runbooks**:
 - Simple D1 to PostgreSQL Migration: [d1-to-postgres-simple.md](file:///C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/docs/maintainers/runbooks/d1-to-postgres-simple.md)
@@ -152,7 +152,16 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 
 ### Playbook 1: Roster Enrollment & Turnkey Linking
 **Prerequisites & Environment Architecture**:
-- **Organization Bootstrap Prerequisite**: The parent organization row (`id = 'shared-workspace'`) must exist in D1 before importing rosters to satisfy foreign key constraints. Note that the normal local delegated authentication session resolves to a per-user personal organization (`user_<id>`); MCP callers without `shared-workspace` will receive an organization constraint error when calling fleet tools. For local fleet development, use the direct local CLI or provision a fixture session with `shared-workspace`.
+- **Organization Bootstrap & Authentication Lanes**:
+  Fleet operations strictly require organization ID `'shared-workspace'`. The operational authentication lanes are:
+  - **Lane 1: Cloudflare Access Google SSO (Primary Live Lane)**:
+    Access edge sets browser session cookie (`CF_Authorization`) and passes signed `Cf-Access-Jwt-Assertion` header to the worker. `resolveCloudflareAccessContext()` validates claims (`iss`, `aud`, `sub`, `email`), resolving organization `'shared-workspace'` with implicit `owner` role.
+  - **Lane 2: Headless CLI & Raw Token Authentication**:
+    Direct CLI operations run host-side via `gh` CLI credentials (or `GITHUB_TOKEN`) and Wrangler D1 credentials (`CLOUDFLARE_API_TOKEN`).
+  - **Lane 3: Hosted Multi-Tenant Mode**:
+    Per-request API key or OAuth session dynamically looks up user membership and organization permissions in the database.
+  - **Local No-Auth Boundary**:
+    `resolveLocalNoAuthContext()` in `local_noauth` mode resolves user `'local-admin'` and organization `'delegated-local-admin'`. Because fleet tools enforce `organizationId === "shared-workspace"`, switching to local no-auth mode alone leaves fleet MCP tools unavailable. To test fleet tools locally, run via direct local CLI (`--local`) or configure test fixtures with `'shared-workspace'`.
 - **Three-Role Execution Topology**:
   - **Role 1 (App HTTP / MCP)**: Vite dev server on port `3001` (`pnpm run dev`) or app Wrangler dev serving UI routes and `/mcp`.
   - **Role 2 (Auxiliary Audit Worker)**: Auxiliary worker on port `8787` (`pnpm exec wrangler dev --config wrangler.audit.jsonc --local --port 8787`) managing Cloudflare Workflows and the local Workflows control API. Note that the auxiliary worker returns 404 for general HTTP fetches; its sole purpose is workflow execution.
@@ -332,10 +341,11 @@ Repository results require the newest completed direct audit with qualifying dia
 - **Target Database**: Emitted execution command targets D1 by default (`open-seo-db-selfhost`), even when planner reads from a local PostgreSQL connection.
 ```typescript
 // Query fleet aggregated issues with skill routing (evaluates latest completed audit per active project, partitioned by source)
+// Note: `totalIssues` in the return object represents the returned issue count (bounded by `limit`), NOT the global fleet total.
 // Source lane partitioning:
-// - 'edge': selects newest completed edge audit per project (workflow_instance_id NOT LIKE 'github-audit-%' OR NULL)
-// - 'repository': selects newest completed direct repository audit per project with verified diagnostic lineage in effective roster
-// - 'all' / 'both': selects the union of newest edge audit AND newest repository audit for each active project
+// - 'edge': selects newest completed edge audit per project (workflow_instance_id NOT LIKE 'github-audit-%' OR NULL). Edge coverage spans active workspace projects; an absent approved roster still permits edge evidence.
+// - 'repository': selects newest completed direct repository audit per project with verified diagnostic lineage in effective approved roster.
+// - 'all' / 'both': selects the union of newest edge audit AND newest repository audit for each active project.
 // Limit parameter: default 50, permitted 1–200. Domain must be a valid canonical lowercase hostname (normalized automatically).
 const issuesResult = await client.callTool({
   name: "get_fleet_issues",
@@ -849,16 +859,17 @@ try {
 - **Organization Constraint**: Strictly restricted to `shared-workspace`.
 - **Operator Permission Gate**: `link_fleet_repository` requires `role === "owner"` or `role === "admin"`; callers with `role === "member"` are rejected with unauthorized error.
 - **Workflows**:
-  1. Inspect fleet overview matrix across all 87 enrolled properties:
+  1. Inspect fleet overview matrix across effective roster members:
+     Note: 87 is the default canonical manifest size, but `get_fleet_matrix` queries the currently effective approved roster version in D1 (census is roster-dependent). Members with `enrollment_state === 'excluded'` are omitted from monitoring denominators. Single-domain filtering returns the matching row and `filteredCount: 1` while preserving fleet-wide metric rollups and distributions:
      ```ts
-     // Fetch complete 87-domain overview matrix:
+     // Fetch overview matrix for active approved roster:
      const matrix = await client.callTool({
        name: "get_fleet_matrix",
        arguments: {},
      });
      console.log(`Roster: ${matrix.structuredContent?.rosterVersion}, Total domains: ${matrix.structuredContent?.totalDomains}`);
 
-     // Filter by single domain (returns fleet totals plus filtered count and single-row detail):
+     // Filter by single domain (preserves fleet totals while returning single-row detail):
      const single = await client.callTool({
        name: "get_fleet_matrix",
        arguments: { domain: "kaca.co.id" },
@@ -902,7 +913,7 @@ try {
          limit: 50,
        },
      });
-     console.log("Critical fleet issues:", issues.structuredContent?.totalIssues);
+     console.log("Returned fleet issues count:", issues.structuredContent?.totalIssues);
      ```
 
 ---

@@ -407,4 +407,21 @@ describe("Document effective base resolution & WHATWG semantics", () => {
       "https://example.test/docs/guide",
     ]);
   });
+
+  it("preserves headings and links when textarea contains literal <noscript> (Sol R24-04)", () => {
+    const html =
+      '<textarea><noscript></textarea><h1>Visible</h1><a href="/ok.html">OK</a>';
+    const result = analyzeHtml(html, "https://fixture.example/", 200, 0);
+    expect(result.h1s).toEqual(["Visible"]);
+    expect(result.links.map((l) => l.targetUrl)).toEqual([
+      "https://fixture.example/ok.html",
+    ]);
+  });
+
+  it("does not match <noscript-placeholder> custom elements as inert noscript (Sol R24-04)", () => {
+    const html =
+      "<noscript-placeholder>fallback</noscript-placeholder><h1>Visible</h1>";
+    const result = analyzeHtml(html, "https://fixture.example/", 200, 0);
+    expect(result.h1s).toEqual(["Visible"]);
+  });
 });

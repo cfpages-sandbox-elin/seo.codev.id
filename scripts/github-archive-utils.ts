@@ -530,11 +530,14 @@ export async function acquireVerifiedBlob(
 }
 
 /**
- * Extracts HTML files from an uncompressed in-memory UStar tarball (Sol P1-02).
+ * Extracts HTML files from an uncompressed in-memory UStar tarball (Sol P1-02, R24-06).
+ * Copies entry buffers independently so large tarball allocations can be garbage collected immediately,
+ * and optionally filters to only selected candidate file paths.
  */
 export function parseTarHtmlFiles(
   tarBuf: Buffer,
   maxEntrySize: number = 10 * 1024 * 1024,
+  selectedPaths?: Set<string>,
 ): Map<string, Buffer> {
   const htmlMap = new Map<string, Buffer>();
   let offset = 0;
@@ -594,10 +597,15 @@ export function parseTarHtmlFiles(
     if (
       isRegularFile &&
       size <= maxEntrySize &&
-      (relPath.endsWith(".html") || relPath.endsWith(".htm"))
+      (relPath.endsWith(".html") || relPath.endsWith(".htm")) &&
+      (!selectedPaths || selectedPaths.has(relPath))
     ) {
       if (contentEnd <= tarBuf.length) {
-        htmlMap.set(relPath, tarBuf.subarray(contentStart, contentEnd));
+        // Sol R24-06: Copy into isolated Buffer so full tarBuf ArrayBuffer can be released
+        htmlMap.set(
+          relPath,
+          Buffer.from(tarBuf.subarray(contentStart, contentEnd)),
+        );
       }
     }
 
