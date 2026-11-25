@@ -22,6 +22,7 @@ import {
   decompressGzipStream,
   discoverGitHubTree,
   acquireVerifiedBlob,
+  normalizeGitRelativePath,
 } from "./github-archive-utils";
 
 const ENV_FILE = resolve(".env.selfhost");
@@ -84,8 +85,8 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
   const treeItems = discovered.tree;
   console.log(`Pinned commit: ${commitSha.slice(0, 10)} (${defaultBranch})`);
 
-  const prefix =
-    publishRoot === "." ? "" : publishRoot.replace(/^\/+|\/+$/g, "") + "/";
+  const normalizedRoot = normalizeGitRelativePath(publishRoot);
+  const prefix = normalizedRoot === "." ? "" : normalizedRoot + "/";
   const htmlBlobs = treeItems.filter(
     (item: any) =>
       item.type === "blob" &&
@@ -203,7 +204,12 @@ export async function runBenchmark(repoName: string, publishRoot = ".") {
   const expandedArchiveBytes = decompressed.length;
   const tDecompress_lane2 = performance.now();
 
-  const rawArchiveMap = parseTarHtmlFiles(decompressed);
+  const candidatePathSet = new Set(htmlBlobs.map((f: any) => f.path));
+  const rawArchiveMap = parseTarHtmlFiles(
+    decompressed,
+    10 * 1024 * 1024,
+    candidatePathSet,
+  );
 
   // Sol F12: Filter extracted archive candidates strictly by publishRoot before comparing maps so external HTML files do not fail parity.
   const lane2Results = new Map<string, Buffer>();

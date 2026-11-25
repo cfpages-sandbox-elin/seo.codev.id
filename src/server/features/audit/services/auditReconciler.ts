@@ -3,10 +3,9 @@
  * Cloudflare Workflow instance.
  */
 import { env } from "cloudflare:workers";
-import { and, asc, eq, isNotNull, isNull, not, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { db } from "@/db";
-import { audits, projects } from "@/db/schema";
-import { getDatabaseProvider } from "@/db/provider";
+import { projects } from "@/db/schema";
 import { AuditRepository } from "@/server/features/audit/repositories/AuditRepository";
 import { parseUtcTimestampMs } from "@/server/features/fleet/services/fleetConstants";
 import {
@@ -15,10 +14,10 @@ import {
 } from "@/server/lib/audit/audit-errors";
 import { captureServerEvent } from "@/server/lib/posthog";
 import {
+  findIrregularRunningAudits,
+  getStaleRunningAudits,
   loadPersistedCursor,
-  pgTimeExpr,
   savePersistedCursor,
-  sqliteTimeExpr,
   type LoadedCursorState,
   type WatchdogCursor,
 } from "./auditWatchdogCursor";
@@ -35,8 +34,43 @@ type RunningAudit = {
   currentPhase: string | null;
 };
 
-let sweepCursor: WatchdogCursor = null;
+let irregularCursorId: string | null = null;
 let sweepInFlight = false;
+let currentSweepToken = 0;
+
+function withTickTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  label: string,
+): Promise<T> {
+  if (timeoutMs <= 0) {
+    return Promise.reject(
+      new Error(`Watchdog tick budget exhausted before ${label}`),
+    );
+  }
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+  return new Promise<T>((resolve, reject) => {
+    timerId = setTimeout(
+      () =>
+        reject(
+          new Error(
+            `Watchdog ${label} exceeded remaining tick budget (${timeoutMs}ms)`,
+          ),
+        ),
+      timeoutMs,
+    );
+    promise.then(
+      (value) => {
+        if (timerId !== undefined) clearTimeout(timerId);
+        resolve(value);
+      },
+      (err) => {
+        if (timerId !== undefined) clearTimeout(timerId);
+        reject(err);
+      },
+    );
+  });
+}
 
 /**
  * If the audit's workflow instance is dead (errored/terminated) or gone,
@@ -117,38 +151,46 @@ export async function reconcileRunningAudit(
   }
   if (!errorInfo) return null;
 
-  const didFail = await AuditRepository.failAudit(
-    audit.id,
-    audit.workflowInstanceId,
-    {
+  const didFail = await withTickTimeout(
+    AuditRepository.failAudit(audit.id, audit.workflowInstanceId, {
       ...errorInfo,
       failedPhase: audit.currentPhase,
-    },
+    }),
+    probeTimeoutMs,
+    "failAudit",
   );
   return didFail ? errorInfo : null;
 }
 
-/** Cron watchdog: sweep stale running audits and reconcile each within a single total tick deadline. */
+/** Cron watchdog: sweep stale running audits and reconcile each within a strict total tick deadline (Sol R4, R5). */
 export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
   if (sweepInFlight) {
     console.warn("[WATCHDOG] Overlapping tick suppressed.");
     return;
   }
   sweepInFlight = true;
+  const myToken = ++currentSweepToken;
   const deadline = Date.now() + TICK_BUDGET_MS;
   const remainingMs = () => Math.max(0, deadline - Date.now());
+  const isActive = () => myToken === currentSweepToken && remainingMs() > 0;
 
-  try {
+  const runSweep = async () => {
     const isManualOverride = overrideCursor !== undefined;
     const cutoff = new Date(Date.now() - STALE_RUNNING_AFTER_MS);
     const loaded: LoadedCursorState = isManualOverride
       ? { kind: "persisted", cursor: overrideCursor, revision: -1 }
-      : await loadPersistedCursor();
+      : await withTickTimeout(
+          loadPersistedCursor(),
+          remainingMs(),
+          "loadPersistedCursor",
+        );
 
-    if (loaded.kind === "read_error") {
-      console.warn(
-        "[WATCHDOG] Failed to read persisted cursor state; skipping cursor sweep this cycle.",
-      );
+    if (!isActive() || loaded.kind === "read_error") {
+      if (loaded.kind === "read_error") {
+        console.warn(
+          "[WATCHDOG] Failed to read persisted cursor state; skipping cursor sweep this cycle.",
+        );
+      }
       return;
     }
 
@@ -158,29 +200,35 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
 
     if (remainingMs() < 2_000) return;
 
-    // 1. Bounded sweep of legacy null-instance or non-canonical/invalid timestamp rows
-    await reconcileIrregularRunningAudits(cutoff, remainingMs);
+    // 1. Progressing cursor sweep of legacy null-instance or non-canonical/invalid timestamp rows
+    await reconcileIrregularRunningAudits(cutoff, remainingMs, isActive);
 
-    if (remainingMs() < 2_000) return;
+    if (!isActive() || remainingMs() < 2_000) return;
 
     // 2. Index-backed keyset sweep of canonical ISO-Z running audits (matching audits_running_keyset_idx)
-    let stale = await getStaleRunningAudits(
-      cutoff,
-      WATCHDOG_BATCH_LIMIT,
-      activeCursor,
+    let stale = await withTickTimeout(
+      getStaleRunningAudits(cutoff, WATCHDOG_BATCH_LIMIT, activeCursor),
+      remainingMs(),
+      "getStaleRunningAudits",
     );
+    if (!isActive()) return;
 
     if (stale.length === 0 && activeCursor !== null) {
       activeCursor = null;
       if (remainingMs() >= 2_000) {
-        stale = await getStaleRunningAudits(cutoff, WATCHDOG_BATCH_LIMIT, null);
+        stale = await withTickTimeout(
+          getStaleRunningAudits(cutoff, WATCHDOG_BATCH_LIMIT, null),
+          remainingMs(),
+          "getStaleRunningAuditsWrap",
+        );
       }
     }
+    if (!isActive()) return;
 
     let processedAll = true;
     for (let i = 0; i < stale.length; i += 5) {
       const budgetLeft = remainingMs();
-      if (budgetLeft < 3_000) {
+      if (!isActive() || budgetLeft < 3_000) {
         console.warn(
           "Audit watchdog: tick deadline approaching, stopping batch early",
         );
@@ -192,53 +240,65 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
         Math.max(500, budgetLeft - 2_000),
       );
       const group = stale.slice(i, i + 5);
-      await Promise.allSettled(
-        group.map(async (audit) => {
-          try {
-            const errorInfo = await reconcileRunningAudit(
-              audit,
-              groupProbeTimeout,
-            );
-            if (!errorInfo) return;
+      await withTickTimeout(
+        Promise.allSettled(
+          group.map(async (audit) => {
+            try {
+              const errorInfo = await reconcileRunningAudit(
+                audit,
+                groupProbeTimeout,
+              );
+              if (!errorInfo || !isActive()) return;
 
-            console.log(
-              `Audit watchdog: marked ${audit.id} failed (${errorInfo.errorCode}, phase=${audit.currentPhase})`,
-            );
-            const project = await db.query.projects.findFirst({
-              where: eq(projects.id, audit.projectId),
-            });
-            if (!project) return;
-            captureServerEvent({
-              distinctId: audit.startedByUserId,
-              event: "site_audit:complete",
-              organizationId: project.organizationId,
-              properties: {
-                project_id: audit.projectId,
-                status: "failed",
-                reconciled_by: "watchdog",
-                error_code: errorInfo.errorCode,
-                pages_crawled: audit.pagesCrawled,
-                pages_total: audit.pagesTotal,
-              },
-            }).catch(() => {});
-          } catch (error) {
-            console.error(
-              `Audit watchdog: failed to reconcile ${audit.id}:`,
-              error,
-            );
-          }
-        }),
+              console.log(
+                `Audit watchdog: marked ${audit.id} failed (${errorInfo.errorCode}, phase=${audit.currentPhase})`,
+              );
+              const project = await withTickTimeout(
+                db.query.projects.findFirst({
+                  where: eq(projects.id, audit.projectId),
+                }),
+                remainingMs(),
+                "lookupProject",
+              );
+              if (!project || !isActive()) return;
+              captureServerEvent({
+                distinctId: audit.startedByUserId,
+                event: "site_audit:complete",
+                organizationId: project.organizationId,
+                properties: {
+                  project_id: audit.projectId,
+                  status: "failed",
+                  reconciled_by: "watchdog",
+                  error_code: errorInfo.errorCode,
+                  pages_crawled: audit.pagesCrawled,
+                  pages_total: audit.pagesTotal,
+                },
+              }).catch(() => {});
+            } catch (error) {
+              console.error(
+                `Audit watchdog: failed to reconcile ${audit.id}:`,
+                error,
+              );
+            }
+          }),
+        ),
+        remainingMs(),
+        "reconcileGroup",
       );
 
-      if (!isManualOverride && remainingMs() >= 500) {
+      if (!isManualOverride && isActive() && remainingMs() >= 500) {
         const last = group[group.length - 1];
         const nextCursor: WatchdogCursor = {
           startedAt: last.startedAt,
           id: last.id,
         };
-        const saved = await savePersistedCursor(nextCursor, currentRevision);
+        const saved = await withTickTimeout(
+          savePersistedCursor(nextCursor, currentRevision),
+          remainingMs(),
+          "savePersistedCursor",
+        );
+        if (!isActive()) return;
         if (saved.result === "applied") {
-          sweepCursor = nextCursor;
           currentRevision = saved.revision ?? currentRevision;
         } else {
           console.warn(
@@ -252,125 +312,100 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
 
     if (
       !isManualOverride &&
+      isActive() &&
       processedAll &&
       remainingMs() >= 500 &&
       (stale.length === 0 || stale.length < WATCHDOG_BATCH_LIMIT)
     ) {
-      const wrapped = await savePersistedCursor(null, currentRevision);
-      if (wrapped.result === "applied") {
-        sweepCursor = null;
-      }
+      await withTickTimeout(
+        savePersistedCursor(null, currentRevision),
+        remainingMs(),
+        "wrapPersistedCursor",
+      );
+    }
+  };
+
+  try {
+    await withTickTimeout(runSweep(), TICK_BUDGET_MS, "sweep");
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("Watchdog")) {
+      console.warn(err.message);
+    } else {
+      throw err;
     }
   } finally {
-    sweepInFlight = false;
+    if (myToken === currentSweepToken) {
+      currentSweepToken++;
+      sweepInFlight = false;
+    }
   }
 }
 
 async function reconcileIrregularRunningAudits(
   cutoff: Date,
   remainingMs: () => number,
+  isActive: () => boolean,
 ) {
-  const isPg = getDatabaseProvider() === "postgres";
-  const isNullOrInvalid = isPg
-    ? sql`(${audits.workflowInstanceId} IS NULL OR ${pgTimeExpr(audits.startedAt)} IS NULL OR ${audits.startedAt} !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$')`
-    : sql`(${audits.workflowInstanceId} IS NULL OR ${sqliteTimeExpr(audits.startedAt)} IS NULL OR NOT (${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'))`;
-
   try {
-    const irregular = await db.query.audits.findMany({
-      where: and(eq(audits.status, "running"), isNullOrInvalid),
-      orderBy: isPg
-        ? [sql`${audits.id} COLLATE "C" ASC`]
-        : [sql`${audits.id} COLLATE BINARY ASC`],
-      limit: 10,
-      columns: {
-        id: true,
-        workflowInstanceId: true,
-        startedAt: true,
-        currentPhase: true,
-      },
-    });
+    let irregular = await withTickTimeout(
+      findIrregularRunningAudits(10, irregularCursorId),
+      remainingMs(),
+      "findIrregularAudits",
+    );
+    if (!isActive()) return;
+
+    if (irregular.length === 0 && irregularCursorId !== null) {
+      irregularCursorId = null;
+      if (remainingMs() >= 2_000) {
+        irregular = await withTickTimeout(
+          findIrregularRunningAudits(10, null),
+          remainingMs(),
+          "findIrregularAuditsWrap",
+        );
+      }
+    }
+    if (!isActive()) return;
 
     for (const row of irregular) {
-      if (remainingMs() < 3_000) break;
+      if (!isActive() || remainingMs() < 3_000) break;
       if (!row.workflowInstanceId) {
         const parsedMs = parseUtcTimestampMs(row.startedAt);
         if (!Number.isFinite(parsedMs) || parsedMs < cutoff.getTime()) {
-          await AuditRepository.failAudit(row.id, null, {
-            errorCode: "instance_lost",
-            errorDetail: "Legacy running audit has null workflow instance ID",
-            failedPhase: row.currentPhase,
-          });
+          await withTickTimeout(
+            AuditRepository.failAudit(row.id, null, {
+              errorCode: "instance_lost",
+              errorDetail: "Legacy running audit has null workflow instance ID",
+              failedPhase: row.currentPhase,
+            }),
+            remainingMs(),
+            "failIrregularNullInstance",
+          );
         }
         continue;
       }
-      // Valid legacy space-UTC or unpadded ISO string: fail only if invalid or past cutoff
       const parsedMs = parseUtcTimestampMs(row.startedAt);
       if (!Number.isFinite(parsedMs)) {
-        await AuditRepository.failAudit(row.id, row.workflowInstanceId, {
-          errorCode: "invalid_started_at",
-          errorDetail: "Running audit has malformed started_at timestamp",
-          failedPhase: row.currentPhase,
-        });
+        await withTickTimeout(
+          AuditRepository.failAudit(row.id, row.workflowInstanceId, {
+            errorCode: "invalid_started_at",
+            errorDetail: "Running audit has malformed started_at timestamp",
+            failedPhase: row.currentPhase,
+          }),
+          remainingMs(),
+          "failIrregularInvalidStartedAt",
+        );
       } else if (parsedMs < cutoff.getTime()) {
         await reconcileRunningAudit(row, Math.min(3_000, remainingMs()));
       }
     }
+
+    if (isActive()) {
+      irregularCursorId =
+        irregular.length === 10 ? irregular[irregular.length - 1].id : null;
+    }
   } catch (err) {
     console.error("Audit watchdog: irregular-row sweep failed:", err);
   }
-}
-
-async function getStaleRunningAudits(
-  cutoff: Date,
-  limit: number,
-  cursor: WatchdogCursor = sweepCursor,
-) {
-  const isPg = getDatabaseProvider() === "postgres";
-  const edgeCutoffIso = cutoff.toISOString();
-  const repoCutoffIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-
-  // Strictly canonical 24-char .mmmZ rows match audits_running_keyset_idx (started_at, id) without temp sort.
-  const canonicalFormat = isPg
-    ? sql`${audits.startedAt} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$'`
-    : sql`${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'`;
-
-  const stalenessPredicate = isPg
-    ? sql`((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${audits.startedAt} < ${edgeCutoffIso}) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${audits.startedAt} < ${repoCutoffIso}))`
-    : sql`((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${audits.startedAt} < ${edgeCutoffIso}) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${audits.startedAt} < ${repoCutoffIso}))`;
-
-  const cursorPredicate = cursor
-    ? isPg
-      ? sql`(${audits.startedAt} COLLATE "C" > ${cursor.startedAt} COLLATE "C" OR (${audits.startedAt} = ${cursor.startedAt} AND ${audits.id} COLLATE "C" > ${cursor.id} COLLATE "C"))`
-      : sql`(${audits.startedAt} > ${cursor.startedAt} OR (${audits.startedAt} = ${cursor.startedAt} AND ${audits.id} > ${cursor.id}))`
-    : undefined;
-
-  return db.query.audits.findMany({
-    where: and(
-      eq(audits.status, "running"),
-      isNotNull(audits.workflowInstanceId),
-      not(isNull(audits.startedAt)),
-      canonicalFormat,
-      stalenessPredicate,
-      cursorPredicate,
-    ),
-    orderBy: isPg
-      ? [
-          sql`${audits.startedAt} COLLATE "C" ASC`,
-          sql`${audits.id} COLLATE "C" ASC`,
-        ]
-      : [asc(audits.startedAt), asc(audits.id)],
-    columns: {
-      id: true,
-      workflowInstanceId: true,
-      projectId: true,
-      startedByUserId: true,
-      startedAt: true,
-      currentPhase: true,
-      pagesCrawled: true,
-      pagesTotal: true,
-    },
-    limit,
-  });
 }
 
 function isOlderThan(startedAt: string, ageMs: number): boolean {

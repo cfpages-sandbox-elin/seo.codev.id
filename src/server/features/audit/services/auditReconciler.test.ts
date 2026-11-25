@@ -302,4 +302,54 @@ describe("auditReconciler", () => {
     expect(finalRow?.startedAt).toBeNull();
     expect(finalRow?.auditId).toBeNull();
   });
+
+  it("advances irregular running cursor across ticks past healthy space-format rows without starvation (Sol R5)", async () => {
+    mockGet.mockClear();
+    dbHoisted.cursorRow = {
+      id: "singleton",
+      startedAt: null,
+      auditId: null,
+      revision: 2,
+    };
+    const freshSpace = new Date(Date.now() - 60_000)
+      .toISOString()
+      .replace("T", " ")
+      .slice(0, 19);
+    const staleSpace = new Date(Date.now() - 3600_000)
+      .toISOString()
+      .replace("T", " ")
+      .slice(0, 19);
+
+    // Tick 1: irregular batch returns 10 fresh healthy space rows -> cursor advances past row 10
+    const firstTen = Array.from({ length: 10 }, (_, idx) => ({
+      id: `irr_${String(idx).padStart(2, "0")}`,
+      workflowInstanceId: `wf_${idx}`,
+      projectId: "proj_1",
+      startedByUserId: "user_1",
+      startedAt: freshSpace,
+      currentPhase: "crawling",
+      pagesCrawled: 0,
+      pagesTotal: 10,
+    }));
+    // Tick 2: next irregular batch returns the 11th stale row whose workflow instance is gone
+    const eleventhRow = {
+      id: "irr_10",
+      workflowInstanceId: "wf_10_lost",
+      projectId: "proj_1",
+      startedByUserId: "user_1",
+      startedAt: staleSpace,
+      currentPhase: "crawling",
+      pagesCrawled: 0,
+      pagesTotal: 10,
+    };
+
+    dbHoisted.auditBatches = [firstTen, [], [eleventhRow], []];
+    mockGet.mockRejectedValueOnce(new Error("Workflow instance not found"));
+
+    await reconcileStaleAudits();
+    expect(mockGet).not.toHaveBeenCalled();
+
+    await reconcileStaleAudits();
+    expect(mockGet).toHaveBeenCalledWith("wf_10_lost");
+  });
 });

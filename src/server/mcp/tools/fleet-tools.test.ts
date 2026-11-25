@@ -1,10 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import {
-  getFleetIssuesTool,
-  getFleetMatrixTool,
-  linkFleetRepositoryTool,
-  runFleetAuditTool,
-} from "./fleet-tools";
+import { getFleetIssuesTool, runFleetAuditTool } from "./fleet-tools";
 import { makeToolContext } from "./tool-test-support";
 
 const hoisted = vi.hoisted(() => ({
@@ -285,6 +280,31 @@ describe("Fleet MCP Tools", () => {
         expect(data.executionCommand).toContain(
           "'--expected-root' 'release notes/owner''s copy'",
         );
+        expect(data.shell).toBe("pwsh");
+        expect(data.selection).toBe("bound");
+        expect(data.binding?.publishRoot).toBe("release notes/owner's copy");
+        expect(data.directNodeExecutable).toBe("node");
+        expect(data.directNodeArgv[0]).toBe("./node_modules/tsx/dist/cli.mjs");
+        expect(data.directNodeArgv).toContain("release notes/owner's copy");
+      } finally {
+        hoisted.memberPublishRoot = prevRoot;
+      }
+    });
+
+    it("encodes Unicode smart single quotes and embedded double quotes safely for PowerShell + native Node (Sol T2)", async () => {
+      const prevRoot = hoisted.memberPublishRoot;
+      hoisted.memberPublishRoot = 'folder/curly\u2019quote/a"b';
+      try {
+        const result = await runFleetAuditTool.handler(
+          { mode: "repository_direct", domain: "kaca.co.id", maxPages: 500 },
+          toolContext,
+        );
+        const data = runFleetAuditTool.config.outputSchema.parse(
+          result.structuredContent,
+        );
+        expect(data.directNodeArgv).toContain('folder/curly\u2019quote/a"b');
+        expect(data.executionCommand).toContain("[char]0x2019");
+        expect(data.executionCommand).not.toContain("\u2019");
       } finally {
         hoisted.memberPublishRoot = prevRoot;
       }
@@ -303,124 +323,6 @@ describe("Fleet MCP Tools", () => {
       } finally {
         hoisted.provider = prevProvider;
       }
-    });
-  });
-
-  describe("link_fleet_repository", () => {
-    it("validates canonical domain input in link_fleet_repository schema", () => {
-      const schema = linkFleetRepositoryTool.config.inputSchema;
-      expect(schema.domain.safeParse("a.id").success).toBe(true);
-      expect(schema.domain.safeParse("kaca.co.id").success).toBe(true);
-      expect(schema.domain.safeParse("-invalid.com").success).toBe(false);
-      expect(schema.domain.safeParse("https://kaca.co.id").success).toBe(false);
-    });
-
-    it("rejects non-operator caller with member role (Sol Round 22 F03)", async () => {
-      const memberContext = makeToolContext({
-        organizationId: "shared-workspace",
-        role: "member",
-      });
-      await expect(
-        linkFleetRepositoryTool.handler(
-          {
-            domain: "kaca.co.id",
-            repoName: "cfpages-syamsulalam-net/kaca-co-id",
-          },
-          memberContext,
-        ),
-      ).rejects.toThrow(
-        /linking fleet repositories requires 'owner' or 'admin' role/,
-      );
-    });
-
-    it("rejects caller outside shared-workspace organization", async () => {
-      const foreignContext = makeToolContext({
-        organizationId: "foreign_org",
-        role: "owner",
-      });
-      await expect(
-        linkFleetRepositoryTool.handler(
-          {
-            domain: "kaca.co.id",
-            repoName: "cfpages-syamsulalam-net/kaca-co-id",
-          },
-          foreignContext,
-        ),
-      ).rejects.toThrow(/shared-workspace/);
-    });
-
-    it("rejects invalid canonical domain in handler", async () => {
-      await expect(
-        linkFleetRepositoryTool.handler(
-          {
-            domain: "-invalid.com",
-            repoName: "cfpages-syamsulalam-net/kaca-co-id",
-          },
-          toolContext,
-        ),
-      ).rejects.toThrow(/Invalid canonical hostname/);
-    });
-
-    it("successfully links repository mapping in effective roster (Sol Round 24 P1-02)", async () => {
-      const res = await linkFleetRepositoryTool.handler(
-        {
-          domain: "kaca.co.id",
-          repoName: "cfpages-syamsulalam-net/kaca-co-id",
-          publishRoot: "dist",
-        },
-        toolContext,
-      );
-      expect(res.structuredContent).toBeDefined();
-      expect(res.structuredContent.status).toBe("linked");
-      expect(res.structuredContent.publishRoot).toBe("dist");
-    });
-
-    it("returns unchanged when mapping matches active member in effective roster (Sol Round 24 P1-02)", async () => {
-      const res = await linkFleetRepositoryTool.handler(
-        {
-          domain: "kaca.co.id",
-          repoName: "cfpages-syamsulalam-net/kaca-co-id",
-        },
-        toolContext,
-      );
-      expect(res.structuredContent).toBeDefined();
-      expect(res.structuredContent.status).toBe("unchanged");
-      expect(res.structuredContent.publishRoot).toBe(".");
-    });
-
-    it("handles normalized equivalent trailing-slash publishRoot via raw column CAS comparison (Sol V4-07)", async () => {
-      const prevRoot = hoisted.memberPublishRoot;
-      hoisted.memberPublishRoot = "public/";
-      try {
-        const res = await linkFleetRepositoryTool.handler(
-          {
-            domain: "kaca.co.id",
-            repoName: "cfpages-syamsulalam-net/kaca-co-id",
-            publishRoot: "public",
-          },
-          toolContext,
-        );
-        expect(res.structuredContent.status).toBe("unchanged");
-        expect(res.structuredContent.publishRoot).toBe("public");
-      } finally {
-        hoisted.memberPublishRoot = prevRoot;
-      }
-    });
-  });
-
-  describe("get_fleet_matrix", () => {
-    it("validates canonical domain input in get_fleet_matrix schema", () => {
-      const schema = getFleetMatrixTool.config.inputSchema;
-      expect(schema.domain.safeParse("a.id").success).toBe(true);
-      expect(schema.domain.safeParse("kaca.co.id").success).toBe(true);
-      expect(schema.domain.safeParse("-invalid.com").success).toBe(false);
-    });
-
-    it("rejects caller outside shared-workspace organization", async () => {
-      const foreignContext = makeToolContext({ organizationId: "foreign_org" });
-      await expect(
-        getFleetMatrixTool.handler({}, foreignContext),
-      ).rejects.toThrow(/shared-workspace/);
     });
   });
 });

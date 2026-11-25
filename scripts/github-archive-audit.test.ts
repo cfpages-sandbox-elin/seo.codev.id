@@ -43,7 +43,9 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
       });
 
       const capped = stream.pipeThrough(capBytes(100, "compressed archive"));
-      await expect(streamToBuffer(capped)).rejects.toThrow(/compressed archive exceeds byte limit/);
+      await expect(streamToBuffer(capped)).rejects.toThrow(
+        /compressed archive exceeds byte limit/,
+      );
     });
   });
 
@@ -68,11 +70,15 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
         .update(pinnedBytes)
         .digest("hex");
 
-      expect(() => verifyGitBlob(wrongBytes, pinnedSha)).toThrow(/Git blob identity mismatch/);
+      expect(() => verifyGitBlob(wrongBytes, pinnedSha)).toThrow(
+        /Git blob identity mismatch/,
+      );
     });
 
     it("rejects malformed SHA format", () => {
-      expect(() => verifyGitBlob(Buffer.from("test"), "not-a-valid-sha")).toThrow(/Invalid Git blob ID/);
+      expect(() =>
+        verifyGitBlob(Buffer.from("test"), "not-a-valid-sha"),
+      ).toThrow(/Invalid Git blob ID/);
     });
   });
 
@@ -111,7 +117,9 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
 
       expect(result.size).toBe(1);
       expect(result.has("index.html")).toBe(true);
-      expect(result.get("index.html")?.toString("utf8")).toBe("<h1>Hello OpenSEO</h1>");
+      expect(result.get("index.html")?.toString("utf8")).toBe(
+        "<h1>Hello OpenSEO</h1>",
+      );
     });
   });
 
@@ -161,11 +169,29 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
       const versions = [{ id: "v_future", approved_at: "2026-11-25 00:00:00" }];
       expect(selectEffectiveRosterVersion(versions, nowMs)).toBeNull();
     });
+
+    it("breaks identical timestamps by UTF-8 BINARY/C order across ASCII and supplementary Unicode (Sol R2)", () => {
+      const asciiTie = [
+        { id: "Z", approved_at: "2026-11-22T10:00:00.000Z" },
+        { id: "a", approved_at: "2026-11-22T10:00:00.000Z" },
+      ];
+      expect(selectEffectiveRosterVersion(asciiTie, nowMs)?.id).toBe("a");
+
+      // U+10000 (UTF-8 F0 90 80 80) > U+E000 (UTF-8 EE 80 80) in UTF-8 byte order despite U+10000 < U+E000 in UTF-16 code units
+      const utf8Tie = [
+        { id: "\uE000", approved_at: "2026-11-22T10:00:00.000Z" },
+        { id: "\u{10000}", approved_at: "2026-11-22T10:00:00.000Z" },
+      ];
+      expect(selectEffectiveRosterVersion(utf8Tie, nowMs)?.id).toBe(
+        "\u{10000}",
+      );
+    });
   });
 
   describe("analyzeHtml link truncation detection (Sol P2-03)", () => {
     it("reports truncatedLinks=false on ordinary pages with <1,000 links", () => {
-      const html = "<html><body><a href='/about'>About</a><a href='/contact'>Contact</a></body></html>";
+      const html =
+        "<html><body><a href='/about'>About</a><a href='/contact'>Contact</a></body></html>";
       const result = analyzeHtml(html, "https://example.com/", 200, 50);
       expect(result.truncatedLinks).toBe(false);
       expect(result.links.length).toBe(2);
@@ -173,8 +199,14 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
 
     it("does NOT trip truncatedLinks on duplicate anchors after 1,000 distinct links (Sol P2-02)", () => {
       // 1,000 unique links + 10 duplicate links of the first target
-      const uniqueLinks = Array.from({ length: 1000 }, (_, i) => `<a href="/page-${i}">Link ${i}</a>`).join("\n");
-      const duplicates = Array.from({ length: 10 }, () => `<a href="/page-0">Duplicate</a>`).join("\n");
+      const uniqueLinks = Array.from(
+        { length: 1000 },
+        (_, i) => `<a href="/page-${i}">Link ${i}</a>`,
+      ).join("\n");
+      const duplicates = Array.from(
+        { length: 10 },
+        () => `<a href="/page-0">Duplicate</a>`,
+      ).join("\n");
       const html = `<html><body>${uniqueLinks}\n${duplicates}</body></html>`;
       const result = analyzeHtml(html, "https://example.com/", 200, 50);
       expect(result.truncatedLinks).toBe(false);
@@ -182,7 +214,10 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
     });
 
     it("reports truncatedLinks=true when unique links exceed MAX_EXTRACTED_LINKS (1,000)", () => {
-      const links = Array.from({ length: 1005 }, (_, i) => `<a href="/page-${i}">Link ${i}</a>`).join("\n");
+      const links = Array.from(
+        { length: 1005 },
+        (_, i) => `<a href="/page-${i}">Link ${i}</a>`,
+      ).join("\n");
       const html = `<html><body>${links}</body></html>`;
       const result = analyzeHtml(html, "https://example.com/", 200, 50);
       expect(result.truncatedLinks).toBe(true);

@@ -217,20 +217,28 @@ async function d1Query<T = Record<string, unknown>>(
       ),
     },
   );
-  const json = (await response.json()) as {
+  let json: {
     success?: boolean;
     errors?: unknown;
     result?: { success?: boolean; results?: T[] }[];
   };
+  try {
+    json = (await response.json()) as typeof json;
+  } catch {
+    throw new Error(
+      `D1_QUERY_FAILED: malformed JSON response (HTTP ${response.status})`,
+    );
+  }
   if (
     !response.ok ||
+    !json ||
     json.success !== true ||
     !Array.isArray(json.result) ||
-    json.result.length === 0 ||
-    json.result[0]?.success === false ||
+    json.result.length !== 1 ||
+    json.result[0]?.success !== true ||
     !Array.isArray(json.result[0]?.results)
   ) {
-    throw new Error(`D1_QUERY_FAILED: ${JSON.stringify(json.errors ?? json)}`);
+    throw new Error(`D1_QUERY_FAILED: ${JSON.stringify(json?.errors ?? json)}`);
   }
   return json.result[0].results;
 }
@@ -413,11 +421,20 @@ async function countD1(
   predicate?: string | null,
 ): Promise<number> {
   const where = predicate ? ` WHERE ${predicate}` : "";
-  const [row] = await d1Query<{ c: number }>(
+  const rows = await d1Query<{ c: number | string }>(
     databaseId,
     `SELECT count(*) AS c FROM "${table}"${where}`,
   );
-  return Number(row?.c ?? 0);
+  if (rows.length !== 1 || rows[0]?.c === undefined || rows[0]?.c === null) {
+    throw new Error(`D1_COUNT_FAILED: missing count row for table '${table}'`);
+  }
+  const parsed = Number(rows[0].c);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(
+      `D1_COUNT_FAILED: invalid count value '${String(rows[0].c)}' for table '${table}'`,
+    );
+  }
+  return parsed;
 }
 
 type PgDb = ReturnType<typeof drizzlePg>;
@@ -509,18 +526,28 @@ async function copyTable(
     const rows = page.map((row: Record<string, unknown>) =>
       convertRow(sqliteTable, row),
     );
+    const { target, set } = buildUpsert(pgTable, keyCols);
+    // T4: Protect PostgreSQL watchdog_cursor ownership after cutover via strict monotonic revision guard
+    const setWhere =
+      name === "watchdog_cursor"
+        ? sql.raw('"watchdog_cursor"."revision" < excluded."revision"')
+        : undefined;
     for (let i = 0; i < rows.length; i += insertBatch) {
       const chunk = rows.slice(i, i + insertBatch);
       const inserted = await (canUpsert
         ? dest
             .insert(pgTable)
             .values(chunk)
-            .onConflictDoUpdate({ target, set })
+            .onConflictDoUpdate({
+              target,
+              set,
+              ...(setWhere ? { setWhere } : {}),
+            })
             .returning()
         : dest.insert(pgTable).values(chunk).onConflictDoNothing().returning());
       appliedCount += inserted.length;
 
-      // V3-04: When conflict skips occur (e.g. --allow-nonempty), verify surviving destination payload equals source row
+      // V3-04: When conflict skips occur (e.g. --allow-nonempty or monotonic cursor skip), verify destination state
       if (inserted.length < chunk.length && keyCols.length > 0) {
         for (const expectedRow of chunk) {
           const keyPredicates = keyCols
@@ -536,11 +563,18 @@ async function copyTable(
               .from(pgTable)
               .where(sql.join(keyPredicates, sql` AND `))
               .limit(1);
+            if (destRows.length === 0) {
+              contentMismatches++;
+              continue;
+            }
+            const destRow = destRows[0] as Record<string, unknown>;
             if (
-              destRows.length === 0 ||
-              stableRowDigest(destRows[0] as Record<string, unknown>) !==
-                stableRowDigest(expectedRow)
+              name === "watchdog_cursor" &&
+              Number(destRow.revision ?? 0) >= Number(expectedRow.revision ?? 0)
             ) {
+              continue;
+            }
+            if (stableRowDigest(destRow) !== stableRowDigest(expectedRow)) {
               contentMismatches++;
             }
           }

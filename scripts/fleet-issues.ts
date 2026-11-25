@@ -140,7 +140,7 @@ export async function getAggregatedFleetIssues(options: {
   }
 
   const repoDiagnosticProof = effectiveRosterId
-    ? `EXISTS (
+    ? `((SELECT COUNT(*) FROM fleet_run_items fri_all WHERE fri_all.audit_id = a.id AND fri_all.primary_series_key = 'diagnostic') = 1 AND EXISTS (
         SELECT COUNT(*) FROM fleet_roster_members m
         JOIN fleet_run_items fri ON fri.audit_id = a.id AND fri.member_id = m.id AND fri.project_id = p.id AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed'
         JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = p.organization_id AND fr.status = 'completed'
@@ -172,7 +172,7 @@ export async function getAggregatedFleetIssues(options: {
             AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
           ELSE 0 END
         HAVING COUNT(DISTINCT fr.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1
-      )`
+      ))`
     : "(1 = 0)";
 
   const sourceFilterCondition =

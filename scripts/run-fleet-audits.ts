@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import { parseArgs } from "node:util";
 import {
+  buildSqliteEffectiveRosterSql,
   executeD1SqlBatches,
   isValidCanonicalHostname,
   selectEffectiveRosterVersion,
@@ -338,6 +339,9 @@ async function main() {
       typeof r.last_audited_epoch === "number" ? r.last_audited_epoch : null,
   }));
 
+  let ambiguousExcludedCount = 0;
+  let recentSkippedCount = 0;
+
   if (targetDomainFilter) {
     candidates = candidates.filter(
       (c) => c.domain.toLowerCase() === targetDomainFilter,
@@ -383,14 +387,19 @@ async function main() {
       seenDomains.add(d);
     }
     if (ambiguousDomains.size > 0) {
+      ambiguousExcludedCount = candidates.filter((c) =>
+        ambiguousDomains.has(c.domain.toLowerCase()),
+      ).length;
       console.warn(
-        `[WARNING] Excluding ${ambiguousDomains.size} ambiguous domains with duplicate project bindings: ${Array.from(ambiguousDomains).join(", ")}`,
+        `[WARNING] Excluding ${ambiguousDomains.size} ambiguous domain(s) (${ambiguousExcludedCount} project row(s)) with duplicate bindings: ${Array.from(ambiguousDomains).join(", ")}`,
       );
       candidates = candidates.filter(
         (c) => !ambiguousDomains.has(c.domain.toLowerCase()),
       );
     }
   }
+
+  const eligiblePreRecencyCount = candidates.length;
 
   const shouldSkipRecent = args.values["no-skip-recent"]
     ? false
@@ -399,12 +408,14 @@ async function main() {
     const tenDaysAgoEpoch = Math.floor(
       (Date.now() - 10 * 24 * 60 * 60 * 1000) / 1000,
     );
+    const beforeFilter = candidates.length;
     candidates = candidates.filter(
       (c) =>
         c.lastAuditedEpoch === null ||
         c.lastAuditedEpoch === undefined ||
         c.lastAuditedEpoch < tenDaysAgoEpoch,
     );
+    recentSkippedCount = beforeFilter - candidates.length;
   }
 
   if (limit) {
@@ -553,7 +564,7 @@ async function main() {
           `[DISPATCH] Launching audit on ${project.domain} (${startUrl}) [ID: ${auditId}]`,
         );
 
-        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits and asserts complete expected tuple (Sol V1-01)
+        // 1. Insert audit row in D1 conditionally — prevents concurrent edge audits and asserts complete expected tuple (Sol V1-01, R1, R5)
         const insertSql = `
           INSERT INTO audits (
             id, project_id, started_by_user_id, start_url,
@@ -563,7 +574,7 @@ async function main() {
           SELECT
             ${sqlText(auditId)}, ${sqlText(project.id)}, 'system', ${sqlText(startUrl)},
             ${sqlText(auditId)}, ${sqlText(JSON.stringify(config))}, 'running', 0,
-            ${maxPages}, 20, 'discovery', datetime('now')
+            ${maxPages}, 20, 'discovery', ${sqlText(new Date().toISOString())}
           WHERE NOT EXISTS (
             SELECT 1 FROM audits
             WHERE project_id = ${sqlText(project.id)} AND status = 'running'
@@ -585,14 +596,7 @@ async function main() {
                      AND rm.enrollment_state = 'active'
                      AND lower(trim(rm.canonical_host)) = ${sqlText(cleanHost)}
                      ${expectedMember ? `AND rm.id = ${sqlText(expectedMember)}` : ""}
-                     AND rv.id = (
-                       SELECT id FROM fleet_roster_versions
-                       WHERE organization_id = 'shared-workspace'
-                         AND approved_at IS NOT NULL
-                         AND julianday(approved_at) <= julianday('now')
-                       ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
-                       LIMIT 1
-                     )
+                     AND rv.id = ${buildSqliteEffectiveRosterSql("'shared-workspace'")}
                  )`
               : ""
           }
@@ -653,7 +657,7 @@ async function main() {
           console.error(
             `[ERROR] Confirmed dispatch rejection for ${project.domain}: ${dispatch.message}`,
           );
-          const failSql = `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = 'discovery', error_code = 'DISPATCH_ERROR', completed_at = datetime('now') WHERE id = '${auditId}' AND status = 'running' RETURNING id;`;
+          const failSql = `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = 'discovery', error_code = 'DISPATCH_ERROR', completed_at = ${sqlText(new Date().toISOString())} WHERE id = ${sqlText(auditId)} AND status = 'running' RETURNING id;`;
           const failedRows = runD1Query(failSql, isRemote);
           if (!failedRows || failedRows.length === 0) {
             console.warn(
@@ -677,7 +681,10 @@ async function main() {
 
   const undispatched = candidates.slice(queueIndex);
   console.log("\n=== Fleet Audit Run Finished ===");
-  console.log(`Total Candidates: ${candidates.length}`);
+  console.log(`Eligible Pre-Recency Candidates: ${eligiblePreRecencyCount}`);
+  console.log(`Ambiguous Domain Exclusions: ${ambiguousExcludedCount}`);
+  console.log(`Skipped (Recent Within 10d): ${recentSkippedCount}`);
+  console.log(`Total Candidates Dispatched: ${candidates.length}`);
   console.log(`Total Completed: ${completedCount}`);
   console.log(`Total Failed: ${failedCount}`);
   console.log(`Skipped (Reservation Busy): ${skippedBusyCount}`);
@@ -689,8 +696,20 @@ async function main() {
     bindingConflictCount +
     activeAudits.size +
     undispatched.length +
-    skippedBusyCount;
-  if (incomplete > 0 || (targetDomainFilter && completedCount === 0)) {
+    skippedBusyCount +
+    ambiguousExcludedCount;
+  const emptyBulkPopulation =
+    !targetDomainFilter && eligiblePreRecencyCount === 0;
+  if (emptyBulkPopulation) {
+    console.error(
+      "[ERROR] Bulk fleet audit had 0 eligible candidates before recency filtering.",
+    );
+  }
+  if (
+    incomplete > 0 ||
+    emptyBulkPopulation ||
+    (targetDomainFilter && completedCount === 0)
+  ) {
     process.exitCode = 1;
   }
 }

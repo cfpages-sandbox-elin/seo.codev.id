@@ -159,21 +159,47 @@ export async function importApprovedRoster(
 
     const domainToProjectMap = new Map<string, string>();
     const ambiguousHosts = new Set<string>();
+    const legacyNonCanonicalProjects: Array<{
+      id: string;
+      rawDomain: string;
+      strippedHost: string;
+    }> = [];
     for (const p of orgProjects) {
       if (p.domain) {
-        const norm = p.domain
-          .trim()
-          .toLowerCase()
+        const canonical = p.domain.trim().toLowerCase();
+        const stripped = canonical
           .replace(/^https?:\/\//, "")
           .replace(/\/+$/, "");
-        if (
-          domainToProjectMap.has(norm) &&
-          domainToProjectMap.get(norm) !== p.id
-        ) {
-          ambiguousHosts.add(norm);
-        } else {
-          domainToProjectMap.set(norm, p.id);
+        if (canonical !== stripped) {
+          legacyNonCanonicalProjects.push({
+            id: p.id,
+            rawDomain: p.domain,
+            strippedHost: stripped,
+          });
+          continue;
         }
+        if (
+          domainToProjectMap.has(canonical) &&
+          domainToProjectMap.get(canonical) !== p.id
+        ) {
+          ambiguousHosts.add(canonical);
+        } else {
+          domainToProjectMap.set(canonical, p.id);
+        }
+      }
+    }
+
+    const rosterLegacyMatches = legacyNonCanonicalProjects.filter(
+      (legacy) =>
+        FLEET_MANIFEST_MEMBERS.some(
+          (m) => m.canonicalHost.trim().toLowerCase() === legacy.strippedHost,
+        ) && !domainToProjectMap.has(legacy.strippedHost),
+    );
+    if (rosterLegacyMatches.length > 0) {
+      for (const leg of rosterLegacyMatches) {
+        console.warn(
+          `[WARN] Leaving manifest host '${leg.strippedHost}' unlinked: project '${leg.id}' stores non-canonical domain '${leg.rawDomain}' (expected canonical hostname without scheme/slash).`,
+        );
       }
     }
 

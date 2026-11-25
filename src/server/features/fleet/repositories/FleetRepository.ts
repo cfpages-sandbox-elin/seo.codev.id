@@ -11,7 +11,12 @@ import {
   projects,
 } from "@/db/schema";
 import { AppError } from "@/server/lib/errors";
-import { parseUtcTimestampMs } from "../services/fleetConstants";
+import {
+  compareUtf8Binary,
+  parseUtcTimestampMs,
+  pgUtcTimeSql,
+  sqliteUtcTimeSql,
+} from "../services/fleetConstants";
 
 export type RawFleetMember = typeof fleetRosterMembers.$inferSelect;
 export type RawFleetSnapshot = typeof fleetSnapshots.$inferSelect;
@@ -35,11 +40,8 @@ type RawFleetSnapshotWithAttempt = RawFleetSnapshot & {
   rubricVersion?: string | null;
 };
 
-const pgSafeTs = (col: string) =>
-  `(CASE WHEN ${col} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$' AND pg_input_is_valid(${col} || '+00', 'timestamptz') THEN (${col} || '+00')::timestamptz WHEN ${col} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$' AND pg_input_is_valid(${col}, 'timestamptz') THEN ${col}::timestamptz ELSE NULL END)`;
-
-const sqliteSafeTs = (col: string) =>
-  `(CASE WHEN ${col} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND ${col} = strftime('%Y-%m-%d %H:%M:%S', ${col}) THEN julianday(${col}) WHEN ${col} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z' AND substr(${col}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${col}, 1, 19)) AND (length(${col}) = 20 OR substr(${col}, 20) GLOB '.[0-9]*Z') AND julianday(${col}) IS NOT NULL THEN julianday(${col}) WHEN ${col} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*[+-][0-9][0-9]:[0-9][0-9]' AND substr(${col}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${col}, 1, 19)) AND julianday(${col}) IS NOT NULL THEN julianday(${col}) ELSE NULL END)`;
+const pgSafeTs = pgUtcTimeSql;
+const sqliteSafeTs = sqliteUtcTimeSql;
 
 interface RawFleetData {
   version: RawFleetVersion;
@@ -107,7 +109,7 @@ export const FleetRepository = {
       const tB = parseUtcTimestampMs(b.approvedAt);
       const diff = (isNaN(tB) ? 0 : tB) - (isNaN(tA) ? 0 : tA);
       if (diff !== 0) return diff;
-      return b.id === a.id ? 0 : b.id > a.id ? 1 : -1;
+      return compareUtf8Binary(b.id, a.id);
     });
 
     return sorted[0] ?? null;
@@ -183,6 +185,14 @@ export const FleetRepository = {
       ? sql`ORDER BY ${fsObservedExpr} DESC NULLS LAST, fs.id COLLATE "C" DESC`
       : sql`ORDER BY ${fsObservedExpr} DESC NULLS LAST, fs.id COLLATE BINARY DESC`;
 
+    const fsPlausibleOfficial = isPg
+      ? sql.raw(
+          `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND fs.grade = (CASE WHEN fs.score >= 90 THEN 'A' WHEN fs.score >= 80 THEN 'B' WHEN fs.score >= 70 THEN 'C' WHEN fs.score >= 60 THEN 'D' ELSE 'F' END) AND ABS((CASE WHEN fs.has_incident_cap THEN LEAST(59, 0.35 * fs.score_technical + 0.15 * fs.score_mobile_perf + 0.10 * fs.score_schema + 0.15 * fs.score_on_page + 0.05 * fs.score_ai_readiness + 0.20 * fs.score_internal_links) ELSE (0.35 * fs.score_technical + 0.15 * fs.score_mobile_perf + 0.10 * fs.score_schema + 0.15 * fs.score_on_page + 0.05 * fs.score_ai_readiness + 0.20 * fs.score_internal_links) END) - fs.score) < 1.001)`,
+        )
+      : sql.raw(
+          `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND fs.grade = (CASE WHEN fs.score >= 90 THEN 'A' WHEN fs.score >= 80 THEN 'B' WHEN fs.score >= 70 THEN 'C' WHEN fs.score >= 60 THEN 'D' ELSE 'F' END) AND ABS((CASE WHEN fs.has_incident_cap = 1 THEN MIN(59, 0.35 * fs.score_technical + 0.15 * fs.score_mobile_perf + 0.10 * fs.score_schema + 0.15 * fs.score_on_page + 0.05 * fs.score_ai_readiness + 0.20 * fs.score_internal_links) ELSE (0.35 * fs.score_technical + 0.15 * fs.score_mobile_perf + 0.10 * fs.score_schema + 0.15 * fs.score_on_page + 0.05 * fs.score_ai_readiness + 0.20 * fs.score_internal_links) END) - fs.score) < 1.001)`,
+        );
+
     const friValidClock = isPg
       ? sql`(${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= ${nowIso}::timestamptz)`
       : sql`(${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= julianday(${nowIso}))`;
@@ -190,6 +200,20 @@ export const FleetRepository = {
     const fsValidClock = isPg
       ? sql`(${fsObservedExpr} IS NOT NULL AND ${fsObservedExpr} <= ${nowIso}::timestamptz AND ${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= ${nowIso}::timestamptz AND ${fsObservedExpr} <= ${friCompletedExpr})`
       : sql`(${fsObservedExpr} IS NOT NULL AND ${fsObservedExpr} <= julianday(${nowIso}) AND ${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= julianday(${nowIso}) AND ${fsObservedExpr} <= ${friCompletedExpr})`;
+
+    const friHasPlausibleOfficial = sql`(
+      fri.status = 'completed'
+      AND fr.rubric_version = 'v1'
+      AND EXISTS (
+        SELECT 1 FROM fleet_snapshots fs
+        WHERE fs.run_item_id = fri.id
+          AND fs.member_id = fri.member_id
+          AND fs.project_id = fri.project_id
+          AND fs.series_key = fri.primary_series_key
+          AND lower(trim(fs.canonical_host)) = lower(trim(rm.canonical_host))
+          AND ${fsPlausibleOfficial}
+      )
+    )`;
 
     const runItems = await db
       .select({
@@ -220,7 +244,10 @@ export const FleetRepository = {
           SELECT r.id FROM (
             SELECT fri.id,
                    ROW_NUMBER() OVER (
-                     PARTITION BY fri.member_id, fri.status, fri.primary_series_key
+                     PARTITION BY fri.member_id,
+                                  fri.status,
+                                  fri.primary_series_key,
+                                  CASE WHEN ${friHasPlausibleOfficial} THEN 1 ELSE 0 END
                      ${friOrder}
                    ) as rn
             FROM fleet_run_items fri
@@ -290,7 +317,8 @@ export const FleetRepository = {
                    ROW_NUMBER() OVER (
                      PARTITION BY fs.member_id,
                                   fs.series_key,
-                                  CASE WHEN fs.coverage = 100 AND fs.score_technical IS NOT NULL THEN 1 ELSE 0 END
+                                  fri.status,
+                                  CASE WHEN ${fsPlausibleOfficial} THEN 1 ELSE 0 END
                      ${fsOrder}
                    ) as rn
             FROM fleet_snapshots fs

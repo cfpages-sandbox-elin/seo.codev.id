@@ -11,6 +11,7 @@ import {
   computeTrendDelta,
   calculateMedian,
   parseUtcTimestampMs,
+  compareUtf8Binary,
   parseIncidentConfirmation,
   computeProvisionalRange,
   type ProvisionalRange,
@@ -348,7 +349,7 @@ export const FleetService = {
         const tB = parseUtcTimestampMs(b.completedAt);
         const diff = (isNaN(tB) ? 0 : tB) - (isNaN(tA) ? 0 : tA);
         if (diff !== 0) return diff;
-        return b.id.localeCompare(a.id);
+        return compareUtf8Binary(b.id, a.id);
       });
 
       const rawSnaps = snapshotsByMember.get(member.id) ?? [];
@@ -357,7 +358,7 @@ export const FleetService = {
         const tB = parseUtcTimestampMs(b.observedAt);
         const diff = (isNaN(tB) ? 0 : tB) - (isNaN(tA) ? 0 : tA);
         if (diff !== 0) return diff;
-        return b.id.localeCompare(a.id);
+        return compareUtf8Binary(b.id, a.id);
       });
 
       const evaluation = evaluateMember(

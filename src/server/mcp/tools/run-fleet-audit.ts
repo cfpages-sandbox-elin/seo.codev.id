@@ -241,8 +241,31 @@ function buildExecutionArgv(options: {
   return argv;
 }
 
+const SMART_SINGLE_QUOTES_RE = /[\u2018\u2019\u201A\u201B]/g;
+
+/**
+ * Encodes an argument cleanly for PowerShell 7+ (`pwsh`), escaping ASCII apostrophes
+ * and decomposing Unicode smart single-quote delimiters via `[char]0xNNNN` concatenation (Sol T2).
+ */
 function quotePowerShell(arg: string): string {
-  return "'" + arg.replaceAll("'", "''") + "'";
+  if (!SMART_SINGLE_QUOTES_RE.test(arg)) {
+    return "'" + arg.replaceAll("'", "''") + "'";
+  }
+  SMART_SINGLE_QUOTES_RE.lastIndex = 0;
+  const parts: string[] = [];
+  let cursor = 0;
+  arg.replace(SMART_SINGLE_QUOTES_RE, (match, offset: number) => {
+    if (offset > cursor) {
+      parts.push("'" + arg.slice(cursor, offset).replaceAll("'", "''") + "'");
+    }
+    parts.push(`[char]0x${match.charCodeAt(0).toString(16)}`);
+    cursor = offset + 1;
+    return match;
+  });
+  if (cursor < arg.length) {
+    parts.push("'" + arg.slice(cursor).replaceAll("'", "''") + "'");
+  }
+  return "(" + parts.join(" + ") + ")";
 }
 
 export const runFleetAuditTool = {
@@ -250,7 +273,7 @@ export const runFleetAuditTool = {
   config: {
     title: "Run fleet audit",
     description:
-      "Plan and configure fleet-wide site audits across enrolled properties in OpenSEO. Read-only planning tool: outputs executable CLI argv and command without launching background processes.",
+      "Plan and configure fleet-wide site audits across enrolled properties in OpenSEO. Read-only planning tool: outputs native Node/tsx argv, pnpm argv, and a PowerShell 7+ display command without launching background processes.",
     inputSchema: runFleetAuditInputSchema,
     outputSchema: z
       .object({
@@ -258,10 +281,25 @@ export const runFleetAuditTool = {
         planId: z.string(),
         organizationId: z.string(),
         mode: z.string(),
+        selection: z.enum(["bound", "deferred"]),
         targetDomain: z.string().nullable().optional(),
+        binding: z
+          .object({
+            rosterId: z.string(),
+            memberId: z.string(),
+            projectId: z.string().nullable(),
+            domain: z.string(),
+            repoName: z.string().nullable(),
+            publishRoot: z.string(),
+          })
+          .passthrough()
+          .nullable(),
         message: z.string(),
+        shell: z.string(),
         executable: z.string(),
         argv: z.array(z.string()),
+        directNodeExecutable: z.string(),
+        directNodeArgv: z.array(z.string()),
         executionCommand: z.string(),
         ...optionalMetaOutputSchema,
       })
@@ -329,6 +367,10 @@ export const runFleetAuditTool = {
       targetProjectId,
     });
 
+    const directNodeArgv = [
+      "./node_modules/tsx/dist/cli.mjs",
+      ...argv.slice(2),
+    ];
     const executionCommand = `& ${["pnpm", ...argv].map(quotePowerShell).join(" ")}`;
     const message = domain
       ? `Fleet audit plan configured for ${domain} in ${mode} mode.`
@@ -340,7 +382,7 @@ export const runFleetAuditTool = {
         planId,
         organizationId: orgId,
         mode,
-        selection: domain ? "bound" : "deferred",
+        selection: domain ? ("bound" as const) : ("deferred" as const),
         targetDomain: domain ?? null,
         binding:
           domain && boundRosterMember
@@ -356,11 +398,14 @@ export const runFleetAuditTool = {
               }
             : null,
         message,
+        shell: "pwsh",
         executable: "pnpm",
         argv,
+        directNodeExecutable: "node",
+        directNodeArgv,
         executionCommand,
       },
-      text: `${message}\nPortable Invocation Contract: executable="pnpm", argv=${JSON.stringify(argv)}\nPowerShell Display Command: \`${executionCommand}\`\nNote: Prefer launching executable with argv directly (no shell). Use the PowerShell command strictly inside PowerShell.`,
+      text: `${message}\nNative Process Contract (shell: false, cross-platform): executable="node", argv=${JSON.stringify(directNodeArgv)}\nPackage Manager Tuple: executable="pnpm", argv=${JSON.stringify(argv)} (Windows resolves pnpm via .cmd/.ps1 shims)\nPowerShell 7+ Display Command (shell="pwsh"): \`${executionCommand}\`\nNote: Windows PowerShell 5.1 strips literal double quotes under Legacy argument passing; prefer directNodeExecutable + directNodeArgv or PowerShell 7+.`,
     });
   },
 };

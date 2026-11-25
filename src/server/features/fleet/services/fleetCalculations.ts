@@ -25,6 +25,7 @@ export {
   FRESHNESS_WINDOW_MS,
   COMPARABLE_BASELINE_WINDOW_MS,
   parseUtcTimestampMs,
+  compareUtf8Binary,
   measuredPercent,
   gradeFor,
   calculateMedian,

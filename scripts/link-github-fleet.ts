@@ -14,6 +14,7 @@ import { resolve } from "node:path";
 import crypto from "node:crypto";
 import { parseArgs } from "node:util";
 import {
+  buildSqliteEffectiveRosterSql,
   selectEffectiveRosterVersion,
   executeD1SqlBatches,
   sqlText,
@@ -193,12 +194,12 @@ export async function linkFleet(options: {
 
   try {
     existingProjects = runD1Query(
-      `SELECT id, domain FROM projects WHERE organization_id = '${orgId}' AND archived_at IS NULL;`,
+      `SELECT id, domain FROM projects WHERE organization_id = ${sqlText(orgId)} AND archived_at IS NULL;`,
       isRemote,
     );
 
     const rosterVersions = runD1Query(
-      `SELECT id, version_tag, approved_at, domain_count, manifest_hash FROM fleet_roster_versions WHERE organization_id = '${orgId}';`,
+      `SELECT id, version_tag, approved_at, domain_count, manifest_hash FROM fleet_roster_versions WHERE organization_id = ${sqlText(orgId)};`,
       isRemote,
     );
     approvedRoster = selectEffectiveRosterVersion(rosterVersions);
@@ -210,7 +211,7 @@ export async function linkFleet(options: {
 
     // Scoped strictly to the approved roster version to prevent mutating historical or foreign versions (P1-1)
     existingMembers = runD1Query(
-      `SELECT id, canonical_host, project_id, version_id, enrollment_state FROM fleet_roster_members WHERE version_id = '${approvedRoster.id}';`,
+      `SELECT id, canonical_host, project_id, version_id, enrollment_state FROM fleet_roster_members WHERE version_id = ${sqlText(approvedRoster.id)};`,
       isRemote,
     );
   } catch (err: any) {
@@ -434,19 +435,12 @@ export async function linkFleet(options: {
            AND v.organization_id = ${sqlText(orgId)}
            AND rm.canonical_host = ${sqlText(p.domain)}
            AND rm.enrollment_state = 'active'
-           AND v.id = (
-             SELECT id FROM fleet_roster_versions
-             WHERE organization_id = ${sqlText(orgId)}
-               AND approved_at IS NOT NULL
-               AND julianday(approved_at) <= julianday('now')
-             ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
-             LIMIT 1
-           )
+           AND v.id = ${buildSqliteEffectiveRosterSql(sqlText(orgId))}
        );`,
     );
   }
 
-  // Scoped UPDATE with live write-time effective version predicate and project resolution (Sol F06, V3-01)
+  // Scoped UPDATE with live write-time effective version predicate and project resolution (Sol F06, V3-01, R1)
   for (const m of membersToLink) {
     sqlStatements.push(`
       UPDATE fleet_roster_members AS m
@@ -457,14 +451,7 @@ export async function linkFleet(options: {
       )
       WHERE m.id = ${sqlText(m.memberId)}
         AND m.version_id = ${sqlText(approvedRoster.id)}
-        AND m.version_id = (
-          SELECT id FROM fleet_roster_versions
-          WHERE organization_id = ${sqlText(orgId)}
-            AND approved_at IS NOT NULL
-            AND julianday(approved_at) <= julianday('now')
-          ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
-          LIMIT 1
-        )
+        AND m.version_id = ${buildSqliteEffectiveRosterSql(sqlText(orgId))}
         AND m.canonical_host = ${sqlText(m.host)}
         AND m.enrollment_state = 'active'
         AND m.project_id IS NULL

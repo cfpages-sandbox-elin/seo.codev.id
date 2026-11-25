@@ -12,6 +12,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import {
+  buildSqliteEffectiveRosterSql,
   executeD1SqlBatches,
   selectEffectiveRosterVersion,
   sqlText,
@@ -64,6 +65,11 @@ export function checkFleetCoverage(options?: {
     return {
       status: "no_effective_roster" as const,
       rosterId: null,
+      declaredMembers: 0,
+      persistedMembers: 0,
+      inactiveMembers: 0,
+      rosterComplete: false,
+      reconciliationOk: false,
       denominator: 0,
       mapped: 0,
       unmapped: 0,
@@ -77,6 +83,13 @@ export function checkFleetCoverage(options?: {
       unauditedList: [],
     };
   }
+
+  const allMemberStatsRows = runD1Query(
+    `SELECT COUNT(*) AS total_persisted FROM fleet_roster_members WHERE version_id = ${sqlText(effectiveRoster.id)};`,
+    isRemote,
+  );
+  const persistedMembers = Number(allMemberStatsRows[0]?.total_persisted ?? 0);
+  const declaredMembers = Number(effectiveRoster.domain_count ?? 0);
 
   // 2. Fetch members of the effective roster version joined with active same-organization projects
   const members = runD1Query(
@@ -185,6 +198,7 @@ export function checkFleetCoverage(options?: {
          WHERE ai.audit_id = a.id AND ai.page_id IS NOT NULL
            AND NOT EXISTS (SELECT 1 FROM audit_pages ap WHERE ap.id = ai.page_id AND ap.audit_id = a.id)
        )
+       AND (SELECT COUNT(*) FROM fleet_run_items fri_all WHERE fri_all.audit_id = a.id AND fri_all.primary_series_key = 'diagnostic') = 1
        AND CASE WHEN json_valid(a.config) THEN
          json_extract(a.config, '$.source') = 'github_repository_direct'
          AND json_extract(a.config, '$.repoName') = rm.repo_name
@@ -252,8 +266,19 @@ export function checkFleetCoverage(options?: {
     }
   }
 
+  const inactiveMembers = Math.max(0, persistedMembers - members.length);
+  const rosterComplete =
+    declaredMembers > 0 && persistedMembers === declaredMembers;
+  const reconciliationOk =
+    both + edgeOnly + repoOnly + neither === members.length;
+
   return {
     rosterId: effectiveRoster.id,
+    declaredMembers,
+    persistedMembers,
+    inactiveMembers,
+    rosterComplete,
+    reconciliationOk,
     denominator: members.length,
     mapped,
     unmapped,
@@ -266,6 +291,19 @@ export function checkFleetCoverage(options?: {
     unmappedList,
     unauditedList,
   };
+}
+
+function failsStrictCoverage(
+  result: ReturnType<typeof checkFleetCoverage>,
+): boolean {
+  return (
+    !result.rosterId ||
+    !result.rosterComplete ||
+    !result.reconciliationOk ||
+    result.denominator === 0 ||
+    result.unmapped > 0 ||
+    result.repoQualified < result.denominator
+  );
 }
 
 async function main() {
@@ -298,13 +336,7 @@ async function main() {
 
   if (args.values.json) {
     console.log(JSON.stringify(result, null, 2));
-    if (
-      isStrict &&
-      (!result.rosterId ||
-        result.denominator === 0 ||
-        result.unmapped > 0 ||
-        result.repoQualified < result.denominator)
-    ) {
+    if (isStrict && failsStrictCoverage(result)) {
       process.exitCode = 1;
     }
     return;
@@ -314,7 +346,10 @@ async function main() {
   console.log("OpenSEO Fleet Coverage & Audit Verification Report");
   console.log("==========================================================");
   console.log(`Effective Roster ID:        ${result.rosterId ?? "None"}`);
-  console.log(`Enrolled Properties (Denom): ${result.denominator}`);
+  console.log(`Declared Roster Members:    ${result.declaredMembers}`);
+  console.log(`Persisted Roster Members:   ${result.persistedMembers}`);
+  console.log(`Inactive / Exempt Members:  ${result.inactiveMembers}`);
+  console.log(`Enrolled Active (Denom):    ${result.denominator}`);
   console.log(`Mapped with Repository:     ${result.mapped}`);
   console.log(`Unmapped (No Repository):   ${result.unmapped}`);
   console.log("----------------------------------------------------------");
@@ -333,13 +368,7 @@ async function main() {
       result.unmappedList.slice(0, 5),
     );
   }
-  if (
-    isStrict &&
-    (!result.rosterId ||
-      result.denominator === 0 ||
-      result.unmapped > 0 ||
-      result.repoQualified < result.denominator)
-  ) {
+  if (isStrict && failsStrictCoverage(result)) {
     process.exitCode = 1;
   }
 }

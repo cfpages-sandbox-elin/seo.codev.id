@@ -414,6 +414,13 @@
       "when": 1795540293285,
       "tag": "0058_typical_riptide",
       "breakpoints": true
+    },
+    {
+      "idx": 59,
+      "version": "6",
+      "when": 1795618618439,
+      "tag": "0059_watchdog_index_and_timestamp_hardening",
+      "breakpoints": true
     }
   ]
 }

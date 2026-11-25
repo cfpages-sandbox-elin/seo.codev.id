@@ -260,6 +260,13 @@
       "when": 1795540300127,
       "tag": "0036_high_imperial_guard",
       "breakpoints": true
+    },
+    {
+      "idx": 37,
+      "version": "7",
+      "when": 1795618618439,
+      "tag": "0037_watchdog_index_and_timestamp_hardening",
+      "breakpoints": true
     }
   ]
 }

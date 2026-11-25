@@ -9,6 +9,10 @@ import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
 import { formatMcpTable, type McpTableColumn } from "@/server/mcp/table";
 import { routeIssueToSkill } from "@/server/lib/audit/issue-routing";
 import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
+import {
+  pgUtcTimeSql,
+  sqliteUtcTimeSql,
+} from "@/server/features/fleet/services/fleetConstants";
 
 const CANONICAL_DOMAIN_REGEX =
   /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i;
@@ -113,15 +117,13 @@ export const getFleetIssuesTool = {
     const source = args.source ?? "all";
     const limit = args.limit ?? 50;
     const isPg = getDatabaseProvider() === "postgres";
-    // Sol R24-02: Guarded UTC timestamp evaluation for PostgreSQL session time-zone and malformed input safety
+    // Sol R24-02, R1: Shared strict UTC timestamp evaluation matching TS parseUtcTimestampMs
     const completedTimeFor = (alias: string) =>
-      isPg
-        ? sql.raw(
-            `(CASE WHEN ${alias}.completed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$' AND pg_input_is_valid(${alias}.completed_at || '+00', 'timestamptz') THEN (${alias}.completed_at || '+00')::timestamptz WHEN ${alias}.completed_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$' AND pg_input_is_valid(${alias}.completed_at, 'timestamptz') THEN (${alias}.completed_at)::timestamptz ELSE NULL END)`,
-          )
-        : sql.raw(
-            `(CASE WHEN (${alias}.completed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND ${alias}.completed_at = strftime('%Y-%m-%d %H:%M:%S', ${alias}.completed_at)) OR (${alias}.completed_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' AND substr(${alias}.completed_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${alias}.completed_at, 1, 19))) THEN julianday(${alias}.completed_at) ELSE NULL END)`,
-          );
+      sql.raw(
+        isPg
+          ? pgUtcTimeSql(`${alias}.completed_at`)
+          : sqliteUtcTimeSql(`${alias}.completed_at`),
+      );
 
     const idDescOrder = (alias: string) =>
       isPg ? `${alias}.id COLLATE "C" DESC` : `${alias}.id COLLATE BINARY DESC`;
@@ -141,7 +143,7 @@ export const getFleetIssuesTool = {
         ? `CASE WHEN (${alias}.config IS NOT NULL AND pg_input_is_valid(${alias}.config, 'jsonb')) THEN (${alias}.config::jsonb ->> 'source') = 'github_repository_direct' AND (${alias}.config::jsonb ->> 'repoName') = m.repo_name AND coalesce(${alias}.config::jsonb ->> 'publishRoot', '.') = coalesce(m.publish_root, '.') AND (${alias}.config::jsonb #>> '{rosterSource,versionId}') = m.version_id AND (${alias}.config::jsonb #>> '{rosterSource,memberId}') = m.id AND (${alias}.config::jsonb #>> '{rosterSource,projectId}') = m.project_id AND lower(trim(${alias}.config::jsonb #>> '{rosterSource,canonicalHost}')) = lower(trim(m.canonical_host)) AND (${alias}.config::jsonb #>> '{rosterSource,repoName}') = m.repo_name AND jsonb_typeof(${alias}.config::jsonb #> '{rosterSource,publishRoot}') = 'string' AND (${alias}.config::jsonb #>> '{rosterSource,publishRoot}') = coalesce(m.publish_root, '.') ELSE false END`
         : `CASE WHEN json_valid(${alias}.config) THEN json_extract(${alias}.config, '$.source') = 'github_repository_direct' AND json_extract(${alias}.config, '$.repoName') = m.repo_name AND coalesce(json_extract(${alias}.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.') AND json_extract(${alias}.config, '$.rosterSource.versionId') = m.version_id AND json_extract(${alias}.config, '$.rosterSource.memberId') = m.id AND json_extract(${alias}.config, '$.rosterSource.projectId') = m.project_id AND lower(trim(json_extract(${alias}.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host)) AND json_extract(${alias}.config, '$.rosterSource.repoName') = m.repo_name AND json_type(${alias}.config, '$.rosterSource.publishRoot') = 'text' AND json_extract(${alias}.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.') ELSE 0 END`;
 
-      return sql`(SELECT ${sql.raw(alias)}.id FROM audits ${sql.raw(alias)} WHERE ${sql.raw(alias)}.project_id = ${projects.id} AND ${sql.raw(alias)}.status = 'completed' AND ${sql.raw(alias)}.workflow_instance_id LIKE 'github-audit-%' AND ${sql.raw(alias)}.pages_total > 0 AND ${sql.raw(alias)}.pages_crawled >= ${sql.raw(alias)}.pages_total AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = ${sql.raw(alias)}.id) >= ${sql.raw(alias)}.pages_total AND NOT EXISTS (SELECT 1 FROM audit_issues ai WHERE ai.audit_id = ${sql.raw(alias)}.id AND ai.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages ap WHERE ap.id = ai.page_id AND ap.audit_id = ${sql.raw(alias)}.id)) AND EXISTS (SELECT COUNT(*) FROM fleet_roster_members m JOIN fleet_run_items fri ON fri.audit_id = ${sql.raw(alias)}.id AND fri.member_id = m.id AND fri.project_id = ${projects.id} AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = ${projects.organizationId} AND fr.status = 'completed' JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = ${projects.id} AND lower(trim(fs.canonical_host)) = lower(trim(m.canonical_host)) AND fs.series_key = 'diagnostic' WHERE m.project_id = ${projects.id} AND lower(trim(m.canonical_host)) = lower(trim(${projects.domain})) AND m.enrollment_state = 'active' AND m.version_id = ${approvedRosterId} AND fr.roster_version_id = ${approvedRosterId} AND m.repo_name IS NOT NULL AND ${sql.raw(configPredicate)} HAVING COUNT(DISTINCT fr.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1) ORDER BY ${completedTimeFor(alias)} DESC NULLS LAST, ${sql.raw(idDescOrder(alias))} LIMIT 1)`;
+      return sql`(SELECT ${sql.raw(alias)}.id FROM audits ${sql.raw(alias)} WHERE ${sql.raw(alias)}.project_id = ${projects.id} AND ${sql.raw(alias)}.status = 'completed' AND ${sql.raw(alias)}.workflow_instance_id LIKE 'github-audit-%' AND ${sql.raw(alias)}.pages_total > 0 AND ${sql.raw(alias)}.pages_crawled >= ${sql.raw(alias)}.pages_total AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = ${sql.raw(alias)}.id) >= ${sql.raw(alias)}.pages_total AND NOT EXISTS (SELECT 1 FROM audit_issues ai WHERE ai.audit_id = ${sql.raw(alias)}.id AND ai.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages ap WHERE ap.id = ai.page_id AND ap.audit_id = ${sql.raw(alias)}.id)) AND (SELECT COUNT(*) FROM fleet_run_items fri_all WHERE fri_all.audit_id = ${sql.raw(alias)}.id AND fri_all.primary_series_key = 'diagnostic') = 1 AND EXISTS (SELECT COUNT(*) FROM fleet_roster_members m JOIN fleet_run_items fri ON fri.audit_id = ${sql.raw(alias)}.id AND fri.member_id = m.id AND fri.project_id = ${projects.id} AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' JOIN fleet_runs fr ON fr.id = fri.run_id AND fr.roster_version_id = m.version_id AND fr.organization_id = ${projects.organizationId} AND fr.status = 'completed' JOIN fleet_snapshots fs ON fs.run_item_id = fri.id AND fs.member_id = m.id AND fs.project_id = ${projects.id} AND lower(trim(fs.canonical_host)) = lower(trim(m.canonical_host)) AND fs.series_key = 'diagnostic' WHERE m.project_id = ${projects.id} AND lower(trim(m.canonical_host)) = lower(trim(${projects.domain})) AND m.enrollment_state = 'active' AND m.version_id = ${approvedRosterId} AND fr.roster_version_id = ${approvedRosterId} AND m.repo_name IS NOT NULL AND ${sql.raw(configPredicate)} HAVING COUNT(DISTINCT fr.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1) ORDER BY ${completedTimeFor(alias)} DESC NULLS LAST, ${sql.raw(idDescOrder(alias))} LIMIT 1)`;
     };
 
     let auditSelectorCondition;

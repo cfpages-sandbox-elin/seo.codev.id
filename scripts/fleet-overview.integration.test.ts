@@ -40,8 +40,14 @@ const changedKey = computeVerifiedComparisonKey({
   canonicalOrigin: host,
   panelHash: "different-panel",
 });
-const migration0056 = readFileSync("drizzle/sqlite/0056_modern_zarda.sql", "utf8");
-const migration0058 = readFileSync("drizzle/sqlite/0058_typical_riptide.sql", "utf8");
+const migration0056 = readFileSync(
+  "drizzle/sqlite/0056_modern_zarda.sql",
+  "utf8",
+);
+const migration0058 = readFileSync(
+  "drizzle/sqlite/0058_typical_riptide.sql",
+  "utf8",
+);
 
 let statements = 0;
 beforeEach(async () => {
@@ -830,4 +836,39 @@ it("F02: rejects security_challenge and undated corroborator from incident cap",
     WHERE id = 'undated-corr'
   `);
   expect(await row()).toMatchObject({ score: null, grade: "ungraded" });
+});
+
+it("R2: aligns terminal attempt tie-breaking with SQL BINARY collation ('a' > 'Z')", async () => {
+  await attempt("Z", "completed", later, { score: 85 });
+  await attempt("a", "failed", later);
+  expect(await row()).toMatchObject({
+    status: "unavailable",
+    score: null,
+    lastGoodScore: 85,
+    lastGoodObservedAt: laterIso,
+  });
+});
+
+it("R3: preserves lastGoodScore across 30+ newer failed and invalid-grade completed weekly observations", async () => {
+  await attempt("baseline-85", "completed", baseline, { score: 85 });
+  const startMs = Date.parse(earlier);
+  // 31 failed weekly attempts with full coverage and valid pillars
+  for (let i = 0; i < 31; i++) {
+    const at = new Date(startMs + i * 1000).toISOString();
+    await attempt(`fail-${i}`, "failed", at, { score: 90 });
+  }
+  // 31 completed weekly attempts with bogus mismatched official score (score 95 vs 30 pillars)
+  for (let i = 0; i < 31; i++) {
+    const at = new Date(Date.parse(laterIso) + i * 1000).toISOString();
+    await attempt(`bad-grade-${i}`, "completed", at, {
+      score: 95,
+      pillarScore: 30,
+    });
+  }
+  expect(await row()).toMatchObject({
+    status: "fresh_partial",
+    score: null,
+    lastGoodScore: 85,
+    lastGoodObservedAt: baseline,
+  });
 });

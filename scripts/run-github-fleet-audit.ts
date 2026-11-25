@@ -32,6 +32,7 @@ import {
   resolveGitHubHead,
   fetchGitHubTree,
   type GitHubHeadDescriptor,
+  buildSqliteEffectiveRosterSql,
   sqlText,
   normalizeGitRelativePath,
   selectEffectiveRosterVersion,
@@ -664,10 +665,18 @@ async function auditRepository(
 
   const candidateFiles = htmlFiles.slice(0, maxPages);
 
-  // Handle stale recovery (> 2 hours old without completion) strictly bounded by live org, host, and roster binding (Sol R3, V1-06)
+  const effectiveRosterSubquery =
+    buildSqliteEffectiveRosterSql("'shared-workspace'");
+  const buildRepoAdmissionClause = (projectColSql: string) =>
+    `EXISTS (SELECT 1 FROM projects p WHERE p.id = ${projectColSql} AND p.archived_at IS NULL AND p.organization_id = 'shared-workspace' AND lower(trim(p.domain)) = lower(trim(${sqlText(domain)})))` +
+    (mapping?.expectedRosterVersionId && mapping?.expectedMemberId
+      ? ` AND EXISTS (SELECT 1 FROM projects p JOIN fleet_roster_members rm ON rm.project_id = p.id AND rm.id = ${sqlText(mapping.expectedMemberId)} JOIN fleet_roster_versions v ON v.id = rm.version_id WHERE p.id = ${projectColSql} AND p.archived_at IS NULL AND p.organization_id = 'shared-workspace' AND rm.enrollment_state = 'active' AND rm.repo_name = ${sqlText(repoName)} AND coalesce(rm.publish_root, '.') = ${sqlText(normalizeGitRelativePath(mapping.publishRoot || "."))} AND rm.version_id = ${sqlText(mapping.expectedRosterVersionId)} AND lower(trim(rm.canonical_host)) = lower(trim(${sqlText(domain)})) AND v.id = ${effectiveRosterSubquery})`
+      : "");
+
+  // Handle stale recovery (> 2 hours old) guarded by the exact same active/roster admission tuple as reservation (Sol R3, V1-06, A2)
   executeD1SqlStatements(
     [
-      `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = ${sqlText(projectId)} AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2 AND EXISTS (SELECT 1 FROM projects p WHERE p.id = audits.project_id AND p.archived_at IS NULL AND p.organization_id = 'shared-workspace' AND lower(trim(p.domain)) = lower(trim(${sqlText(domain)})))${mapping?.expectedRosterVersionId && mapping?.expectedMemberId ? ` AND EXISTS (SELECT 1 FROM fleet_roster_members rm JOIN fleet_roster_versions v ON v.id = rm.version_id WHERE rm.id = ${sqlText(mapping.expectedMemberId)} AND rm.project_id = ${sqlText(projectId)} AND rm.version_id = ${sqlText(mapping.expectedRosterVersionId)} AND rm.enrollment_state = 'active' AND lower(trim(rm.canonical_host)) = lower(trim(${sqlText(domain)})) AND v.organization_id = 'shared-workspace')` : ""};`,
+      `UPDATE audits SET status = 'failed', current_phase = 'failed', failed_phase = CASE WHEN current_phase IS NOT NULL AND current_phase != 'failed' THEN current_phase ELSE 'analyzing' END, error_code = 'runner_timeout', completed_at = CURRENT_TIMESTAMP WHERE project_id = ${sqlText(projectId)} AND status = 'running' AND workflow_instance_id LIKE 'github-audit-%' AND (julianday('now') - julianday(started_at)) * 24 >= 2 AND ${buildRepoAdmissionClause("audits.project_id")};`,
     ],
     isRemote,
   );
@@ -701,7 +710,7 @@ async function auditRepository(
         : null,
   });
 
-  // Reserve audit attempt in D1 conditionally — fails atomically if an active running repository audit already exists (Sol Round 24 P1-03)
+  // Reserve audit attempt in D1 conditionally — fails atomically if an active running repository audit already exists (Sol Round 24 P1-03, A2)
   executeD1SqlStatements(
     [
       `INSERT INTO audits (
@@ -717,37 +726,7 @@ async function auditRepository(
       SELECT 1 FROM audits
       WHERE project_id = ${sqlText(projectId)} AND status = 'running'
     )
-    AND EXISTS (
-      SELECT 1 FROM projects p
-      WHERE p.id = ${sqlText(projectId)}
-        AND p.archived_at IS NULL
-        AND p.organization_id = 'shared-workspace'
-        AND lower(trim(p.domain)) = lower(trim(${sqlText(domain)}))
-    )
-    ${
-      mapping?.expectedRosterVersionId && mapping?.expectedMemberId
-        ? `AND EXISTS (
-             SELECT 1 FROM projects p
-             JOIN fleet_roster_members rm ON rm.project_id = p.id AND rm.id = ${sqlText(mapping.expectedMemberId)}
-             JOIN fleet_roster_versions v ON v.id = rm.version_id
-             WHERE p.id = ${sqlText(projectId)} AND p.archived_at IS NULL
-               AND p.organization_id = 'shared-workspace'
-               AND rm.enrollment_state = 'active'
-               AND rm.repo_name = ${sqlText(repoName)}
-               AND coalesce(rm.publish_root, '.') = ${sqlText(normalizeGitRelativePath(mapping.publishRoot || "."))}
-               AND rm.version_id = ${sqlText(mapping.expectedRosterVersionId)}
-               AND lower(trim(rm.canonical_host)) = lower(trim(${sqlText(domain)}))
-               AND v.id = (
-                 SELECT id FROM fleet_roster_versions
-                 WHERE organization_id = 'shared-workspace'
-                   AND approved_at IS NOT NULL
-                   AND julianday(approved_at) <= julianday('now')
-                 ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
-                 LIMIT 1
-               )
-           )`
-        : ""
-    };`,
+    AND ${buildRepoAdmissionClause(sqlText(projectId))};`,
     ],
     isRemote,
   );
@@ -1241,7 +1220,7 @@ async function auditRepository(
            pages_total = ${htmlFiles.length},
            error_code = ${errorCode ? sqlText(errorCode) : "NULL"},
            error_detail = ${errorDetail ? sqlText(errorDetail) : "NULL"},
-           completed_at = datetime('now')
+           completed_at = ${sqlText(new Date().toISOString())}
        WHERE id = ${sqlText(auditId)}
          AND status = 'running'
          AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = ${sqlText(auditId)}) = ${crawledPages.length}
@@ -1270,14 +1249,7 @@ async function auditRepository(
                     AND p.organization_id = 'shared-workspace'
                     AND p.archived_at IS NULL
                     AND lower(trim(p.domain)) = lower(trim(rm.canonical_host))
-                    AND v.id = (
-                      SELECT id FROM fleet_roster_versions
-                      WHERE organization_id = 'shared-workspace'
-                        AND approved_at IS NOT NULL
-                        AND julianday(approved_at) <= julianday('now')
-                      ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
-                      LIMIT 1
-                    )
+                    AND v.id = ${buildSqliteEffectiveRosterSql("'shared-workspace'")}
                 )`
              : ""
          }
@@ -1551,105 +1523,89 @@ function publishGuardedDiagnosticTriple(
     return false;
   }
   const nowIso = observedAt || new Date().toISOString();
+  const sAudit = sqlText(auditId);
+  const sMember = sqlText(memberId);
+  const sVersion = sqlText(versionId);
+  const sOrg = sqlText(organizationId);
+  const sProject = sqlText(projectId);
+  const sDomain = sqlText(domain);
+  const sRun = sqlText(runId);
+  const sItem = sqlText(runItemId);
+  const sSnap = sqlText(snapshotId);
+  const sNow = sqlText(nowIso);
+  const sGrade = sqlText(grade);
+  const effectiveVerSql = buildSqliteEffectiveRosterSql("p.org");
 
-  // Sol Round 24 P1-04: Single unified eligibility CTE ensuring atomic 1/1/1 or 0/0/0 triple writes
-  const eligibleCte = `WITH eligible AS (
-       SELECT a.id, p.id AS project_id, m.id AS member_id, m.version_id, v.organization_id
-       FROM audits a
-       JOIN projects p ON p.id = a.project_id AND p.archived_at IS NULL
-       JOIN fleet_roster_members m ON m.project_id = p.id AND m.id = ${sqlText(memberId)}
-       JOIN fleet_roster_versions v ON v.id = m.version_id
-       WHERE a.id = ${sqlText(auditId)} AND a.status = 'completed'
-         AND a.pages_crawled >= a.pages_total AND a.pages_total > 0
-         AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
-         AND NOT EXISTS (
-           SELECT 1 FROM audit_issues i
-           WHERE i.audit_id = a.id AND i.page_id IS NOT NULL
-             AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id)
-         )
-         AND p.organization_id = ${sqlText(organizationId)} AND v.organization_id = ${sqlText(organizationId)}
-         AND m.enrollment_state = 'active' AND m.version_id = ${sqlText(versionId)}
-         AND lower(trim(p.domain)) = lower(trim(m.canonical_host))
-         AND lower(trim(m.canonical_host)) = lower(trim(${sqlText(domain)}))
-         AND v.id = (
-           SELECT id FROM fleet_roster_versions
-           WHERE organization_id = ${sqlText(organizationId)}
-             AND approved_at IS NOT NULL
-             AND julianday(approved_at) <= julianday('now')
-           ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
-           LIMIT 1
-         )
-         AND a.workflow_instance_id LIKE 'github-audit-%'
-         AND json_valid(a.config)
-         AND json_extract(a.config, '$.source') = 'github_repository_direct'
-         AND json_extract(a.config, '$.repoName') = m.repo_name
-         AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
-         AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
-         AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
-         AND json_extract(a.config, '$.rosterSource.versionId') = v.id
-         AND json_extract(a.config, '$.rosterSource.memberId') = m.id
-         AND json_extract(a.config, '$.rosterSource.projectId') = p.id
-         AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
-         AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
-         AND (
-           SELECT COUNT(*) FROM fleet_run_items fri_other
-           WHERE fri_other.audit_id = a.id
-             AND fri_other.primary_series_key = 'diagnostic'
-             AND fri_other.id <> ${sqlText(runItemId)}
-         ) = 0
-         AND NOT EXISTS (
-           SELECT 1 FROM fleet_runs fr_bad
-           WHERE fr_bad.id = ${sqlText(runId)}
-             AND (fr_bad.organization_id <> v.organization_id OR fr_bad.roster_version_id <> v.id)
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM fleet_run_items fri_bad
-           WHERE fri_bad.id = ${sqlText(runItemId)}
-             AND (
-               fri_bad.run_id <> ${sqlText(runId)}
-               OR fri_bad.member_id <> m.id
-               OR fri_bad.project_id <> p.id
-               OR fri_bad.audit_id <> a.id
-               OR fri_bad.primary_series_key <> 'diagnostic'
-             )
-         )
-         AND NOT EXISTS (
-           SELECT 1 FROM fleet_snapshots fs_bad
-           WHERE fs_bad.id = ${sqlText(snapshotId)}
-             AND (
-               fs_bad.run_item_id <> ${sqlText(runItemId)}
-               OR fs_bad.member_id <> m.id
-               OR fs_bad.project_id <> p.id
-               OR lower(trim(fs_bad.canonical_host)) <> lower(trim(m.canonical_host))
-               OR fs_bad.series_key <> 'diagnostic'
-             )
-         )
-     )`;
+  // Sol Round 24 P1-04, Round 27 A1: Bind every string literal once via CTE `args` inside Stmt 1
+  // so 253-char domains and schema-admitted IDs stay well inside D1's 14,999-byte atomic batch budget.
+  const compactSql = (q: string) => q.replace(/\s+/g, " ").trim();
+  const stmt1 = compactSql(`
+    WITH args AS (
+      SELECT ${sAudit} AS aid, ${sMember} AS mid, ${sVersion} AS vid, ${sOrg} AS org,
+             ${sProject} AS pid, lower(trim(${sDomain})) AS dom, ${sRun} AS rid,
+             ${sItem} AS iid, ${sSnap} AS sid, ${sNow} AS ts
+    ),
+    eligible AS (
+      SELECT a.id, pr.id AS project_id, m.id AS member_id, m.version_id, v.organization_id, p.rid, p.ts
+      FROM args p
+      JOIN audits a ON a.id = p.aid
+      JOIN projects pr ON pr.id = a.project_id AND pr.archived_at IS NULL
+      JOIN fleet_roster_members m ON m.project_id = pr.id AND m.id = p.mid
+      JOIN fleet_roster_versions v ON v.id = m.version_id
+      WHERE a.status = 'completed' AND a.pages_crawled >= a.pages_total AND a.pages_total > 0
+        AND pr.id = p.pid AND pr.organization_id = p.org AND v.organization_id = p.org
+        AND m.enrollment_state = 'active' AND m.version_id = p.vid
+        AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
+        AND lower(trim(m.canonical_host)) = p.dom
+        AND v.id = ${effectiveVerSql}
+        AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+        AND NOT EXISTS (SELECT 1 FROM audit_issues i WHERE i.audit_id = a.id AND i.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id))
+        AND a.workflow_instance_id LIKE 'github-audit-%'
+        AND json_valid(a.config) AND json_extract(a.config, '$.source') = 'github_repository_direct'
+        AND json_extract(a.config, '$.repoName') = m.repo_name
+        AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
+        AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
+        AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
+        AND json_extract(a.config, '$.rosterSource.versionId') = v.id
+        AND json_extract(a.config, '$.rosterSource.memberId') = m.id
+        AND json_extract(a.config, '$.rosterSource.projectId') = pr.id
+        AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
+        AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
+        AND (SELECT COUNT(*) FROM fleet_run_items o WHERE o.audit_id = a.id AND o.primary_series_key = 'diagnostic' AND o.id <> p.iid) = 0
+        AND NOT EXISTS (SELECT 1 FROM fleet_runs fr_bad WHERE fr_bad.id = p.rid AND (fr_bad.organization_id <> v.organization_id OR fr_bad.roster_version_id <> v.id))
+        AND NOT EXISTS (SELECT 1 FROM fleet_run_items fri_bad WHERE fri_bad.id = p.iid AND (fri_bad.run_id <> p.rid OR fri_bad.member_id <> m.id OR fri_bad.project_id <> pr.id OR fri_bad.audit_id <> a.id OR fri_bad.primary_series_key <> 'diagnostic'))
+        AND NOT EXISTS (SELECT 1 FROM fleet_snapshots fs_bad WHERE fs_bad.id = p.sid AND (fs_bad.run_item_id <> p.iid OR fs_bad.member_id <> m.id OR fs_bad.project_id <> pr.id OR lower(trim(fs_bad.canonical_host)) <> lower(trim(m.canonical_host)) OR fs_bad.series_key <> 'diagnostic'))
+    )
+    INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
+    SELECT rid, organization_id, version_id, 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, ts, ts
+    FROM eligible WHERE 1
+    ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = excluded.completed_at;
+  `);
+  const stmt2 = compactSql(`
+    INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
+    SELECT ${sItem}, fr.id, m.id, pr.id, a.id, 'diagnostic', 'completed', 1, fr.completed_at, fr.completed_at
+    FROM fleet_runs fr
+    JOIN audits a ON a.id = ${sAudit}
+    JOIN projects pr ON pr.id = a.project_id AND pr.archived_at IS NULL AND pr.organization_id = fr.organization_id
+    JOIN fleet_roster_members m ON m.id = ${sMember} AND m.project_id = pr.id AND m.version_id = fr.roster_version_id AND m.enrollment_state = 'active'
+    WHERE fr.id = ${sRun} AND fr.status = 'completed' AND fr.completed_at = ${sNow}
+      AND fr.roster_version_id = ${buildSqliteEffectiveRosterSql("fr.organization_id")}
+      AND a.status = 'completed' AND a.pages_crawled >= a.pages_total AND a.pages_total > 0
+      AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
+    ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = excluded.completed_at;
+  `);
+  const stmt3 = compactSql(`
+    INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
+    SELECT ${sSnap}, fri.id, fri.member_id, fri.project_id, m.canonical_host, ${score}, ${sGrade}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, fri.completed_at
+    FROM fleet_run_items fri
+    JOIN fleet_runs fr ON fr.id = fri.run_id
+    JOIN fleet_roster_members m ON m.id = fri.member_id
+    WHERE fri.id = ${sItem} AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' AND fri.completed_at = ${sNow}
+      AND fr.status = 'completed' AND fr.completed_at = ${sNow}
+    ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sGrade}, coverage = ${coverage}, observed_at = excluded.observed_at;
+  `);
 
-  const diagnosticSql = [
-    `${eligibleCte}
-     INSERT INTO fleet_runs (id, organization_id, roster_version_id, rubric_version, trigger, requester_id, status, total_domains, completed_domains, failed_domains, started_at, completed_at)
-     SELECT ${sqlText(runId)}, organization_id, version_id, 'v1', 'manual', 'github-audit-runner', 'completed', 1, 1, 0, ${sqlText(nowIso)}, ${sqlText(nowIso)}
-     FROM eligible
-     WHERE 1
-     ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = ${sqlText(nowIso)};`,
-
-    `${eligibleCte}
-     INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-     SELECT ${sqlText(runItemId)}, ${sqlText(runId)}, e.member_id, e.project_id, e.id, 'diagnostic', 'completed', 1, ${sqlText(nowIso)}, ${sqlText(nowIso)}
-     FROM eligible e
-     JOIN fleet_runs fr ON fr.id = ${sqlText(runId)} AND fr.status = 'completed'
-     WHERE 1
-     ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = ${sqlText(nowIso)};`,
-
-    `${eligibleCte}
-     INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-     SELECT ${sqlText(snapshotId)}, fri.id, e.member_id, e.project_id, ${sqlText(domain)}, ${score}, ${sqlText(grade)}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, ${sqlText(nowIso)}
-     FROM eligible e
-     JOIN fleet_run_items fri ON fri.id = ${sqlText(runItemId)} AND fri.status = 'completed'
-     WHERE 1
-     ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sqlText(grade)}, coverage = ${coverage}, observed_at = ${sqlText(nowIso)};`,
-  ];
+  const diagnosticSql = [stmt1, stmt2, stmt3];
 
   executeD1SqlBatches(diagnosticSql, isRemote, { atomic: true });
   const isVerified = verifyDiagnosticTriple(

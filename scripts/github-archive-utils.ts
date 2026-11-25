@@ -3,13 +3,31 @@ import { execFileSync, spawnSync } from "node:child_process";
 import fs, { readFileSync } from "node:fs";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { parseUtcTimestampMs } from "../src/server/features/fleet/services/fleetConstants";
+import {
+  compareUtf8Binary,
+  parseUtcTimestampMs,
+  sqliteUtcTimeSql,
+} from "../src/server/features/fleet/services/fleetConstants";
 import {
   isValidRepoSlug,
   normalizeRepoSlug,
   normalizeGitRelativePath,
 } from "../src/shared/git-repo";
-export { isValidRepoSlug, normalizeRepoSlug, normalizeGitRelativePath };
+export {
+  isValidRepoSlug,
+  normalizeRepoSlug,
+  normalizeGitRelativePath,
+  sqliteUtcTimeSql,
+};
+
+/**
+ * Shared SQLite subquery selecting the currently effective approved roster version
+ * using identical calendar/UTC validation and BINARY tie-breaking across all CLI tools (Sol R1).
+ */
+export function buildSqliteEffectiveRosterSql(orgIdSqlLiteral: string): string {
+  const ts = sqliteUtcTimeSql("approved_at");
+  return `(SELECT id FROM (SELECT id, ${ts} AS ts FROM fleet_roster_versions WHERE organization_id = ${orgIdSqlLiteral} AND approved_at IS NOT NULL) WHERE ts IS NOT NULL AND ts <= julianday('now') ORDER BY ts DESC, id COLLATE BINARY DESC LIMIT 1)`;
+}
 
 /**
  * Streaming byte capping transform stream (Sol P1 - F1).
@@ -269,7 +287,7 @@ export function selectEffectiveRosterVersion<
     const tB = parseUtcTimestampMs(b.approved_at ?? b.approvedAt);
     const diff = (isNaN(tB) ? 0 : tB) - (isNaN(tA) ? 0 : tA);
     if (diff !== 0) return diff;
-    return b.id === a.id ? 0 : b.id > a.id ? 1 : -1;
+    return compareUtf8Binary(b.id, a.id);
   });
 
   return valid[0] ?? null;

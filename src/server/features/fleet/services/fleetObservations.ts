@@ -3,7 +3,11 @@ import type {
   RawFleetRunItem,
   RawFleetSnapshot,
 } from "../repositories/FleetRepository";
-import { measuredPercent, parseUtcTimestampMs } from "./fleetCalculations";
+import {
+  compareUtf8Binary,
+  measuredPercent,
+  parseUtcTimestampMs,
+} from "./fleetCalculations";
 
 export interface SnapshotAttemptOverlay extends RawFleetSnapshot {
   attemptStatus?: string | null;
@@ -41,7 +45,8 @@ export function resolveTerminalAttempts(
         : [];
     }),
     (a, b) =>
-      b.completedAtMs - a.completedAtMs || b.item.id.localeCompare(a.item.id),
+      b.completedAtMs - a.completedAtMs ||
+      compareUtf8Binary(b.item.id, a.item.id),
   );
   return {
     admittedItemById: new Map(admitted.map((x) => [x.item.id, x])),
@@ -93,7 +98,8 @@ export function resolveAdmittedObservations(
       return [{ snap, observedAtMs, parent }];
     }),
     (a, b) =>
-      b.observedAtMs - a.observedAtMs || b.snap.id.localeCompare(a.snap.id),
+      b.observedAtMs - a.observedAtMs ||
+      compareUtf8Binary(b.snap.id, a.snap.id),
   );
 }
 

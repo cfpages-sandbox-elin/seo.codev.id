@@ -4,6 +4,10 @@ import { db } from "@/db";
 import { fleetRosterMembers } from "@/db/schema";
 import { getDatabaseProvider } from "@/db/provider";
 import { FleetRepository } from "@/server/features/fleet/repositories/FleetRepository";
+import {
+  pgUtcTimeSql,
+  sqliteUtcTimeSql,
+} from "@/server/features/fleet/services/fleetConstants";
 import type { ToolContext } from "@/server/mcp/context";
 import { mcpResponse } from "@/server/mcp/formatters";
 import { optionalMetaOutputSchema } from "@/server/mcp/output-schemas";
@@ -156,44 +160,28 @@ export const linkFleetRepositoryTool = {
     }
 
     const isPg = getDatabaseProvider() === "postgres";
-    // Sol R24-02: Guarded UTC timestamp evaluation for PostgreSQL session time-zone and malformed input safety
+    const pgTs = pgUtcTimeSql("approved_at");
+    const sqliteTs = sqliteUtcTimeSql("approved_at");
+    // Sol R24-02, R1: Shared strict UTC timestamp validation + binary collation tie-break
     const effectiveVersionSubquery = isPg
-      ? sql`(
+      ? sql.raw(`(
           SELECT id FROM fleet_roster_versions
-          WHERE organization_id = ${orgId}
+          WHERE organization_id = ${"'" + orgId.replaceAll("'", "''") + "'"}
             AND approved_at IS NOT NULL
-            AND (
-              CASE
-                WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$'
-                 AND pg_input_is_valid(approved_at || '+00', 'timestamptz') THEN (approved_at || '+00')::timestamptz <= CURRENT_TIMESTAMP
-                WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$'
-                 AND pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz <= CURRENT_TIMESTAMP
-                ELSE false
-              END
-            )
-          ORDER BY (
-            CASE
-              WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?$'
-               AND pg_input_is_valid(approved_at || '+00', 'timestamptz') THEN (approved_at || '+00')::timestamptz
-              WHEN approved_at ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,3})?(Z|[+-][0-9]{2}:[0-9]{2})$'
-               AND pg_input_is_valid(approved_at, 'timestamptz') THEN approved_at::timestamptz
-              ELSE NULL
-            END
-          ) DESC NULLS LAST, id COLLATE "C" DESC
+            AND ${pgTs} IS NOT NULL
+            AND ${pgTs} <= CURRENT_TIMESTAMP
+          ORDER BY ${pgTs} DESC NULLS LAST, id COLLATE "C" DESC
           LIMIT 1
-        )`
-      : sql`(
+        )`)
+      : sql.raw(`(
           SELECT id FROM fleet_roster_versions
-          WHERE organization_id = ${orgId}
+          WHERE organization_id = ${"'" + orgId.replaceAll("'", "''") + "'"}
             AND approved_at IS NOT NULL
-            AND (
-              (approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]' AND approved_at = strftime('%Y-%m-%d %H:%M:%S', approved_at))
-              OR (approved_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*' AND substr(approved_at, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(approved_at, 1, 19)))
-            )
-            AND julianday(approved_at) <= julianday('now')
-          ORDER BY julianday(approved_at) DESC NULLS LAST, id COLLATE BINARY DESC
+            AND ${sqliteTs} IS NOT NULL
+            AND ${sqliteTs} <= julianday('now')
+          ORDER BY ${sqliteTs} DESC NULLS LAST, id COLLATE BINARY DESC
           LIMIT 1
-        )`;
+        )`);
 
     const currentSlug = member.repoName?.trim();
     const currentRoot = normalizeGitRelativePath(member.publishRoot);
