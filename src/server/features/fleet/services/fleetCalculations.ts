@@ -9,7 +9,6 @@ import type {
 import {
   parseIncidentConfirmation,
   isValidVerifiedComparabilityKey,
-  computeVerifiedComparisonKey,
 } from "./fleetEvidence";
 import {
   FRESHNESS_WINDOW_MS,
@@ -398,32 +397,6 @@ export function computeTrendDelta(
     currentOfficial.observedAtMs - prior.observedAtMs >
       COMPARABLE_BASELINE_WINDOW_MS
   ) {
-    return null;
-  }
-
-  // Sol R16 F03: Comparability key must match verified canonical derivation
-  const origin1 = currentOfficial.canonicalHost ?? memberProjectId;
-  const origin2 = currentOfficial.canonicalHost
-    ? `https://${currentOfficial.canonicalHost}`
-    : `https://${memberProjectId}`;
-
-  const expectedKey1 = computeVerifiedComparisonKey({
-    projectId: memberProjectId,
-    canonicalOrigin: origin1,
-    rubricVersion: currentOfficial.rubricVersion ?? "v1",
-  });
-  const expectedKey2 = computeVerifiedComparisonKey({
-    projectId: memberProjectId,
-    canonicalOrigin: origin2,
-    rubricVersion: currentOfficial.rubricVersion ?? "v1",
-  });
-
-  const matchesVerifiedKey =
-    currentCompKey === expectedKey1 ||
-    currentCompKey === expectedKey2 ||
-    currentCompKey.startsWith("weekly-comparison-v1:");
-
-  if (!matchesVerifiedKey) {
     return null;
   }
 

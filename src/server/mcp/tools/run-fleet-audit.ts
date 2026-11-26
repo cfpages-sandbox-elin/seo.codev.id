@@ -1,4 +1,4 @@
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { db } from "@/db";
 import { getDatabaseProvider } from "@/db/provider";
@@ -83,7 +83,7 @@ async function resolveTargetProject(
     .where(
       and(
         eq(projects.organizationId, orgId),
-        eq(projects.domain, domain),
+        sql`lower(trim(${projects.domain})) = ${domain}`,
         isNull(projects.archivedAt),
       ),
     )

@@ -344,7 +344,7 @@ async function main() {
 
   if (targetDomainFilter) {
     candidates = candidates.filter(
-      (c) => c.domain.toLowerCase() === targetDomainFilter,
+      (c) => c.domain.trim().toLowerCase() === targetDomainFilter,
     );
     if (candidates.length === 0) {
       console.error(
@@ -435,6 +435,7 @@ async function main() {
     }
   >();
   let queueIndex = 0;
+  let triggeredCount = 0;
   let completedCount = 0;
   let failedCount = 0;
   let skippedBusyCount = 0;
@@ -640,6 +641,7 @@ async function main() {
           renderLocks: [],
         };
 
+        triggeredCount++;
         const dispatch = triggerWorkflow(
           target.workflow,
           auditId,
@@ -684,7 +686,8 @@ async function main() {
   console.log(`Eligible Pre-Recency Candidates: ${eligiblePreRecencyCount}`);
   console.log(`Ambiguous Domain Exclusions: ${ambiguousExcludedCount}`);
   console.log(`Skipped (Recent Within 10d): ${recentSkippedCount}`);
-  console.log(`Total Candidates Dispatched: ${candidates.length}`);
+  console.log(`Total Candidates Selected: ${candidates.length}`);
+  console.log(`Workflow Dispatches Triggered: ${triggeredCount}`);
   console.log(`Total Completed: ${completedCount}`);
   console.log(`Total Failed: ${failedCount}`);
   console.log(`Skipped (Reservation Busy): ${skippedBusyCount}`);

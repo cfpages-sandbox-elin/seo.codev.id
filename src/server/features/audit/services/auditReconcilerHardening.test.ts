@@ -135,4 +135,69 @@ describe("auditReconciler hardening (V4-01, V4-03, V4-04)", () => {
     expect(result).toBeNull();
     expect(mocks.failAudit).not.toHaveBeenCalled();
   });
+
+  it("reserves tick budget for canonical stale audits when irregular rows run slowly (V4-04)", async () => {
+    vi.useFakeTimers();
+    try {
+      const irr = [
+        {
+          id: "irr_slow_0",
+          workflowInstanceId: "wf_slow_0",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          currentPhase: "crawling",
+        },
+        {
+          id: "irr_slow_1",
+          workflowInstanceId: "wf_slow_1",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          currentPhase: "crawling",
+        },
+        {
+          id: "irr_slow_2",
+          workflowInstanceId: "wf_slow_2",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          currentPhase: "crawling",
+        },
+        {
+          id: "irr_slow_3",
+          workflowInstanceId: "wf_slow_3",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          currentPhase: "crawling",
+        },
+      ];
+      mocks.findIrregularRunningAudits.mockResolvedValueOnce(irr);
+      mocks.workflowGet.mockImplementation(async (wfId: string) => ({
+        status: async () => {
+          if (wfId.startsWith("wf_slow_")) {
+            await vi.advanceTimersByTimeAsync(4_500);
+          }
+          return { status: "terminated" };
+        },
+      }));
+      mocks.failAudit.mockResolvedValue(true);
+      mocks.getStaleRunningAudits.mockResolvedValueOnce([
+        {
+          id: "canon_1",
+          workflowInstanceId: "wf_canon_1",
+          projectId: "proj_1",
+          startedByUserId: "u1",
+          startedAt: "2026-01-01T00:00:00.000Z",
+          currentPhase: "crawling",
+          pagesCrawled: 0,
+          pagesTotal: 10,
+        },
+      ]);
+
+      await reconcileStaleAudits();
+
+      expect(mocks.getStaleRunningAudits).toHaveBeenCalled();
+      expect(mocks.failAudit).toHaveBeenCalledWith(
+        "canon_1",
+        "wf_canon_1",
+        expect.anything(),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

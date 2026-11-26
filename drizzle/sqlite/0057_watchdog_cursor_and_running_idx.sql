@@ -18,15 +18,27 @@ WHERE `status` = 'running'
       SELECT `id`,
         `project_id`,
         CASE
-          WHEN `started_at` GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
-           AND `started_at` = strftime('%Y-%m-%d %H:%M:%S', `started_at`)
-          THEN julianday(`started_at`)
-          WHEN `started_at` GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'
-           AND substr(`started_at`, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(`started_at`, 1, 19))
-           AND (length(`started_at`) = 20 OR substr(`started_at`, 20) GLOB '.[0-9]*Z')
+          WHEN instr(`started_at`, char(0)) = 0
+           AND substr(`started_at`, 1, 4) > '0000'
+           AND substr(`started_at`, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
+           AND substr(`started_at`, 12, 2) < '24'
+           AND substr(`started_at`, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(`started_at`, 1, 19))
+           AND (length(`started_at`) = 19 OR (length(`started_at`) BETWEEN 21 AND 23 AND substr(`started_at`, 20) GLOB '.[0-9]*' AND substr(`started_at`, 21) NOT GLOB '*[^0-9]*'))
            AND julianday(`started_at`) IS NOT NULL
           THEN julianday(`started_at`)
-          WHEN `started_at` GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*[+-][0-9][0-9]:[0-9][0-9]'
+          WHEN instr(`started_at`, char(0)) = 0
+           AND substr(`started_at`, 1, 4) > '0000'
+           AND `started_at` GLOB '*Z'
+           AND substr(`started_at`, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
+           AND substr(`started_at`, 12, 2) < '24'
+           AND substr(`started_at`, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(`started_at`, 1, 19))
+           AND (length(`started_at`) = 20 OR (length(`started_at`) BETWEEN 22 AND 24 AND substr(`started_at`, 20, length(`started_at`) - 20) GLOB '.[0-9]*' AND substr(`started_at`, 21, length(`started_at`) - 21) NOT GLOB '*[^0-9]*'))
+           AND julianday(`started_at`) IS NOT NULL
+          THEN julianday(`started_at`)
+          WHEN instr(`started_at`, char(0)) = 0
+           AND substr(`started_at`, 1, 4) > '0000'
+           AND `started_at` GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*[+-][0-9][0-9]:[0-9][0-9]'
+           AND substr(`started_at`, 12, 2) < '24'
            AND substr(`started_at`, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(`started_at`, 1, 19))
            AND julianday(`started_at`) IS NOT NULL
           THEN julianday(`started_at`)

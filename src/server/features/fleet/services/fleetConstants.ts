@@ -54,17 +54,28 @@ const multiplyFractions = (a: Fraction, b: Fraction): Fraction =>
   fraction(a.n * b.n, a.d * b.d);
 
 function numberToFraction(val: number): Fraction {
+  if (!Number.isFinite(val)) {
+    throw new RangeError(`Expected finite number, received ${String(val)}`);
+  }
   if (Number.isInteger(val)) {
     return { n: BigInt(val), d: 1n };
   }
   const str = val.toString();
+  const expMatch = /^([+-]?\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(str);
+  if (expMatch) {
+    const sign = expMatch[1].startsWith("-") ? -1n : 1n;
+    const intDigits = expMatch[1].replace(/^[+-]/, "");
+    const fracDigits = expMatch[2] ?? "";
+    const digits = BigInt(intDigits + fracDigits);
+    const shift = Number(expMatch[3]) - fracDigits.length;
+    if (shift >= 0) {
+      return { n: sign * digits * 10n ** BigInt(shift), d: 1n };
+    }
+    return fraction(sign * digits, 10n ** BigInt(-shift));
+  }
   const dot = str.indexOf(".");
   if (dot === -1) {
     return { n: BigInt(str), d: 1n };
-  }
-  if (str.includes("e") || str.includes("E")) {
-    const scale = 1_000_000_000n;
-    return fraction(BigInt(Math.floor(val * 1_000_000_000)), scale);
   }
   const decimals = str.slice(dot + 1);
   const d = 10n ** BigInt(decimals.length);

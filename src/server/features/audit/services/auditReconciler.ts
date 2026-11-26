@@ -202,11 +202,17 @@ export async function reconcileStaleAudits(overrideCursor?: WatchdogCursor) {
 
     if (remainingMs() < 2_000) return;
 
-    // 1. Progressing cursor sweep of legacy null-instance or non-canonical/invalid timestamp rows
+    // 1. Bounded-budget cursor sweep of null-instance or non-canonical/invalid timestamp rows
+    // Reserve >= 8_000ms for canonical stale running audits so slow irregular rows cannot starve healthy queues (V4-04).
+    const irregularBudgetFloorMs = 8_000;
+    const irregularRemainingMs = () =>
+      Math.max(0, remainingMs() - irregularBudgetFloorMs);
+    const irregularIsActive = () =>
+      isActive() && remainingMs() > irregularBudgetFloorMs;
     await reconcileIrregularRunningAudits(
       cutoff,
-      remainingMs,
-      isActive,
+      irregularRemainingMs,
+      irregularIsActive,
       withTickTimeout,
       reconcileRunningAudit,
     );

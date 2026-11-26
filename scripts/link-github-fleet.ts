@@ -363,6 +363,15 @@ export async function linkFleet(options: {
     );
   }
 
+  const declaredCount = Number(approvedRoster.domain_count ?? 0);
+  if (existingMembers.length !== declaredCount) {
+    console.error(
+      `\n[ERROR] Incomplete roster materialization for '${approvedRoster.id}': persisted ${existingMembers.length} member row(s) vs declared domain_count ${declaredCount}.`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+
   if (isDryRun) {
     console.log(`\n[DRY RUN] Actions preview:`);
     if (missingProjects.length > 0) {
@@ -382,14 +391,6 @@ export async function linkFleet(options: {
             `  -> ${m.host} (member: ${m.memberId}) => project: ${m.projectId}`,
           ),
         );
-    }
-    const declaredCount = Number(approvedRoster.domain_count ?? 0);
-    if (existingMembers.length !== declaredCount) {
-      console.error(
-        `\n[ERROR] Dry run detected incomplete roster materialization: persisted ${existingMembers.length} member row(s) vs declared domain_count ${declaredCount}.`,
-      );
-      process.exitCode = 1;
-      return;
     }
     if (invalidActiveMembers.length > 0) {
       console.error(
