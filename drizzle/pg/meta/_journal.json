@@ -274,6 +274,13 @@
       "when": 1795618619439,
       "tag": "0038_watchdog_timestamp_strictness",
       "breakpoints": true
+    },
+    {
+      "idx": 39,
+      "version": "7",
+      "when": 1795653664561,
+      "tag": "0039_pg_double_precision_floats",
+      "breakpoints": true
     }
   ]
 }

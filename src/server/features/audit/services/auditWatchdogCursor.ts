@@ -182,15 +182,30 @@ export async function savePersistedCursor(
   }
 }
 
-/** Query running audits with null workflow instance ID or non-canonical/invalid started_at timestamps (Sol R5, V4-03, V4-05). */
+/** Query actionable irregular running audits (null instance ID, invalid started_at, or non-canonical stale rows) so healthy fresh legacy rows never starve tail failures across cold starts (Sol R5, V4-03, V4-05). */
 export async function findIrregularRunningAudits(
   limit: number,
   cursorId: string | null,
+  cutoff?: Date,
+): Promise<
+  Array<{
+    id: string;
+    workflowInstanceId: string | null;
+    startedAt: string;
+    currentPhase: string | null;
+  }>
+>;
+export async function findIrregularRunningAudits(
+  limit: number,
+  cursorId: string | null,
+  cutoff = new Date(Date.now() - 15 * 60 * 1000),
 ) {
   const isPg = getDatabaseProvider() === "postgres";
+  const edgeCutoffIso = cutoff.toISOString();
+  const repoCutoffIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
   const isNullOrInvalid = isPg
-    ? sql`(${audits.workflowInstanceId} IS NULL OR ${pgTimeExpr(audits.startedAt)} IS NULL OR substr(${audits.startedAt}, 1, 4) <= '0000' OR ${audits.startedAt} !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$')`
-    : sql`(${audits.workflowInstanceId} IS NULL OR ${sqliteTimeExpr(audits.startedAt)} IS NULL OR instr(${audits.startedAt}, char(0)) > 0 OR substr(${audits.startedAt}, 1, 4) <= '0000' OR NOT (${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9]Z' AND substr(${audits.startedAt}, 12, 2) < '24'))`;
+    ? sql`(${audits.workflowInstanceId} IS NULL OR ${pgTimeExpr(audits.startedAt)} IS NULL OR substr(${audits.startedAt}, 1, 4) <= '0000' OR (${audits.startedAt} !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$' AND ((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${pgTimeExpr(audits.startedAt)} < ${edgeCutoffIso}::timestamptz) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${pgTimeExpr(audits.startedAt)} < ${repoCutoffIso}::timestamptz))))`
+    : sql`(${audits.workflowInstanceId} IS NULL OR ${sqliteTimeExpr(audits.startedAt)} IS NULL OR instr(${audits.startedAt}, char(0)) > 0 OR substr(${audits.startedAt}, 1, 4) <= '0000' OR (NOT (${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9]Z' AND substr(${audits.startedAt}, 12, 2) < '24') AND ((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${sqliteTimeExpr(audits.startedAt)} < julianday(${edgeCutoffIso})) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${sqliteTimeExpr(audits.startedAt)} < julianday(${repoCutoffIso})))))`;
 
   const cursorFilter = cursorId
     ? isPg

@@ -2,10 +2,10 @@ import { sql } from "drizzle-orm";
 import {
   bigint,
   boolean,
+  doublePrecision,
   index,
   integer,
   pgTable,
-  real,
   serial,
   text,
   uniqueIndex,
@@ -183,8 +183,8 @@ export const keywordMetrics = pgTable(
     locationCode: integer("location_code").notNull(),
     languageCode: text("language_code").notNull().default("en"),
     searchVolume: integer("search_volume"),
-    cpc: real("cpc"),
-    competition: real("competition"),
+    cpc: doublePrecision("cpc"),
+    competition: doublePrecision("competition"),
     keywordDifficulty: integer("keyword_difficulty"),
     intent: text("intent"),
     monthlySearches: text("monthly_searches"),
@@ -270,7 +270,7 @@ export const rankTrackingKeywords = pgTable(
     matchCase: boolean("match_case").notNull().default(false),
     searchVolume: integer("search_volume"),
     keywordDifficulty: integer("keyword_difficulty"),
-    cpc: real("cpc"),
+    cpc: doublePrecision("cpc"),
     metricsFetchedAt: timestampColumn("metrics_fetched_at"),
     // Set when a user pins the keyword to the top of the tracker's table.
     // Pins are shared by everyone in the project.

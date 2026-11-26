@@ -174,7 +174,7 @@ export function checkFleetCoverage(options?: {
                   AND a.status = 'completed'
                   AND a.workflow_instance_id LIKE 'github-audit-%'
                   AND a.pages_total > 0
-                  AND a.pages_crawled >= a.pages_total
+                  AND a.pages_crawled = a.pages_total
      JOIN fleet_run_items i ON i.audit_id = a.id
                            AND i.member_id = rm.id
                            AND i.project_id = p.id
@@ -189,10 +189,13 @@ export function checkFleetCoverage(options?: {
                            AND s.project_id = p.id
                            AND lower(trim(s.canonical_host)) = lower(trim(rm.canonical_host))
                            AND s.series_key = 'diagnostic'
+                           AND s.coverage = 100
+                           AND s.score BETWEEN 0 AND 100
+                           AND s.grade = (CASE WHEN s.score >= 90 THEN 'A' WHEN s.score >= 80 THEN 'B' WHEN s.score >= 70 THEN 'C' WHEN s.score >= 60 THEN 'D' ELSE 'F' END)
      WHERE rm.version_id = ${sqlText(effectiveRoster.id)}
        AND rm.enrollment_state = 'active'
        AND rm.repo_name IS NOT NULL
-       AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+       AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
        AND NOT EXISTS (
          SELECT 1 FROM audit_issues ai
          WHERE ai.audit_id = a.id AND ai.page_id IS NOT NULL

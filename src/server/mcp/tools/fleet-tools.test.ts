@@ -200,7 +200,7 @@ describe("Fleet MCP Tools", () => {
         "--expected-root=.",
       ]);
       expect(data.executionCommand).toBe(
-        "& 'pnpm' 'exec' 'tsx' 'scripts/run-github-fleet-audit.ts' '--domain' 'kaca.co.id' '--roster-id' 'roster_v1' '--remote' '--max-pages' '500' '--expected-member=member_1' '--expected-project=proj_1' '--expected-repo=cfpages-syamsulalam-net/kaca-co-id' '--expected-root=.'",
+        "& 'node' './node_modules/tsx/dist/cli.mjs' 'scripts/run-github-fleet-audit.ts' '--domain' 'kaca.co.id' '--roster-id' 'roster_v1' '--remote' '--max-pages' '500' '--expected-member=member_1' '--expected-project=proj_1' '--expected-repo=cfpages-syamsulalam-net/kaca-co-id' '--expected-root=.'",
       );
     });
 
@@ -325,6 +325,10 @@ describe("Fleet MCP Tools", () => {
         );
         expect(data.executionCommand).toContain("[char]0x2019");
         expect(data.executionCommand).not.toContain("\u2019");
+        expect(data.executionCommand).toContain(
+          "& 'node' './node_modules/tsx/dist/cli.mjs'",
+        );
+        expect(data.executionCommand).not.toContain("& 'pnpm'");
       } finally {
         hoisted.memberPublishRoot = prevRoot;
       }

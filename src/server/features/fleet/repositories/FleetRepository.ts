@@ -1,4 +1,4 @@
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { sort } from "remeda";
 import { db } from "@/db";
 import { getDatabaseProvider } from "@/db/provider";
@@ -17,6 +17,12 @@ import {
   pgUtcTimeSql,
   sqliteUtcTimeSql,
 } from "../services/fleetConstants";
+import {
+  buildFsPlausibleOfficialSql,
+  normalizeSnapshotRow,
+  recoverMemberWeeklyBaselines,
+  snapshotSelectColumns,
+} from "./fleetPlausibilitySql";
 
 export type RawFleetMember = typeof fleetRosterMembers.$inferSelect;
 export type RawFleetSnapshot = typeof fleetSnapshots.$inferSelect;
@@ -31,7 +37,7 @@ export type RawFleetRunItem = Omit<
   rubricVersion?: string | null;
 };
 
-type RawFleetSnapshotWithAttempt = RawFleetSnapshot & {
+export type RawFleetSnapshotWithAttempt = RawFleetSnapshot & {
   attemptStatus?: string | null;
   errorCode?: string | null;
   attemptErrorCode?: string | null;
@@ -42,10 +48,6 @@ type RawFleetSnapshotWithAttempt = RawFleetSnapshot & {
 
 const pgSafeTs = pgUtcTimeSql;
 const sqliteSafeTs = sqliteUtcTimeSql;
-
-function gradeMatchFor(floorExpr: string): string {
-  return `fs.grade = (CASE WHEN ${floorExpr} >= 90 THEN 'A' WHEN ${floorExpr} >= 80 THEN 'B' WHEN ${floorExpr} >= 70 THEN 'C' WHEN ${floorExpr} >= 60 THEN 'D' ELSE 'F' END)`;
-}
 
 interface RawFleetData {
   version: RawFleetVersion;
@@ -189,23 +191,7 @@ export const FleetRepository = {
       ? sql`ORDER BY ${fsObservedExpr} DESC NULLS LAST, fs.id COLLATE "C" DESC`
       : sql`ORDER BY ${fsObservedExpr} DESC NULLS LAST, fs.id COLLATE BINARY DESC`;
 
-    const rawWeighted =
-      "(35.0 * fs.score_technical + 15.0 * fs.score_mobile_perf + 10.0 * fs.score_schema + 15.0 * fs.score_on_page + 5.0 * fs.score_ai_readiness + 20.0 * fs.score_internal_links) / 100.0";
-    const pgFloorUncapped = `FLOOR(((${rawWeighted})::numeric + 1e-9))::int`;
-    const sqliteFloorUncapped = `CAST(((${rawWeighted}) + 1e-9) AS INTEGER)`;
-    // V4-01: Wrap JSON parsing/casting STRICTLY inside CASE WHEN so Postgres & SQLite optimizers cannot hoist ::jsonb / json_extract past validation guards.
-    const pgConfirmedCapSql =
-      "(CASE WHEN fs.has_incident_cap = TRUE AND fs.score <= 59 AND fs.incident_reason IS NOT NULL AND left(trim(fs.incident_reason), 1) = '{' AND right(trim(fs.incident_reason), 1) = '}' AND pg_input_is_valid(fs.incident_reason, 'jsonb') THEN (CASE WHEN jsonb_typeof((fs.incident_reason)::jsonb) = 'object' AND lower(coalesce((fs.incident_reason)::jsonb->>'kind', '')) IN ('dns_failure','tls_invalid','tcp_timeout','http_5xx','empty_body','malware_defacement','site_down') AND jsonb_typeof((fs.incident_reason)::jsonb->'expectedIntentVerified') = 'boolean' AND ((fs.incident_reason)::jsonb->'expectedIntentVerified') = 'true'::jsonb AND jsonb_typeof(coalesce((fs.incident_reason)::jsonb->'primaryProbe', (fs.incident_reason)::jsonb->'probe')) = 'object' AND jsonb_typeof(coalesce((fs.incident_reason)::jsonb->'corroborationProbe', (fs.incident_reason)::jsonb->'corroboration')) = 'object' THEN TRUE ELSE FALSE END) ELSE FALSE END)";
-    const sqliteConfirmedCapSql =
-      "(CASE WHEN fs.has_incident_cap = 1 AND fs.score <= 59 AND fs.incident_reason IS NOT NULL AND json_valid(fs.incident_reason) = 1 THEN (CASE WHEN json_type(fs.incident_reason) = 'object' AND lower(coalesce(json_extract(fs.incident_reason, '$.kind'), '')) IN ('dns_failure','tls_invalid','tcp_timeout','http_5xx','empty_body','malware_defacement','site_down') AND json_type(fs.incident_reason, '$.expectedIntentVerified') = 'true' AND json_type(coalesce(json_extract(fs.incident_reason, '$.primaryProbe'), json_extract(fs.incident_reason, '$.probe'))) = 'object' AND json_type(coalesce(json_extract(fs.incident_reason, '$.corroborationProbe'), json_extract(fs.incident_reason, '$.corroboration'))) = 'object' THEN 1 ELSE 0 END) ELSE 0 END)";
-
-    const fsPlausibleOfficial = isPg
-      ? sql.raw(
-          `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND NOT fs.is_provisional AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND ((NOT fs.has_incident_cap AND (fs.score = ${pgFloorUncapped} OR ABS((${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(pgFloorUncapped)}) OR (${pgConfirmedCapSql} AND (fs.score = LEAST(59, ${pgFloorUncapped}) OR ABS(LEAST(59, ${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(`LEAST(59, ${pgFloorUncapped})`)}) OR (fs.has_incident_cap AND fs.score <= 59 AND (fs.score = ${pgFloorUncapped} OR ABS((${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(pgFloorUncapped)})))`,
-        )
-      : sql.raw(
-          `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND fs.is_provisional = 0 AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND ((fs.has_incident_cap = 0 AND (fs.score = ${sqliteFloorUncapped} OR ABS((${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(sqliteFloorUncapped)}) OR (${sqliteConfirmedCapSql} = 1 AND (fs.score = MIN(59, ${sqliteFloorUncapped}) OR ABS(MIN(59, ${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(`MIN(59, ${sqliteFloorUncapped})`)}) OR (fs.has_incident_cap = 1 AND fs.score <= 59 AND (fs.score = ${sqliteFloorUncapped} OR ABS((${rawWeighted}) - fs.score) < 1e-7) AND ${gradeMatchFor(sqliteFloorUncapped)})))`,
-        );
+    const fsPlausibleOfficial = buildFsPlausibleOfficialSql(isPg);
 
     const friValidClock = isPg
       ? sql`(${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= ${nowIso}::timestamptz)`
@@ -281,39 +267,7 @@ export const FleetRepository = {
 
     // Query 4: Snapshots for this approved roster version bounded by series-aware window function (Sol Round 24 P2-07, R24-12, V4-06)
     const rawSnapshots = await db
-      .select({
-        id: fleetSnapshots.id,
-        runItemId: fleetSnapshots.runItemId,
-        memberId: fleetSnapshots.memberId,
-        projectId: fleetSnapshots.projectId,
-        canonicalHost: fleetSnapshots.canonicalHost,
-        score: fleetSnapshots.score,
-        grade: fleetSnapshots.grade,
-        coverage: fleetSnapshots.coverage,
-        isProvisional: fleetSnapshots.isProvisional,
-        provisionalLower: fleetSnapshots.provisionalLower,
-        provisionalUpper: fleetSnapshots.provisionalUpper,
-        hasIncidentCap: fleetSnapshots.hasIncidentCap,
-        incidentReason: fleetSnapshots.incidentReason,
-        scoreTechnical: fleetSnapshots.scoreTechnical,
-        scoreInternalLinks: fleetSnapshots.scoreInternalLinks,
-        scoreMobilePerf: fleetSnapshots.scoreMobilePerf,
-        scoreOnPage: fleetSnapshots.scoreOnPage,
-        scoreSchema: fleetSnapshots.scoreSchema,
-        scoreAiReadiness: fleetSnapshots.scoreAiReadiness,
-        seriesKey: fleetSnapshots.seriesKey,
-        comparabilityKey: fleetSnapshots.comparabilityKey,
-        evidenceManifestR2Key: fleetSnapshots.evidenceManifestR2Key,
-        evidenceManifestHash: fleetSnapshots.evidenceManifestHash,
-        observedAt: fleetSnapshots.observedAt,
-        attemptOutcome: fleetRunItems.status,
-        attemptStatus: fleetRunItems.status,
-        runId: fleetRunItems.runId,
-        errorCode: fleetRunItems.errorCode,
-        rubricVersion: fleetRuns.rubricVersion,
-        runItemMemberId: fleetRunItems.memberId,
-        runItemProjectId: fleetRunItems.projectId,
-      })
+      .select(snapshotSelectColumns)
       .from(fleetSnapshots)
       .innerJoin(fleetRunItems, eq(fleetSnapshots.runItemId, fleetRunItems.id))
       .innerJoin(
@@ -356,23 +310,61 @@ export const FleetRepository = {
       .orderBy(desc(fleetSnapshots.observedAt), desc(fleetSnapshots.id));
 
     const snapshots: RawFleetSnapshotWithAttempt[] = [];
+    const seenSnapIds = new Set<string>();
     for (const snap of rawSnapshots) {
-      // P1-3 Relational Lineage & Tenant Isolation:
-      // Exclude snapshots whose member/project lineage disagrees with parent run item
-      if (
-        snap.memberId !== snap.runItemMemberId ||
-        snap.projectId !== snap.runItemProjectId
-      ) {
-        continue;
-      }
-      snapshots.push({
-        ...snap,
-        attemptStatus: snap.attemptStatus ?? null,
-        errorCode: snap.errorCode ?? null,
-        comparabilityKey: snap.comparabilityKey ?? null,
-        seriesKey: snap.seriesKey ?? null,
-        rubricVersion: snap.rubricVersion ?? null,
+      if (seenSnapIds.has(snap.id)) continue;
+      const normalized = normalizeSnapshotRow(snap);
+      if (!normalized) continue;
+      seenSnapIds.add(snap.id);
+      snapshots.push(normalized);
+    }
+
+    const recoveredRunItemIds = new Set<string>();
+    for (const member of validatedMembers) {
+      await recoverMemberWeeklyBaselines({
+        member,
+        organizationId,
+        versionId: version.id,
+        isPg,
+        nowMs,
+        nowIso,
+        snapshots,
+        seenSnapIds,
+        recoveredRunItemIds,
       });
+    }
+
+    const existingRunItemIds = new Set(runItems.map((r) => r.id));
+    const missingRunItemIds = [...recoveredRunItemIds].filter(
+      (id) => !existingRunItemIds.has(id),
+    );
+    if (missingRunItemIds.length > 0) {
+      const extraItems = await db
+        .select({
+          id: fleetRunItems.id,
+          runId: fleetRunItems.runId,
+          memberId: fleetRunItems.memberId,
+          projectId: fleetRunItems.projectId,
+          auditId: fleetRunItems.auditId,
+          primarySeriesKey: fleetRunItems.primarySeriesKey,
+          status: fleetRunItems.status,
+          attemptCount: fleetRunItems.attemptCount,
+          errorCode: fleetRunItems.errorCode,
+          startedAt: fleetRunItems.startedAt,
+          completedAt: fleetRunItems.completedAt,
+          rubricVersion: fleetRuns.rubricVersion,
+        })
+        .from(fleetRunItems)
+        .innerJoin(
+          fleetRuns,
+          and(
+            eq(fleetRunItems.runId, fleetRuns.id),
+            eq(fleetRuns.organizationId, organizationId),
+            eq(fleetRuns.rosterVersionId, version.id),
+          ),
+        )
+        .where(inArray(fleetRunItems.id, missingRunItemIds));
+      runItems.push(...extraItems);
     }
 
     return {

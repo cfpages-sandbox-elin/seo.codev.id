@@ -368,7 +368,7 @@ export const runFleetAuditTool = {
       "./node_modules/tsx/dist/cli.mjs",
       ...argv.slice(2),
     ];
-    const executionCommand = `& ${["pnpm", ...argv].map(quotePowerShell).join(" ")}`;
+    const executionCommand = `& ${["node", ...directNodeArgv].map(quotePowerShell).join(" ")}`;
     const message = domain
       ? `Fleet audit plan configured for ${domain} in ${mode} mode.`
       : `Fleet audit plan configured across enrolled properties in ${mode} mode.`;

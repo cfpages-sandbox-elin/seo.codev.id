@@ -137,7 +137,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 ### Runner Scope, Concurrency & CLI Parser Reference
 | Runner / Script | Default Pages | Max Pages | Concurrency | Scope Flags | Scope Modifiers & Options | Execution Backend |
 |---|---|---|---|---|---|---|
-| **Edge HTTP Runner** (`scripts/run-fleet-audits.ts`) | 500 | 10,000 | 2 (1–5) | Exactly one of `--domain` / `-d <host>`, `--all`, or `--limit` / `-l <n>` | `--max-pages` / `-m <1–10000>`, `--roster-id <id>` (opts into effective-roster filtering), `--skip-recent` / `--no-skip-recent` (single-domain bypasses recency), `--concurrency` / `-c <1–5>`, `--expected-project <id>`, `--expected-member <id>`, `--remote` (default) \| `--local` | Shipped live production crawler |
+| **Edge HTTP Runner** (`scripts/run-fleet-audits.ts`) | 500 | 10,000 | 2 (1–5) | Exactly one of `--domain` / `-d <host>`, `--all`, or `--limit` / `-l <n>` | `--max-pages` / `-m <1–10000>`, `--roster-id <id>` (opts into effective-roster filtering), `--skip-recent` / `--no-skip-recent` (single-domain bypasses recency), `--concurrency` / `-c <1–5>`, `--expected-project <id>` & `--expected-member <id>` (both require single-domain `--domain <host>` and non-empty `--roster-id <id>`), `--remote` (default) \| `--local` (bulk fails if active roster members are unlinked/archived/stale) | Shipped live production crawler |
 | **Repository Direct Runner** (`scripts/run-github-fleet-audit.ts`) | 10,000 | 10,000 | Host-side paced | Exactly one of `--domain` / `-d <host>`, `--all` / `-a`, or `--limit` / `-l <n>` | `--workspace` / `-w` (audits wider inventory; conflicts with `--roster-id`), `--roster-id <id>`, `--force` / `-f`, `--archive`, `--max-pages` / `-m <n>` (1–10,000), `--scan-budget <n>` (positive int; limit default `max(limit*10, 20)`, unlimited in `--all`, rejected with `--domain`), `--expected-repo=<slug>`, `--expected-root=<path>`, `--expected-member=<id>`, `--expected-project=<id>`, `--remote` (default) \| `--local` (bulk exits nonzero if unlinked/stale/unmapped active members or incomplete `--scan-budget` truncation occur) | Shipped diagnostic source audit |
 | **Fleet Project Linker** (`scripts/link-github-fleet.ts`) | N/A | N/A | N/A | Target org (default `shared-workspace`) | `--dry-run`, `--org-id <id>`, `--remote` \| `--local` (default) (both preview and apply fail if `persistedMembers !== declaredMembers`) | Local D1 inventory mapping |
 | **Roster Importer** (`scripts/import-fleet-roster.ts`) | N/A | N/A | N/A | `<orgId>` (positional) | `--approval <file>`, `--help` / `-h` (fails if existing version has `persistedMembers !== domainCount`) | Roster version bootstrap |
@@ -146,6 +146,11 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
 | **Fleet Issues CLI** (`scripts/fleet-issues.ts`) | N/A | N/A | N/A | Filtered search | `--domain <host>`, `--severity <critical\|warning\|info>`, `--type <slug>`, `--source <all\|edge\|repository\|both>`, `--limit <n>`, `--json`, `--csv <file>`, `--remote` (default) \| `--local` | Fleet-wide issue extraction |
 | **D1 to Postgres Migrator** (`scripts/migrate-d1-to-postgres.ts`) | 5,000 | 50,000 | Serial chunked | Schema / single table | `--table <name>` (scopes preview, preflight, copy, sequences, and verify to single table), `--dry-run`, `--allow-nonempty`, `--page-size <1–50000>` (default 5000; `reports` uses 20 rows/page), `--update`, `--since-hours <(0, 8760]>` (default 12), `--help` (streams bounded keyset pages across all table sizes to verify full arbiter keysets + converted row parity before exit 0) | Keyset-paginated store copy |
 | **Weekly Fleet Baseline Publisher** | N/A | N/A | Scheduled | Fleet-wide | External scheduled service consuming `fleetCalculations.ts` contracts | Dedicated background grading publisher |
+
+  Pinned single-target Edge HTTP CLI example (`--expected-project` / `--expected-member` require `--domain` + `--roster-id`):
+  ```powershell
+  pnpm exec tsx scripts/run-fleet-audits.ts --domain kaca.co.id --roster-id roster_v1 --expected-project proj_1 --expected-member member_1 --remote
+  ```
 
 **Audit Terminal Outcome Dispositions & Coverage Separation**:
 - **`PAGE_BUDGET_REACHED`**: Candidate URL count exceeded `--max-pages` ceiling before completion (`audits.status = 'failed'`, excluded from diagnostic fleet series, nonzero exit).
@@ -184,7 +189,7 @@ OpenSEO operates on a **Dual-Lane Audit Architecture**:
   - **Role 2 (Auxiliary Audit Worker)**: Auxiliary worker on port `8787` (`pnpm exec wrangler dev --config wrangler.audit.jsonc --local --port 8787`) managing Cloudflare Workflows and the local Workflows control API. Note that the auxiliary worker returns 404 for general HTTP fetches; its sole purpose is workflow execution.
   - **Role 3 (Direct Host CLI)**: Local and remote CLI execution against D1 via Wrangler (`--local` or `--remote`), sharing the local persistence root at `.wrangler/state/v3/d1`. Note **per-command environment precedence**:
     - **D1 runner children** (`scripts/github-archive-utils.ts` used by audit runners, linker, issue CLI, and fleet status): `.env.selfhost` $\rightarrow$ `.env.local` $\rightarrow$ `.env`, where the first populated file value wins over ambient `process.env`.
-    - **Repository runner & benchmark GitHub creds** (`run-github-fleet-audit.ts`, `benchmark-archive-audit.ts`): `.env.selfhost` populates `process.env` / `envVars` **before** running `gh auth token` / `gh api` and inspecting `GITHUB_TOKEN`, so populated `GH_TOKEN`/`GITHUB_TOKEN` in `.env.selfhost` override ambient shell tokens before falling back to `gh` CLI credentials.
+    - **Edge HTTP runner** (`scripts/run-fleet-audits.ts` direct HTTP workflow trigger & polling) and **Repository runner / benchmark** (`run-github-fleet-audit.ts`, `benchmark-archive-audit.ts`): all three load repo-relative `.env.selfhost` at startup, overriding ambient `process.env` only for populated keys (empty assignments in `.env.selfhost` are skipped rather than clobbering ambient vars) before running `gh auth token` / `gh api`, inspecting `GITHUB_TOKEN`, or dispatching `/api/workflows/site-audit` triggers.
     - **D1 $\rightarrow$ PostgreSQL migrator** (`scripts/cli-utils.ts` imported by `scripts/migrate-d1-to-postgres.ts`): populated `process.env` $\rightarrow$ `.env.local` $\rightarrow$ `.env` (never loads `.env.selfhost`).
 - **Cloudflare Access Two-Stage Authentication**: Edge access is governed by the Cloudflare Access session cookie at the public edge boundary, while the worker validates the signed `Cf-Access-Jwt-Assertion` header, mapping verified identity to user records before enforcing organization authorization.
 - **Approval Protocol**: Approval JSON requires canonical schema fields: `organizationId`, `versionTag`, `rosterPlanSha256`, `approvedBy`, and optional `approvedAt` (ISO timestamp).
@@ -707,6 +712,16 @@ try {
      const research = researchRes.structuredContent;
      const { name, domain, overview, competitors, suggestedTopics, suggestedKeywords } = research;
 
+     if (
+       typeof name !== "string" || !name.trim() ||
+       typeof domain !== "string" || !domain.trim() ||
+       typeof overview !== "string" || !overview.trim() ||
+       !Array.isArray(competitors)
+     ) {
+       console.error("Research output is missing required identity or competitor fields; aborting before save.");
+       return;
+     }
+
      // Ensure grounded topics have exactly 5 prompts each
      const validTopics = (suggestedTopics ?? []).filter((t) => Array.isArray(t.prompts) && t.prompts.length === 5);
      if (validTopics.length === 0) {
@@ -718,10 +733,10 @@ try {
        name: "save_project_website_setup",
        arguments: {
          projectId,
-         name: name ?? "Toilet Cubicle Surabaya",
-         domain: domain ?? "toiletcubicle.co.id",
-         overview: overview ?? "Commercial toilet cubicle contractor.",
-         competitors: competitors ?? [],
+         name,
+         domain,
+         overview,
+         competitors,
          suggestedTopics: validTopics,
          suggestedKeywords: suggestedKeywords ?? []
        }
@@ -870,7 +885,7 @@ try {
      ```
 
 > [!NOTE]
-> **Resolution & Deletion Invariants**: `resolveAudit` reads an explicit project-bound ID or the project's latest attempt regardless of status, ordered deterministically by `julianday(started_at) DESC, id DESC` on SQLite/D1 and `pgUtcTimeSql(started_at)` guarded `timestamptz` cast descending (invalid timestamps ordered last), then `id DESC` on PostgreSQL. Direct repository source pages store HTTP status as NULL, so filtering `get_audit_pages` by `statusCode: 200` excludes direct repository pages. `delete_site_audit` cancels running edge Workflows when a workflow instance handle is available in Cloudflare Workflows; direct repository audits run out-of-band with synthetic marker `github-audit-*` and are deleted directly without contacting Cloudflare Workflows. A running row with a null instance ID cannot be cancelled via Workflows.
+> **Resolution & Deletion Invariants**: `resolveAudit` reads an explicit project-bound ID or the project's latest attempt regardless of status, ordered deterministically by `julianday(started_at) DESC NULLS LAST, id DESC` on SQLite/D1 and `CASE WHEN pg_input_is_valid(started_at, 'timestamptz') THEN started_at::timestamptz END DESC NULLS LAST, id DESC` on PostgreSQL. Direct repository source pages store HTTP status as NULL, so filtering `get_audit_pages` by `statusCode: 200` excludes direct repository pages. `delete_site_audit` cancels running edge Workflows when a workflow instance handle is available in Cloudflare Workflows; direct repository audits run out-of-band with synthetic marker `github-audit-*` and are deleted directly without contacting Cloudflare Workflows. A running row with a null instance ID cannot be cancelled via Workflows.
 > **Authentication & Watchdog Invariants**:
 > - **Authentication Lanes**: Public self-hosted MCP uses Cloudflare Access session cookie → Access edge → signed origin assertion (validating issuer, audience, subject, and email claims). For repository runners and benchmarks (`run-github-fleet-audit.ts`, `benchmark-archive-audit.ts`), `.env.selfhost` `GH_TOKEN`/`GITHUB_TOKEN` keys populate process/config state before `gh auth token` and `gh api`, taking precedence over ambient tokens when defined.
 > - **Attempt Expiration vs Watchdog Reconciler**: Abandoned repository audits running longer than 2 hours are reclaimed by the CLI runner pre-reservation pass scoped to the live bound tuple and by the background watchdog reconciler (`src/server/features/audit/services/auditReconciler.ts`), which persists progress in `watchdog_cursor` (`revision` CAS, bootstrapping missing cursor rows at revision `1` while enforcing an entry `TICK_BUDGET_MS` budget and re-entrant sweep guard). Reservation asserts no other currently running attempt exists for the project on the target DB.
@@ -967,7 +982,7 @@ OpenSEO exposes 80 registered MCP tools in `src/server/mcp/server.ts`:
 - `research_project_website`: Crawl and summarize initial project brand data from root page (`projectId`, `website` [URL string]).
 - `save_project_website_setup`: Save initial domain branding and keyword focus during onboarding (`projectId`, `name`, `domain`, `overview`, `competitors` [required array of `{ name, domain, notes? }`, max 100], `suggestedTopics` [optional, max 5 topics, each 5 prompts], `suggestedKeywords` [optional, max 15 keywords]).
 - `get_project_context`: Retrieve project configuration, target keywords, and brand identity (`projectId`).
-- `update_project_context`: Update project branding, competitors, or target locale (`projectId`, `updates` object).
+- `update_project_context`: Apply 1–50 structured project context patch operations (`projectId`, `updates` array of union ops: `section`, `customSection`, `deleteCustomSection`, `addCompetitors`, `removeCompetitors`, `addKeyPages`, `removeKeyPages`, `appendResearchLog`, `removeResearchLog`).
 - `get_domain_overview`: Get aggregate domain metrics and health status (`projectId`, `domain`, `scope` [`"domain"` | `"subdomains"`, optional], `includeSubdomains` [optional boolean, deprecated in favor of `scope`; omitting preserves `scope` inference], `locationCode` [optional], `languageCode` [optional]).
 
 ### Family 2: Keyword, Domain and SERP Research (10 tools)

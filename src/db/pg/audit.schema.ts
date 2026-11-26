@@ -1,10 +1,10 @@
 import { sql } from "drizzle-orm";
 import {
   boolean,
+  doublePrecision,
   index,
   integer,
   pgTable,
-  real,
   text,
   uniqueIndex,
 } from "drizzle-orm/pg-core";
@@ -169,10 +169,10 @@ export const auditLighthouseResults = pgTable(
     accessibilityScore: integer("accessibility_score"),
     bestPracticesScore: integer("best_practices_score"),
     seoScore: integer("seo_score"),
-    lcpMs: real("lcp_ms"),
-    cls: real("cls"),
-    inpMs: real("inp_ms"),
-    ttfbMs: real("ttfb_ms"),
+    lcpMs: doublePrecision("lcp_ms"),
+    cls: doublePrecision("cls"),
+    inpMs: doublePrecision("inp_ms"),
+    ttfbMs: doublePrecision("ttfb_ms"),
     errorMessage: text("error_message"),
     r2Key: text("r2_key"),
     payloadSizeBytes: integer("payload_size_bytes"),

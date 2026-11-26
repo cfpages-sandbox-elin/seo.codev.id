@@ -21,9 +21,11 @@ import {
   sqlText,
 } from "./github-archive-utils";
 
-// Sourced environment from .env.selfhost
+// Sourced environment from .env.selfhost (repo-relative)
 const ENV_FILE = resolve(
-  "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id/.env.selfhost",
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  ".env.selfhost",
 );
 
 function loadEnv(): Record<string, string> {
@@ -42,8 +44,10 @@ function loadEnv(): Record<string, string> {
           .slice(eqIdx + 1)
           .trim()
           .replace(/^['"]|['"]$/g, "");
-        env[key] = val;
-        process.env[key] = val;
+        if (val) {
+          env[key] = val;
+          process.env[key] = val;
+        }
       }
     }
   } catch (err) {
@@ -306,6 +310,36 @@ async function main() {
     console.log(
       `Enrolled Roster Filter: ${rosterId} (verified effective approved version)`,
     );
+  }
+
+  // Sol R31 V3-02: Census active roster members BEFORE inner-joining projects so unlinked/archived/stale members cannot be silently dropped.
+  let unmappedRosterCount = 0;
+  if (rosterId) {
+    const rosterCensusRows = runD1Query(
+      `SELECT rm.id AS member_id, rm.canonical_host, rm.project_id,
+              p.id AS active_project_id
+       FROM fleet_roster_members rm
+       JOIN fleet_roster_versions rv ON rv.id = rm.version_id
+       LEFT JOIN projects p ON p.id = rm.project_id
+         AND p.organization_id = rv.organization_id
+         AND p.archived_at IS NULL
+         AND lower(trim(p.domain)) = lower(trim(rm.canonical_host))
+       WHERE rm.version_id = ${sqlText(rosterId)}
+         AND rv.organization_id = 'shared-workspace'
+         AND rv.id = ${buildSqliteEffectiveRosterSql("'shared-workspace'")}
+         AND rm.enrollment_state = 'active';`,
+      isRemote,
+    );
+    const brokenMembers = rosterCensusRows.filter((r) => !r.active_project_id);
+    unmappedRosterCount = brokenMembers.length;
+    if (unmappedRosterCount > 0) {
+      console.warn(
+        `[WARNING] Effective roster '${rosterId}' has ${unmappedRosterCount} unlinked/archived/stale active member(s): ${brokenMembers
+          .slice(0, 5)
+          .map((r) => `${r.canonical_host}(${r.member_id})`)
+          .join(", ")}.`,
+      );
+    }
   }
 
   // Query enrolled projects in shared-workspace with normalized UTC epoch of completed edge crawls (Sol F05, C2)
@@ -684,6 +718,7 @@ async function main() {
   const undispatched = candidates.slice(queueIndex);
   console.log("\n=== Fleet Audit Run Finished ===");
   console.log(`Eligible Pre-Recency Candidates: ${eligiblePreRecencyCount}`);
+  console.log(`Unmapped / Stale Active Roster Members: ${unmappedRosterCount}`);
   console.log(`Ambiguous Domain Exclusions: ${ambiguousExcludedCount}`);
   console.log(`Skipped (Recent Within 10d): ${recentSkippedCount}`);
   console.log(`Total Candidates Selected: ${candidates.length}`);
@@ -700,7 +735,8 @@ async function main() {
     activeAudits.size +
     undispatched.length +
     skippedBusyCount +
-    ambiguousExcludedCount;
+    ambiguousExcludedCount +
+    (!targetDomainFilter ? unmappedRosterCount : 0);
   const emptyBulkPopulation =
     !targetDomainFilter && eligiblePreRecencyCount === 0;
   if (emptyBulkPopulation) {

@@ -303,20 +303,16 @@ export async function linkFleet(options: {
   let alreadyLinkedCount = 0;
   let inactiveCount = 0;
   let unmappedCount = 0;
-  const invalidActiveMembers: Array<{
+  const invalidExistingBindings: Array<{
     memberId: string;
     host: string;
     projectId: string;
+    enrollmentState: string;
     reason: string;
   }> = [];
 
   for (const m of existingMembers) {
-    if (m.enrollment_state !== "active") {
-      inactiveCount++;
-      continue;
-    }
     if (m.project_id !== null) {
-      alreadyLinkedCount++;
       const matchedProj = existingProjectIdMap.get(m.project_id);
       if (
         !matchedProj ||
@@ -324,15 +320,23 @@ export async function linkFleet(options: {
         matchedProj.domain.toLowerCase().trim() !==
           m.canonical_host.toLowerCase().trim()
       ) {
-        invalidActiveMembers.push({
+        invalidExistingBindings.push({
           memberId: m.id,
           host: m.canonical_host,
           projectId: m.project_id,
+          enrollmentState: m.enrollment_state,
           reason: matchedProj
             ? `project domain '${matchedProj.domain ?? "null"}' != '${m.canonical_host}'`
             : "project missing or archived/foreign org",
         });
       }
+    }
+    if (m.enrollment_state !== "active") {
+      inactiveCount++;
+      continue;
+    }
+    if (m.project_id !== null) {
+      alreadyLinkedCount++;
     } else if (
       !existingProjectDomainMap.has(m.canonical_host.toLowerCase().trim())
     ) {
@@ -346,7 +350,7 @@ export async function linkFleet(options: {
   console.log(`  - Fleet roster members to link: ${linkableCount}`);
   console.log(`  - Already linked active members: ${alreadyLinkedCount}`);
   console.log(
-    `  - Invalid existing active links: ${invalidActiveMembers.length}`,
+    `  - Invalid existing member links (all states): ${invalidExistingBindings.length}`,
   );
   console.log(`  - Inactive / parked roster members: ${inactiveCount}`);
   console.log(`  - Unmapped active roster members: ${unmappedCount}`);
@@ -392,15 +396,15 @@ export async function linkFleet(options: {
           ),
         );
     }
-    if (invalidActiveMembers.length > 0) {
+    if (invalidExistingBindings.length > 0) {
       console.error(
-        `\n[ERROR] Dry run detected ${invalidActiveMembers.length} invalid existing active member binding(s):`,
+        `\n[ERROR] Dry run detected ${invalidExistingBindings.length} invalid existing member binding(s):`,
       );
-      invalidActiveMembers
+      invalidExistingBindings
         .slice(0, 5)
         .forEach((inv) =>
           console.error(
-            `  ! ${inv.host} (member: ${inv.memberId}, project: ${inv.projectId}): ${inv.reason}`,
+            `  ! ${inv.host} (member: ${inv.memberId}, state: ${inv.enrollmentState}, project: ${inv.projectId}): ${inv.reason}`,
           ),
         );
       process.exitCode = 1;
@@ -419,9 +423,9 @@ export async function linkFleet(options: {
     return;
   }
 
-  if (invalidActiveMembers.length > 0) {
+  if (invalidExistingBindings.length > 0) {
     throw new Error(
-      `Cannot apply links while ${invalidActiveMembers.length} active roster member(s) have invalid existing project bindings (first: ${invalidActiveMembers[0].host} -> ${invalidActiveMembers[0].reason}).`,
+      `Cannot apply links while ${invalidExistingBindings.length} roster member(s) have invalid existing project bindings (first: ${invalidExistingBindings[0].host} [${invalidExistingBindings[0].enrollmentState}] -> ${invalidExistingBindings[0].reason}).`,
     );
   }
 

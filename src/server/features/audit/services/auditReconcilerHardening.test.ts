@@ -94,6 +94,7 @@ describe("auditReconciler hardening (V4-01, V4-03, V4-04)", () => {
       2,
       10,
       "irr_09",
+      expect.any(Date),
     );
   });
 

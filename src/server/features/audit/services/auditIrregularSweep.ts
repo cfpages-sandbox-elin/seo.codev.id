@@ -84,7 +84,7 @@ export async function reconcileIrregularRunningAudits(
 ) {
   try {
     let irregular = await withTimeout(
-      findIrregularRunningAudits(10, irregularCursorId),
+      findIrregularRunningAudits(10, irregularCursorId, cutoff),
       remainingMs(),
       "findIrregularAudits",
     );
@@ -94,7 +94,7 @@ export async function reconcileIrregularRunningAudits(
       irregularCursorId = null;
       if (remainingMs() >= 2_000) {
         irregular = await withTimeout(
-          findIrregularRunningAudits(10, null),
+          findIrregularRunningAudits(10, null, cutoff),
           remainingMs(),
           "findIrregularAuditsWrap",
         );

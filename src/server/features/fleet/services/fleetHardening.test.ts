@@ -87,4 +87,60 @@ describe("fleet scoring and comparability hardening (V4-03, V4-06)", () => {
       computeTrendDelta(curOfficial, "proj_1", [curRaw, prevRaw], nowMs),
     ).toBe(6);
   });
+
+  it("rejects empty probe objects in incident caps and floors 89.9999999995 pillars without rounding to 90 (Sol R31 V4-01)", () => {
+    const nowMs = Date.parse("2026-11-26T00:00:00.000Z");
+    const emptyProbeCap = {
+      id: "snap_empty_probe",
+      runItemId: "fri_empty_probe",
+      memberId: "mem_1",
+      projectId: "proj_1",
+      canonicalHost: "kaca.co.id",
+      score: 59,
+      grade: "F" as const,
+      coverage: 100,
+      isProvisional: false,
+      provisionalLower: null,
+      provisionalUpper: null,
+      hasIncidentCap: true,
+      incidentReason: JSON.stringify({
+        kind: "site_down",
+        expectedIntentVerified: true,
+        primaryProbe: {},
+        corroborationProbe: {},
+      }),
+      scoreTechnical: 90,
+      scoreInternalLinks: 90,
+      scoreMobilePerf: 90,
+      scoreOnPage: 90,
+      scoreSchema: 90,
+      scoreAiReadiness: 90,
+      seriesKey: "weekly-baseline",
+      comparabilityKey: null,
+      evidenceManifestR2Key: null,
+      evidenceManifestHash: null,
+      observedAt: "2026-11-25T00:00:00.000Z",
+      attemptStatus: "completed",
+      rubricVersion: "v1",
+    };
+    expect(officialPoint(emptyProbeCap, "proj_1", nowMs)).toBeNull();
+
+    const near90 = {
+      ...emptyProbeCap,
+      id: "snap_near90",
+      hasIncidentCap: false,
+      incidentReason: null,
+      score: 89,
+      grade: "B" as const,
+      scoreTechnical: 89.9999999995,
+      scoreInternalLinks: 89.9999999995,
+      scoreMobilePerf: 89.9999999995,
+      scoreOnPage: 89.9999999995,
+      scoreSchema: 89.9999999995,
+      scoreAiReadiness: 89.9999999995,
+    };
+    const parsedNear90 = officialPoint(near90, "proj_1", nowMs);
+    expect(parsedNear90?.score).toBe(89);
+    expect(parsedNear90?.grade).toBe("B");
+  });
 });

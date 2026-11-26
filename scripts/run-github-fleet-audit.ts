@@ -413,6 +413,9 @@ export function findMatchingCompletedAudit(
                 AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(rm.canonical_host))
                 AND json_extract(a.config, '$.rosterSource.repoName') = rm.repo_name
                 AND r.organization_id = 'shared-workspace'
+                AND fs.coverage = 100
+                AND fs.score BETWEEN 0 AND 100
+                AND fs.grade = (CASE WHEN fs.score >= 90 THEN 'A' WHEN fs.score >= 80 THEN 'B' WHEN fs.score >= 70 THEN 'C' WHEN fs.score >= 60 THEN 'D' ELSE 'F' END)
                 ${tripleFilter}
             ) AS has_verified_triple
      FROM audits a
@@ -420,8 +423,8 @@ export function findMatchingCompletedAudit(
        AND a.status = 'completed'
        AND a.workflow_instance_id LIKE 'github-audit-%'
        AND a.pages_total > 0
-       AND a.pages_crawled >= a.pages_total
-       AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+       AND a.pages_crawled = a.pages_total
+       AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
        AND NOT EXISTS (
          SELECT 1 FROM audit_issues i
          WHERE i.audit_id = a.id AND i.page_id IS NOT NULL
@@ -1264,6 +1267,13 @@ async function auditRepository(
                WHERE p.id = i.page_id AND p.audit_id = ${sqlText(auditId)}
              )
          )
+         AND EXISTS (
+           SELECT 1 FROM projects p
+           WHERE p.id = ${sqlText(projectId)}
+             AND p.organization_id = 'shared-workspace'
+             AND p.archived_at IS NULL
+             AND lower(trim(p.domain)) = lower(trim(${sqlText(domain)}))
+         )
          ${
            mapping?.expectedRosterVersionId && mapping?.expectedMemberId
              ? `AND EXISTS (
@@ -1290,6 +1300,14 @@ async function auditRepository(
       throw new Error(
         `Audit CAS finalization failed for ${auditId} (updated ${casResult?.length ?? 0} rows, expected 1 matching id). State conflict or child count mismatch.`,
       );
+    }
+
+    if (!isComplete) {
+      console.log(
+        `[DIAGNOSTIC SKIP] Audit '${auditId}' finalized as '${finalStatus}' (${errorCode ?? "INCOMPLETE"}); skipping diagnostic fleet series.`,
+      );
+      process.exitCode = 1;
+      return false;
     }
 
     // Stage 5 (FLEET-GH-05): Diagnostic Fleet Series Integration strictly scoped to effective roster and active projects (Sol P1-02, P1-03)
@@ -1584,13 +1602,16 @@ function publishGuardedDiagnosticTriple(
       JOIN projects pr ON pr.id = a.project_id AND pr.archived_at IS NULL
       JOIN fleet_roster_members m ON m.project_id = pr.id AND m.id = p.mid
       JOIN fleet_roster_versions v ON v.id = m.version_id
-      WHERE a.status = 'completed' AND a.pages_crawled >= a.pages_total AND a.pages_total > 0
+      WHERE a.status = 'completed' AND a.pages_crawled = a.pages_total AND a.pages_total > 0
         AND pr.id = p.pid AND pr.organization_id = p.org AND v.organization_id = p.org
         AND m.enrollment_state = 'active' AND m.version_id = p.vid
         AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
         AND lower(trim(m.canonical_host)) = p.dom
         AND v.id = ${effectiveVerSql}
-        AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+        AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
+        AND ${coverage} = 100
+        AND ${score} BETWEEN 0 AND 100
+        AND ${sGrade} = (CASE WHEN ${score} >= 90 THEN 'A' WHEN ${score} >= 80 THEN 'B' WHEN ${score} >= 70 THEN 'C' WHEN ${score} >= 60 THEN 'D' ELSE 'F' END)
         AND NOT EXISTS (SELECT 1 FROM audit_issues i WHERE i.audit_id = a.id AND i.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id))
         AND a.workflow_instance_id LIKE 'github-audit-%'
         AND json_valid(a.config) AND json_extract(a.config, '$.source') = 'github_repository_direct'
@@ -1628,9 +1649,12 @@ function publishGuardedDiagnosticTriple(
     JOIN fleet_roster_versions v ON v.id = m.version_id AND v.organization_id = fr.organization_id
     WHERE fr.organization_id = p.org AND fr.status = 'completed' AND fr.completed_at = p.ts
       AND v.id = ${effectiveVerSql}
-      AND a.status = 'completed' AND a.pages_crawled >= a.pages_total AND a.pages_total > 0
+      AND a.status = 'completed' AND a.pages_crawled = a.pages_total AND a.pages_total > 0
       AND a.workflow_instance_id LIKE 'github-audit-%'
-      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
+      AND ${coverage} = 100
+      AND ${score} BETWEEN 0 AND 100
+      AND ${sGrade} = (CASE WHEN ${score} >= 90 THEN 'A' WHEN ${score} >= 80 THEN 'B' WHEN ${score} >= 70 THEN 'C' WHEN ${score} >= 60 THEN 'D' ELSE 'F' END)
       AND NOT EXISTS (SELECT 1 FROM audit_issues i WHERE i.audit_id = a.id AND i.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id))
       AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
       AND lower(trim(m.canonical_host)) = p.dom
@@ -1664,7 +1688,11 @@ function publishGuardedDiagnosticTriple(
     WHERE fr.organization_id = p.org AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' AND fri.completed_at = p.ts
       AND fr.status = 'completed' AND fr.completed_at = p.ts
       AND v.id = ${effectiveVerSql}
-      AND a.status = 'completed' AND a.workflow_instance_id LIKE 'github-audit-%'
+      AND a.status = 'completed' AND a.pages_crawled = a.pages_total AND a.pages_total > 0 AND a.workflow_instance_id LIKE 'github-audit-%'
+      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
+      AND ${coverage} = 100
+      AND ${score} BETWEEN 0 AND 100
+      AND ${sGrade} = (CASE WHEN ${score} >= 90 THEN 'A' WHEN ${score} >= 80 THEN 'B' WHEN ${score} >= 70 THEN 'C' WHEN ${score} >= 60 THEN 'D' ELSE 'F' END)
       AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
       AND lower(trim(m.canonical_host)) = p.dom
       AND json_valid(a.config) AND json_extract(a.config, '$.source') = 'github_repository_direct'
@@ -1764,14 +1792,17 @@ function verifyDiagnosticTriple(
       AND i.status = ${sqlText(expectedItemStatus)}
       AND a.status = 'completed'
       AND a.pages_total > 0
-      AND a.pages_crawled >= a.pages_total
+      AND a.pages_crawled = a.pages_total
       AND a.workflow_instance_id LIKE 'github-audit-%'
-      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) >= a.pages_total
+      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
       AND NOT EXISTS (
         SELECT 1 FROM audit_issues ai
         WHERE ai.audit_id = a.id AND ai.page_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = ai.page_id AND p2.audit_id = a.id)
       )
+      AND fs.coverage = 100
+      AND fs.score BETWEEN 0 AND 100
+      AND fs.grade = (CASE WHEN fs.score >= 90 THEN 'A' WHEN fs.score >= 80 THEN 'B' WHEN fs.score >= 70 THEN 'C' WHEN fs.score >= 60 THEN 'D' ELSE 'F' END)
       AND json_valid(a.config)
       AND json_extract(a.config, '$.source') = 'github_repository_direct'
       AND json_extract(a.config, '$.repoName') = m.repo_name
@@ -1890,8 +1921,8 @@ function repairDiagnosticObservation(
     if (status !== "completed") return false;
     const crawled = Number(pages_crawled || 0);
     const total = Number(pages_total || 0);
-    if (total === 0 || crawled < total) return false;
-    if (Number(page_count || 0) < total) return false;
+    if (total <= 0 || crawled !== total) return false;
+    if (Number(page_count || 0) !== total) return false;
     if (Number(orphaned_count || 0) > 0) return false;
 
     // Sol F01: Validate audit config source tuple matches expectedSource across all 6 fields
@@ -2206,6 +2237,13 @@ async function main() {
     );
     for (const r of rosterRows) {
       const host = r.canonical_host.toLowerCase().trim();
+      if (!isValidCanonicalHostname(host)) {
+        rosterUnlinkedOrStaleCount++;
+        console.error(
+          `[ERROR] Stored canonical host '${host}' for active roster member '${r.member_id}' is not a valid RFC 1123 hostname.`,
+        );
+        continue;
+      }
       const activeProjId = projectIdByDomain.get(host);
       if (
         !r.project_id ||
@@ -2443,6 +2481,13 @@ async function main() {
         break;
       }
       scannedCandidates++;
+      if (!isValidCanonicalHostname(dom)) {
+        unmappedCount++;
+        console.error(
+          `[ERROR] Discovered candidate domain '${dom}' is not a valid RFC 1123 hostname; skipping.`,
+        );
+        continue;
+      }
       const approvedMember = approvedMembersByHost.get(dom);
       const isEligible = isWorkspace || approvedHosts.has(dom);
       if (!isEligible) continue;

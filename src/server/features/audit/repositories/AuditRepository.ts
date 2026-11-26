@@ -56,6 +56,7 @@ async function createAudit(data: {
       pagesTotal: data.pagesTotal,
       lighthouseTotal: data.lighthouseTotal,
       currentPhase: "discovery",
+      startedAt: new Date().toISOString(),
     })
     .onConflictDoNothing()
     .returning({ id: audits.id });
