@@ -144,12 +144,20 @@ export function compareUtf8Binary(a: string, b: string): number {
 }
 
 /**
- * Shared SQLite UTC timestamp parser/validator matching parseUtcTimestampMs (Sol R1, V4-03).
- * Accepts valid calendar 0001-9999 YYYY-MM-DD HH:MM:SS(.sss)? or YYYY-MM-DDTHH:MM:SS(.sss)?Z
- * with hour 00-23, uppercase 'Z' only (GLOB), and zero NUL bytes.
+ * Shared SQLite UTC timestamp parser/validator matching parseUtcTimestampMs (Sol R1, V4-03, V4-01).
+ * Uses fixed-position checks + max 7-byte GLOB ('*[^0-9]*') to stay well under Cloudflare D1's
+ * 50-byte LIKE/GLOB pattern limit while enforcing strict calendar 0001-9999, hour 00-23,
+ * uppercase 'Z' (unicode 90), and zero NUL bytes.
  */
 export function sqliteUtcTimeSql(col: string): string {
-  return `(CASE WHEN instr(${col}, char(0)) = 0 AND substr(${col}, 1, 4) > '0000' AND substr(${col}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9]' AND substr(${col}, 12, 2) < '24' AND substr(${col}, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(${col}, 1, 19)) AND (length(${col}) = 19 OR (length(${col}) BETWEEN 21 AND 23 AND substr(${col}, 20) GLOB '.[0-9]*' AND substr(${col}, 21) NOT GLOB '*[^0-9]*')) AND julianday(${col}) IS NOT NULL THEN julianday(${col}) WHEN instr(${col}, char(0)) = 0 AND substr(${col}, 1, 4) > '0000' AND ${col} GLOB '*Z' AND substr(${col}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]' AND substr(${col}, 12, 2) < '24' AND substr(${col}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${col}, 1, 19)) AND (length(${col}) = 20 OR (length(${col}) BETWEEN 22 AND 24 AND substr(${col}, 20, length(${col}) - 20) GLOB '.[0-9]*' AND substr(${col}, 21, length(${col}) - 21) NOT GLOB '*[^0-9]*')) AND julianday(${col}) IS NOT NULL THEN julianday(${col}) ELSE NULL END)`;
+  const digits12 = `(((substr(${col}, 1, 4) || substr(${col}, 6, 2)) || (substr(${col}, 9, 2) || substr(${col}, 12, 2))) || (substr(${col}, 15, 2) || substr(${col}, 18, 2)))`;
+  const spaceSeps = `((substr(${col}, 5, 1) || substr(${col}, 8, 1)) || (substr(${col}, 11, 1) || (substr(${col}, 14, 1) || substr(${col}, 17, 1))))`;
+  const isoSeps = `((substr(${col}, 5, 1) || substr(${col}, 8, 1)) || (substr(${col}, 14, 1) || substr(${col}, 17, 1)))`;
+  const spaceFrac = `(length(${col}) = 19 OR ((length(${col}) BETWEEN 21 AND 23) AND (substr(${col}, 20, 1) = '.' AND substr(${col}, 21) NOT GLOB '*[^0-9]*')))`;
+  const isoFrac = `(length(${col}) = 20 OR ((length(${col}) BETWEEN 22 AND 24) AND (substr(${col}, 20, 1) = '.' AND substr(${col}, 21, length(${col}) - 21) NOT GLOB '*[^0-9]*')))`;
+  const spaceValid = `(((instr(${col}, char(0)) = 0 AND substr(${col}, 1, 4) > '0000') AND (${spaceSeps} = '-- ::' AND ${digits12} NOT GLOB '*[^0-9]*')) AND ((substr(${col}, 12, 2) < '24' AND substr(${col}, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(${col}, 1, 19))) AND (${spaceFrac} AND julianday(${col}) IS NOT NULL)))`;
+  const isoValid = `(((instr(${col}, char(0)) = 0 AND substr(${col}, 1, 4) > '0000') AND ((length(${col}) >= 20 AND unicode(substr(${col}, length(${col}), 1)) = 90) AND (unicode(substr(${col}, 11, 1)) = 84 AND ${isoSeps} = '--::'))) AND ((${digits12} NOT GLOB '*[^0-9]*' AND substr(${col}, 12, 2) < '24') AND (substr(${col}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${col}, 1, 19)) AND (${isoFrac} AND julianday(${col}) IS NOT NULL))))`;
+  return `(CASE WHEN ${spaceValid} THEN julianday(${col}) WHEN ${isoValid} THEN julianday(${col}) ELSE NULL END)`;
 }
 
 /**

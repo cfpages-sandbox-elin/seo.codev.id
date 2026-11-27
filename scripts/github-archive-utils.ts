@@ -19,6 +19,7 @@ export {
   isValidRepoSlug,
   normalizeRepoSlug,
   normalizeGitRelativePath,
+  parseUtcTimestampMs,
   sqliteUtcTimeSql,
 };
 
@@ -26,9 +27,12 @@ export {
  * Shared SQLite subquery selecting the currently effective approved roster version
  * using identical calendar/UTC validation and BINARY tie-breaking across all CLI tools (Sol R1).
  */
-export function buildSqliteEffectiveRosterSql(orgIdSqlLiteral: string): string {
-  const ts = sqliteUtcTimeSql("approved_at");
-  return `(SELECT id FROM (SELECT id, ${ts} AS ts FROM fleet_roster_versions WHERE organization_id = ${orgIdSqlLiteral} AND approved_at IS NOT NULL) WHERE ts IS NOT NULL AND ts <= julianday('now') ORDER BY ts DESC, id COLLATE BINARY DESC LIMIT 1)`;
+export function buildSqliteEffectiveRosterSql(
+  orgIdSqlLiteral: string,
+  clockExpr = "julianday('now')",
+): string {
+  const ts = sqliteUtcTimeSql("v.t");
+  return `(SELECT id FROM (SELECT id, ${ts} AS ts FROM (SELECT id, approved_at AS t FROM fleet_roster_versions WHERE organization_id = ${orgIdSqlLiteral} AND approved_at IS NOT NULL) v) WHERE ts IS NOT NULL AND ts <= ${clockExpr} ORDER BY ts DESC, id COLLATE BINARY DESC LIMIT 1)`;
 }
 
 /**
@@ -316,7 +320,7 @@ export function extractJsonFromOutput(stdout: string): any {
  * Loads environment variables from local config files.
  */
 export function loadLocalEnv(
-  repoRoot = "C:/Users/THINKPAD/Documents/GitHub/seo.codev.id",
+  repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), ".."),
 ): Record<string, string> {
   const env: Record<string, string> = {};
   const candidates = [
@@ -337,7 +341,7 @@ export function loadLocalEnv(
               .slice(eqIdx + 1)
               .trim()
               .replace(/^['"]|['"]$/g, "");
-            if (!env[key]) env[key] = val;
+            if (val && !env[key]) env[key] = val;
           }
         }
       } catch {}
@@ -353,13 +357,16 @@ function windowsCommandUpperBound(argv: string[]) {
 }
 
 /**
- * Literal Hex SQL Text Encoder (Sol R1, Round 17).
- * Encodes strings into SQLite blob literals CAST(X'...' AS TEXT) to prevent
- * Wrangler CLI local command trimmers from stripping keywords or failing on SQL syntax.
+ * Compact Safe-ASCII / Literal Hex SQL Text Encoder (Sol R1, R17, R32 V1-02).
+ * Emits compact single-quoted literals for strictly safe ASCII tokens (reducing
+ * 253-char domain & long ID SQL footprint by >50%) and hex-encodes everything else.
  */
 export function sqlText(value: string | null | undefined): string {
   if (value === null || value === undefined) {
     return "NULL";
+  }
+  if (/^[A-Za-z0-9._:/@-]{0,512}$/.test(value)) {
+    return `'${value}'`;
   }
   return "CAST(X'" + Buffer.from(value, "utf8").toString("hex") + "' AS TEXT)";
 }

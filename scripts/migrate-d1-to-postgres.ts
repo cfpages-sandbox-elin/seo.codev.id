@@ -669,7 +669,7 @@ async function verifyTableParity(
         }
         if (
           name === "watchdog_cursor" &&
-          Number(pgRow.revision ?? 0) >= Number(expected.revision ?? 0)
+          Number(pgRow.revision ?? 0) > Number(expected.revision ?? 0)
         ) {
           continue;
         }
@@ -873,7 +873,7 @@ async function copyTable(
             const destRow = destRows[0] as Record<string, unknown>;
             if (
               name === "watchdog_cursor" &&
-              Number(destRow.revision ?? 0) >= Number(expectedRow.revision ?? 0)
+              Number(destRow.revision ?? 0) > Number(expectedRow.revision ?? 0)
             ) {
               continue;
             }

@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import { sort } from "remeda";
 import { db } from "@/db";
 import { fleetRuns, fleetRunItems, fleetSnapshots } from "@/db/schema";
@@ -11,6 +11,7 @@ import {
 } from "../services/fleetConstants";
 import type {
   RawFleetMember,
+  RawFleetRunItem,
   RawFleetSnapshotWithAttempt,
 } from "./FleetRepository";
 
@@ -36,9 +37,9 @@ export function buildFsPlausibleOfficialSql(isPg: boolean) {
   if (isPg) {
     const floorU = `FLOOR(((${RAW_WEIGHTED_EXPR})::numeric + 1e-12))::int`;
     const primary =
-      "coalesce((fs.incident_reason)::jsonb->'primaryProbe', (fs.incident_reason)::jsonb->'probe')";
+      "coalesce(nullif((fs.incident_reason)::jsonb->'primaryProbe', 'null'::jsonb), nullif((fs.incident_reason)::jsonb->'probe', 'null'::jsonb))";
     const corrob =
-      "coalesce((fs.incident_reason)::jsonb->'corroborationProbe', (fs.incident_reason)::jsonb->'corroboration')";
+      "coalesce(nullif((fs.incident_reason)::jsonb->'corroborationProbe', 'null'::jsonb), nullif((fs.incident_reason)::jsonb->'corroboration', 'null'::jsonb))";
     const capSql = `(CASE WHEN fs.has_incident_cap = TRUE AND fs.score <= 59 AND fs.incident_reason IS NOT NULL AND left(trim(fs.incident_reason), 1) = '{' AND right(trim(fs.incident_reason), 1) = '}' AND pg_input_is_valid(fs.incident_reason, 'jsonb') THEN (CASE WHEN jsonb_typeof((fs.incident_reason)::jsonb) = 'object' AND lower(coalesce((fs.incident_reason)::jsonb->>'kind', '')) IN ('dns_failure','tls_invalid','tcp_timeout','http_5xx','empty_body','malware_defacement','site_down') AND jsonb_typeof((fs.incident_reason)::jsonb->'expectedIntentVerified') = 'boolean' AND ((fs.incident_reason)::jsonb->'expectedIntentVerified') = 'true'::jsonb AND ${pgProbeOkSql(primary)} AND ${pgProbeOkSql(corrob)} AND coalesce(nullif(trim(${primary}->>'id'), ''), nullif(trim(${primary}->>'probeId'), '')) <> coalesce(nullif(trim(${corrob}->>'id'), ''), nullif(trim(${corrob}->>'probeId'), '')) AND trim(${primary}->>'source') <> trim(${corrob}->>'source') THEN TRUE ELSE FALSE END) ELSE FALSE END)`;
     return sql.raw(
       `(fri.status = 'completed' AND fr.rubric_version = 'v1' AND fs.coverage = 100 AND NOT fs.is_provisional AND fs.score BETWEEN 0 AND 100 AND fs.score_technical BETWEEN 0 AND 100 AND fs.score_internal_links BETWEEN 0 AND 100 AND fs.score_mobile_perf BETWEEN 0 AND 100 AND fs.score_on_page BETWEEN 0 AND 100 AND fs.score_schema BETWEEN 0 AND 100 AND fs.score_ai_readiness BETWEEN 0 AND 100 AND ((NOT fs.has_incident_cap AND (fs.score = ${floorU} OR ABS((${RAW_WEIGHTED_EXPR}) - fs.score) < 1e-7) AND ${gradeMatchFor(floorU)}) OR (${capSql} AND (fs.score = LEAST(59, ${floorU}) OR ABS(LEAST(59, ${RAW_WEIGHTED_EXPR}) - fs.score) < 1e-7) AND ${gradeMatchFor(`LEAST(59, ${floorU})`)}) OR (fs.has_incident_cap AND fs.score <= 59 AND (fs.score = ${floorU} OR ABS((${RAW_WEIGHTED_EXPR}) - fs.score) < 1e-7) AND ${gradeMatchFor(floorU)})))`,
@@ -113,24 +114,48 @@ export function normalizeSnapshotRow(
   };
 }
 
-function appendRecoveryPage(opts: {
+export function hasComparableOfficialHistory(
+  snaps: RawFleetSnapshotWithAttempt[],
+  memberProjectId: string | null,
+  memberHost: string,
+  nowMs: number,
+): boolean {
+  if (!memberProjectId) return false;
+  const points = snaps
+    .map((s) =>
+      officialPoint(s, memberProjectId, nowMs, s.attemptStatus, memberHost),
+    )
+    .filter((p): p is NonNullable<typeof p> => p !== null);
+  if (points.length === 0) return false;
+  const ordered = sort(points, (a, b) => {
+    const t = b.observedAtMs - a.observedAtMs;
+    return t !== 0 ? t : compareUtf8Binary(b.id, a.id);
+  });
+  const latest = ordered[0];
+  if (!latest || !latest.comparabilityKey) return false;
+  return ordered.some(
+    (p) =>
+      p.observedAtMs < latest.observedAtMs &&
+      p.comparabilityKey === latest.comparabilityKey,
+  );
+}
+
+export function appendRecoveryPage(opts: {
   page: RawSnapshotJoinRow[];
   member: RawFleetMember;
   nowMs: number;
   snapshots: RawFleetSnapshotWithAttempt[];
   seenSnapIds: Set<string>;
   recoveredRunItemIds: Set<string>;
-}): number {
+}): void {
   const { page, member, nowMs, snapshots, seenSnapIds, recoveredRunItemIds } =
     opts;
-  let addedValid = 0;
   for (const row of page) {
     if (seenSnapIds.has(row.id)) continue;
     const candidate = normalizeSnapshotRow(row);
     if (!candidate) continue;
     seenSnapIds.add(row.id);
     snapshots.push(candidate);
-    recoveredRunItemIds.add(row.runItemId);
     if (
       officialPoint(
         candidate,
@@ -140,15 +165,112 @@ function appendRecoveryPage(opts: {
         member.canonicalHost,
       ) !== null
     ) {
-      addedValid++;
+      recoveredRunItemIds.add(row.runItemId);
     }
   }
-  return addedValid;
+}
+
+/**
+ * Ensures every active member's newest terminal weekly-baseline attempt retains its own paired
+ * valid-clock snapshot even when older attempts had newer observations filling rn <= 30 (Sol R32 V4-04).
+ */
+export async function hydrateLatestAttemptSnapshots(params: {
+  members: RawFleetMember[];
+  runItems: RawFleetRunItem[];
+  organizationId: string;
+  versionId: string;
+  isPg: boolean;
+  nowIso: string;
+  snapshots: RawFleetSnapshotWithAttempt[];
+  seenSnapIds: Set<string>;
+}): Promise<void> {
+  const {
+    members,
+    runItems,
+    organizationId,
+    versionId,
+    isPg,
+    nowIso,
+    snapshots,
+    seenSnapIds,
+  } = params;
+  const activeMemberIds = new Set(
+    members
+      .filter((m) => m.projectId !== null && m.enrollmentState === "active")
+      .map((m) => m.id),
+  );
+  const existingRunItemSnaps = new Set(
+    snapshots
+      .filter((s) => s.seriesKey === "weekly-baseline")
+      .map((s) => s.runItemId),
+  );
+  const latestByMember = new Map<string, RawFleetRunItem>();
+  for (const item of runItems) {
+    if (!activeMemberIds.has(item.memberId)) continue;
+    if (item.primarySeriesKey !== "weekly-baseline") continue;
+    if (item.status !== "completed" && item.status !== "partial") continue;
+    const prev = latestByMember.get(item.memberId);
+    if (!prev) {
+      latestByMember.set(item.memberId, item);
+      continue;
+    }
+    const ta = parseUtcTimestampMs(item.completedAt);
+    const tb = parseUtcTimestampMs(prev.completedAt);
+    const diff =
+      (Number.isFinite(ta) ? ta : 0) - (Number.isFinite(tb) ? tb : 0);
+    if (diff > 0 || (diff === 0 && compareUtf8Binary(item.id, prev.id) > 0)) {
+      latestByMember.set(item.memberId, item);
+    }
+  }
+  const missingItemIds = [...latestByMember.values()]
+    .map((i) => i.id)
+    .filter((id) => !existingRunItemSnaps.has(id));
+  if (missingItemIds.length === 0) return;
+
+  const observedExpr = isPg
+    ? sql.raw(pgSafeTs("fleet_snapshots.observed_at"))
+    : sql.raw(sqliteSafeTs("fleet_snapshots.observed_at"));
+  const completedExpr = isPg
+    ? sql.raw(pgSafeTs("fleet_run_items.completed_at"))
+    : sql.raw(sqliteSafeTs("fleet_run_items.completed_at"));
+  const nowBound = isPg
+    ? sql`${nowIso}::timestamptz`
+    : sql`julianday(${nowIso})`;
+
+  for (let i = 0; i < missingItemIds.length; i += 50) {
+    const chunk = missingItemIds.slice(i, i + 50);
+    const rows: RawSnapshotJoinRow[] = await db
+      .select(snapshotSelectColumns)
+      .from(fleetSnapshots)
+      .innerJoin(fleetRunItems, eq(fleetSnapshots.runItemId, fleetRunItems.id))
+      .innerJoin(
+        fleetRuns,
+        and(
+          eq(fleetRunItems.runId, fleetRuns.id),
+          eq(fleetRuns.organizationId, organizationId),
+          eq(fleetRuns.rosterVersionId, versionId),
+        ),
+      )
+      .where(
+        and(
+          inArray(fleetSnapshots.runItemId, chunk),
+          eq(fleetSnapshots.seriesKey, "weekly-baseline"),
+          sql`(${observedExpr} IS NOT NULL AND ${observedExpr} <= ${nowBound} AND ${completedExpr} IS NOT NULL AND ${completedExpr} <= ${nowBound} AND ${observedExpr} <= ${completedExpr})`,
+        ),
+      );
+    for (const row of rows) {
+      if (seenSnapIds.has(row.id)) continue;
+      const candidate = normalizeSnapshotRow(row);
+      if (!candidate) continue;
+      seenSnapIds.add(row.id);
+      snapshots.push(candidate);
+    }
+  }
 }
 
 /**
  * Bounded keyset continuation sweep when a member fills its initial 30-row weekly window
- * with < 2 JS-verified officialPoint observations (Sol R31 V4-01).
+ * without recovering a strictly earlier comparable trend pair (Sol R31 V4-01, R32 V4-05).
  */
 export async function recoverMemberWeeklyBaselines(params: {
   member: RawFleetMember;
@@ -182,18 +304,16 @@ export async function recoverMemberWeeklyBaselines(params: {
       s.attemptStatus === "completed",
   );
   if (weeklyCompleted.length < 30) return;
-
-  let validOfficialCount = weeklyCompleted.filter(
-    (s) =>
-      officialPoint(
-        s,
-        member.projectId,
-        nowMs,
-        s.attemptStatus,
-        member.canonicalHost,
-      ) !== null,
-  ).length;
-  if (validOfficialCount >= 2) return;
+  if (
+    hasComparableOfficialHistory(
+      weeklyCompleted,
+      member.projectId,
+      member.canonicalHost,
+      nowMs,
+    )
+  ) {
+    return;
+  }
 
   const sortedAsc = sort(weeklyCompleted, (a, b) => {
     const ta = parseUtcTimestampMs(a.observedAt);
@@ -208,6 +328,9 @@ export async function recoverMemberWeeklyBaselines(params: {
   const observedExpr = isPg
     ? sql.raw(pgSafeTs("fleet_snapshots.observed_at"))
     : sql.raw(sqliteSafeTs("fleet_snapshots.observed_at"));
+  const completedExpr = isPg
+    ? sql.raw(pgSafeTs("fleet_run_items.completed_at"))
+    : sql.raw(sqliteSafeTs("fleet_run_items.completed_at"));
   const nowBound = isPg
     ? sql`${nowIso}::timestamptz`
     : sql`julianday(${nowIso})`;
@@ -246,7 +369,7 @@ export async function recoverMemberWeeklyBaselines(params: {
           eq(fleetRunItems.status, "completed"),
           eq(fleetRuns.rubricVersion, "v1"),
           sql`lower(trim(${fleetSnapshots.canonicalHost})) = lower(trim(${member.canonicalHost}))`,
-          sql`(${observedExpr} IS NOT NULL AND ${observedExpr} <= ${nowBound})`,
+          sql`(${observedExpr} IS NOT NULL AND ${observedExpr} <= ${nowBound} AND ${completedExpr} IS NOT NULL AND ${completedExpr} <= ${nowBound} AND ${observedExpr} <= ${completedExpr})`,
           cursorKeysetSql,
         ),
       )
@@ -259,7 +382,7 @@ export async function recoverMemberWeeklyBaselines(params: {
       .limit(30);
 
     if (page.length === 0) break;
-    validOfficialCount += appendRecoveryPage({
+    appendRecoveryPage({
       page,
       member,
       nowMs,
@@ -271,6 +394,23 @@ export async function recoverMemberWeeklyBaselines(params: {
     if (!tail) break;
     cursorObserved = tail.observedAt;
     cursorId = tail.id;
-    if (page.length < 30 || validOfficialCount >= 2) break;
+    const memberAllWeekly = snapshots.filter(
+      (s) =>
+        s.memberId === member.id &&
+        s.projectId === member.projectId &&
+        s.seriesKey === "weekly-baseline" &&
+        s.attemptStatus === "completed",
+    );
+    if (
+      page.length < 30 ||
+      hasComparableOfficialHistory(
+        memberAllWeekly,
+        member.projectId,
+        member.canonicalHost,
+        nowMs,
+      )
+    ) {
+      break;
+    }
   }
 }

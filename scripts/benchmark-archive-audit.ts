@@ -10,7 +10,8 @@
  */
 import { execSync } from "node:child_process";
 import fs, { readFileSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { parseArgs } from "node:util";
@@ -25,8 +26,10 @@ import {
   normalizeGitRelativePath,
 } from "./github-archive-utils";
 
-const ENV_FILE = resolve(".env.selfhost");
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const ENV_FILE = resolve(REPO_ROOT, ".env.selfhost");
 const MANIFEST_PATH = resolve(
+  REPO_ROOT,
   "src/server/features/fleet/data/fleetManifest.json",
 );
 

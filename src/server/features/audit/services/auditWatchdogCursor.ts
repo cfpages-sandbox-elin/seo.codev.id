@@ -39,24 +39,32 @@ const pgTimeExpr = (expr: SQL | Column | string | null | undefined) => sql`(
   END
 )`;
 
+const sqliteDigits12 = (expr: SQL | Column | string | null | undefined) =>
+  sql`(((substr(${expr}, 1, 4) || substr(${expr}, 6, 2)) || (substr(${expr}, 9, 2) || substr(${expr}, 12, 2))) || (substr(${expr}, 15, 2) || substr(${expr}, 18, 2)))`;
+
+const sqliteCanonicalIsoCheck = (
+  expr: SQL | Column | string | null | undefined,
+) => sql`(
+  ((instr(${expr}, char(0)) = 0 AND length(${expr}) = 24)
+   AND (substr(${expr}, 1, 4) > '0000' AND (unicode(substr(${expr}, 11, 1)) = 84 AND unicode(substr(${expr}, 24, 1)) = 90)))
+  AND (((((substr(${expr}, 5, 1) || substr(${expr}, 8, 1)) || (substr(${expr}, 14, 1) || substr(${expr}, 17, 1))) || substr(${expr}, 20, 1)) = '--::.')
+   AND ((${sqliteDigits12(expr)} || substr(${expr}, 21, 3)) NOT GLOB '*[^0-9]*'
+    AND (substr(${expr}, 12, 2) < '24' AND substr(${expr}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${expr}, 1, 19)))))
+)`;
+
 const sqliteTimeExpr = (expr: SQL | Column | string | null | undefined) => sql`(
   CASE
-    WHEN instr(${expr}, char(0)) = 0
-     AND substr(${expr}, 1, 4) > '0000'
-     AND substr(${expr}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
-     AND substr(${expr}, 12, 2) < '24'
-     AND substr(${expr}, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(${expr}, 1, 19))
-     AND (length(${expr}) = 19 OR (length(${expr}) BETWEEN 21 AND 23 AND substr(${expr}, 20) GLOB '.[0-9]*' AND substr(${expr}, 21) NOT GLOB '*[^0-9]*'))
-     AND julianday(${expr}) IS NOT NULL
+    WHEN (((instr(${expr}, char(0)) = 0 AND substr(${expr}, 1, 4) > '0000')
+      AND (((substr(${expr}, 5, 1) || substr(${expr}, 8, 1)) || (substr(${expr}, 11, 1) || (substr(${expr}, 14, 1) || substr(${expr}, 17, 1)))) = '-- ::' AND ${sqliteDigits12(expr)} NOT GLOB '*[^0-9]*'))
+     AND ((substr(${expr}, 12, 2) < '24' AND substr(${expr}, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(${expr}, 1, 19)))
+      AND ((length(${expr}) = 19 OR ((length(${expr}) BETWEEN 21 AND 23) AND (substr(${expr}, 20, 1) = '.' AND substr(${expr}, 21) NOT GLOB '*[^0-9]*'))) AND julianday(${expr}) IS NOT NULL)))
     THEN julianday(${expr})
-    WHEN instr(${expr}, char(0)) = 0
-     AND substr(${expr}, 1, 4) > '0000'
-     AND ${expr} GLOB '*Z'
-     AND substr(${expr}, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
-     AND substr(${expr}, 12, 2) < '24'
-     AND substr(${expr}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${expr}, 1, 19))
-     AND (length(${expr}) = 20 OR (length(${expr}) BETWEEN 22 AND 24 AND substr(${expr}, 20, length(${expr}) - 20) GLOB '.[0-9]*' AND substr(${expr}, 21, length(${expr}) - 21) NOT GLOB '*[^0-9]*'))
-     AND julianday(${expr}) IS NOT NULL
+    WHEN (((instr(${expr}, char(0)) = 0 AND substr(${expr}, 1, 4) > '0000')
+      AND ((length(${expr}) >= 20 AND unicode(substr(${expr}, length(${expr}), 1)) = 90)
+       AND (unicode(substr(${expr}, 11, 1)) = 84 AND ((substr(${expr}, 5, 1) || substr(${expr}, 8, 1)) || (substr(${expr}, 14, 1) || substr(${expr}, 17, 1))) = '--::')))
+     AND ((${sqliteDigits12(expr)} NOT GLOB '*[^0-9]*' AND substr(${expr}, 12, 2) < '24')
+      AND (substr(${expr}, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(${expr}, 1, 19))
+       AND ((length(${expr}) = 20 OR ((length(${expr}) BETWEEN 22 AND 24) AND (substr(${expr}, 20, 1) = '.' AND substr(${expr}, 21, length(${expr}) - 21) NOT GLOB '*[^0-9]*'))) AND julianday(${expr}) IS NOT NULL))))
     THEN julianday(${expr})
     ELSE NULL
   END
@@ -204,8 +212,8 @@ export async function findIrregularRunningAudits(
   const edgeCutoffIso = cutoff.toISOString();
   const repoCutoffIso = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
   const isNullOrInvalid = isPg
-    ? sql`(${audits.workflowInstanceId} IS NULL OR ${pgTimeExpr(audits.startedAt)} IS NULL OR substr(${audits.startedAt}, 1, 4) <= '0000' OR (${audits.startedAt} !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$' AND ((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${pgTimeExpr(audits.startedAt)} < ${edgeCutoffIso}::timestamptz) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${pgTimeExpr(audits.startedAt)} < ${repoCutoffIso}::timestamptz))))`
-    : sql`(${audits.workflowInstanceId} IS NULL OR ${sqliteTimeExpr(audits.startedAt)} IS NULL OR instr(${audits.startedAt}, char(0)) > 0 OR substr(${audits.startedAt}, 1, 4) <= '0000' OR (NOT (${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9]Z' AND substr(${audits.startedAt}, 12, 2) < '24') AND ((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${sqliteTimeExpr(audits.startedAt)} < julianday(${edgeCutoffIso})) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${sqliteTimeExpr(audits.startedAt)} < julianday(${repoCutoffIso})))))`;
+    ? sql`(${audits.workflowInstanceId} IS NULL OR length(trim(${audits.workflowInstanceId})) = 0 OR ${pgTimeExpr(audits.startedAt)} IS NULL OR substr(${audits.startedAt}, 1, 4) <= '0000' OR (${audits.startedAt} !~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$' AND ((${audits.workflowInstanceId} NOT LIKE 'github-audit-%' AND ${pgTimeExpr(audits.startedAt)} < ${edgeCutoffIso}::timestamptz) OR (${audits.workflowInstanceId} LIKE 'github-audit-%' AND ${pgTimeExpr(audits.startedAt)} < ${repoCutoffIso}::timestamptz))))`
+    : sql`((${audits.workflowInstanceId} IS NULL OR length(trim(${audits.workflowInstanceId})) = 0) OR (${sqliteTimeExpr(audits.startedAt)} IS NULL OR (NOT ${sqliteCanonicalIsoCheck(audits.startedAt)} AND ${sqliteTimeExpr(audits.startedAt)} < (CASE WHEN ${audits.workflowInstanceId} GLOB 'github-audit-*' THEN julianday(${repoCutoffIso}) ELSE julianday(${edgeCutoffIso}) END))))`;
 
   const cursorFilter = cursorId
     ? isPg
@@ -244,11 +252,11 @@ export async function getStaleRunningAudits(
 
   const canonicalFormat = isPg
     ? sql`substr(${audits.startedAt}, 1, 4) > '0000' AND ${audits.startedAt} ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T([01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]\\.[0-9]{3}Z$' AND ${pgTimeExpr(audits.startedAt)} IS NOT NULL`
-    : sql`instr(${audits.startedAt}, char(0)) = 0 AND substr(${audits.startedAt}, 1, 4) > '0000' AND ${audits.startedAt} GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9].[0-9][0-9][0-9]Z' AND substr(${audits.startedAt}, 12, 2) < '24' AND ${sqliteTimeExpr(audits.startedAt)} IS NOT NULL`;
+    : sql`${sqliteCanonicalIsoCheck(audits.startedAt)} AND ${sqliteTimeExpr(audits.startedAt)} IS NOT NULL`;
 
   const stalenessPredicate = isPg
-    ? sql`${audits.startedAt} COLLATE "C" < ${edgeCutoffIso} COLLATE "C" AND (${audits.workflowInstanceId} NOT LIKE 'github-audit-%' OR ${audits.startedAt} COLLATE "C" < ${repoCutoffIso} COLLATE "C")`
-    : sql`${audits.startedAt} < ${edgeCutoffIso} AND (${audits.workflowInstanceId} NOT LIKE 'github-audit-%' OR ${audits.startedAt} < ${repoCutoffIso})`;
+    ? sql`length(trim(${audits.workflowInstanceId})) > 0 AND ${audits.startedAt} COLLATE "C" < ${edgeCutoffIso} COLLATE "C" AND (${audits.workflowInstanceId} NOT LIKE 'github-audit-%' OR ${audits.startedAt} COLLATE "C" < ${repoCutoffIso} COLLATE "C")`
+    : sql`length(trim(${audits.workflowInstanceId})) > 0 AND ${audits.startedAt} < ${edgeCutoffIso} AND (${audits.workflowInstanceId} NOT GLOB 'github-audit-*' OR ${audits.startedAt} < ${repoCutoffIso})`;
 
   const cursorPredicate = cursor
     ? isPg

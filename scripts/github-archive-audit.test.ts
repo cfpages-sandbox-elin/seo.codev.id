@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 import crypto from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import {
   capBytes,
   streamToBuffer,
@@ -8,7 +11,16 @@ import {
   isValidRepoSlug,
   selectEffectiveRosterVersion,
   parseTarHtmlFiles,
+  sqlText,
+  loadLocalEnv,
+  buildSqliteEffectiveRosterSql,
 } from "./github-archive-utils";
+import {
+  buildDiagnosticTripleStatements,
+  buildVerifyDiagnosticTripleSql,
+  buildFindMatchingCompletedAuditSql,
+  computeDiagnosticTripleIds,
+} from "./run-github-fleet-audit";
 import { analyzeHtml } from "../src/server/lib/audit/page-analyzer";
 import zlib from "node:zlib";
 
@@ -224,6 +236,166 @@ describe("GitHub Archive & Git Ingestion Utils", () => {
       const result = analyzeHtml(html, "https://example.com/", 200, 50);
       expect(result.truncatedLinks).toBe(true);
       expect(result.links.length).toBe(1000);
+    });
+  });
+
+  describe("R32 diagnostic SQL, size budget, pinned clock & env precedence (V1-01..V1-04, V2-01)", () => {
+    it("encodes safe ASCII compactly via sqlText and fits 253-char host + 291-char memberId under D1 batch and Windows bounds (V1-02)", () => {
+      const host253 = [
+        "a".repeat(63),
+        "b".repeat(63),
+        "c".repeat(63),
+        "d".repeat(58) + ".id",
+      ].join(".");
+      expect(host253.length).toBe(253);
+      expect(isValidCanonicalHostname(host253)).toBe(true);
+      expect(sqlText(host253)).toBe(`'${host253}'`);
+      expect(sqlText("quote'test;1")).toContain("CAST(X'");
+
+      const longMemberId = "m_" + "x".repeat(289);
+      expect(longMemberId.length).toBe(291);
+      const stmts = buildDiagnosticTripleStatements({
+        auditId: "audit_" + "a".repeat(30),
+        projectId: "proj_" + "p".repeat(30),
+        domain: host253,
+        memberId: longMemberId,
+        versionId: "roster_" + "v".repeat(30),
+        organizationId: "shared-workspace",
+        score: 92,
+        grade: "A",
+        coverage: 100,
+        observedAt: "2026-11-27T01:00:00.000Z",
+        clockIso: "2026-11-27T01:00:05.000Z",
+      });
+      expect(stmts).not.toBeNull();
+      expect(stmts!.length).toBe(4);
+      const joined = stmts!.join("\n");
+      const jsonEnvelopeBytes = Buffer.byteLength(
+        JSON.stringify([
+          "d1",
+          "execute",
+          "open-seo-db-selfhost",
+          "--command",
+          joined,
+        ]),
+        "utf8",
+      );
+      expect(Buffer.byteLength(joined, "utf8")).toBeLessThan(14_999);
+      expect(jsonEnvelopeBytes).toBeLessThan(14_999);
+      const conservativeWinChars = 2 * joined.length + 256;
+      expect(conservativeWinChars).toBeLessThan(30_000);
+    });
+
+    it("pins one UTC clock across diagnostic writes, rejects invalid/future observedAt, and verifies with s.* alias (V1-01, V1-03, V1-04)", () => {
+      const clockIso = "2026-11-27T02:00:00.000Z";
+      expect(
+        buildDiagnosticTripleStatements({
+          auditId: "aud_1",
+          projectId: "proj_1",
+          domain: "kaca.co.id",
+          memberId: "mem_1",
+          versionId: "ver_1",
+          organizationId: "shared-workspace",
+          score: 90,
+          grade: "A",
+          coverage: 100,
+          observedAt: "not-a-timestamp",
+          clockIso,
+        }),
+      ).toBeNull();
+
+      expect(
+        buildDiagnosticTripleStatements({
+          auditId: "aud_1",
+          projectId: "proj_1",
+          domain: "kaca.co.id",
+          memberId: "mem_1",
+          versionId: "ver_1",
+          organizationId: "shared-workspace",
+          score: 90,
+          grade: "A",
+          coverage: 100,
+          observedAt: "2026-11-27T02:00:01.000Z",
+          clockIso,
+        }),
+      ).toBeNull();
+
+      const stmts = buildDiagnosticTripleStatements({
+        auditId: "aud_1",
+        projectId: "proj_1",
+        domain: "kaca.co.id",
+        memberId: "mem_1",
+        versionId: "ver_1",
+        organizationId: "shared-workspace",
+        score: 90,
+        grade: "A",
+        coverage: 100,
+        observedAt: "2026-11-27T01:59:59.000Z",
+        clockIso,
+      })!;
+      const pinnedExpr = `julianday('${clockIso}')`;
+      expect(stmts[0]).toContain(pinnedExpr);
+      expect(stmts[3]).toContain("json_extract('{', '$')");
+
+      const ids = computeDiagnosticTripleIds("aud_1", "ver_1", "mem_1");
+      const verifySql = buildVerifyDiagnosticTripleSql(
+        ids.runId,
+        ids.runItemId,
+        ids.snapshotId,
+        "aud_1",
+        "shared-workspace",
+        "ver_1",
+        "mem_1",
+        "proj_1",
+        "kaca.co.id",
+        "completed",
+        "completed",
+        clockIso,
+      );
+      expect(verifySql).toContain("s.coverage = 100");
+      expect(verifySql).toContain("s.score BETWEEN 0 AND 100");
+      expect(verifySql).toContain("s.grade =");
+      expect(verifySql).not.toContain("fs.coverage");
+      expect(verifySql).not.toContain("fs.score");
+      expect(verifySql).not.toContain("fs.grade");
+
+      const reuseSql = buildFindMatchingCompletedAuditSql(
+        "proj_1",
+        "owner/repo",
+        ".",
+        "abc123",
+        "ver_1",
+        clockIso,
+      );
+      expect(reuseSql).toContain("fs.observed_at");
+      expect(reuseSql).toContain("a.completed_at");
+      expect(
+        buildSqliteEffectiveRosterSql("'shared-workspace'", pinnedExpr),
+      ).toContain(pinnedExpr);
+    });
+
+    it("skips blank .env values in loadLocalEnv so populated lower-priority or ambient vars are preserved (V2-01)", () => {
+      const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "openseo-env-test-"));
+      try {
+        fs.writeFileSync(
+          path.join(tmp, ".env.selfhost"),
+          "EMPTY_KEY=\nSHARED_KEY=from_selfhost\n",
+        );
+        fs.writeFileSync(
+          path.join(tmp, ".env.local"),
+          "EMPTY_KEY=from_local\nONLY_LOCAL=yes\n",
+        );
+        const loaded = loadLocalEnv(tmp);
+        expect(loaded.SHARED_KEY).toBe("from_selfhost");
+        expect(loaded.EMPTY_KEY).toBe("from_local");
+        expect(loaded.ONLY_LOCAL).toBe("yes");
+
+        fs.unlinkSync(path.join(tmp, ".env.local"));
+        const reloaded = loadLocalEnv(tmp);
+        expect(reloaded.EMPTY_KEY).toBeUndefined();
+      } finally {
+        fs.rmSync(tmp, { recursive: true, force: true });
+      }
     });
   });
 });

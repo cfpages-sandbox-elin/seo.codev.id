@@ -19,6 +19,7 @@ import {
 } from "../services/fleetConstants";
 import {
   buildFsPlausibleOfficialSql,
+  hydrateLatestAttemptSnapshots,
   normalizeSnapshotRow,
   recoverMemberWeeklyBaselines,
   snapshotSelectColumns,
@@ -198,8 +199,8 @@ export const FleetRepository = {
       : sql`(${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= julianday(${nowIso}))`;
 
     const fsValidClock = isPg
-      ? sql`(${fsObservedExpr} IS NOT NULL AND ${fsObservedExpr} <= ${nowIso}::timestamptz AND ${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= ${nowIso}::timestamptz AND ${fsObservedExpr} <= ${friCompletedExpr})`
-      : sql`(${fsObservedExpr} IS NOT NULL AND ${fsObservedExpr} <= julianday(${nowIso}) AND ${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= julianday(${nowIso}) AND ${fsObservedExpr} <= ${friCompletedExpr})`;
+      ? sql`((${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= ${nowIso}::timestamptz) AND (${fsObservedExpr} IS NOT NULL AND ${fsObservedExpr} <= ${friCompletedExpr}))`
+      : sql`((${friCompletedExpr} IS NOT NULL AND ${friCompletedExpr} <= julianday(${nowIso})) AND (${fsObservedExpr} IS NOT NULL AND ${fsObservedExpr} <= ${friCompletedExpr}))`;
 
     const friHasPlausibleOfficial = sql`(
       fri.status = 'completed'
@@ -212,6 +213,7 @@ export const FleetRepository = {
           AND fs.series_key = fri.primary_series_key
           AND lower(trim(fs.canonical_host)) = lower(trim(rm.canonical_host))
           AND ${fsPlausibleOfficial}
+          AND ${fsValidClock}
       )
     )`;
 
@@ -319,7 +321,19 @@ export const FleetRepository = {
       snapshots.push(normalized);
     }
 
-    const recoveredRunItemIds = new Set<string>();
+    const recoveredRunItemIds = new Set<string>(
+      snapshots.map((s) => s.runItemId),
+    );
+    await hydrateLatestAttemptSnapshots({
+      members: validatedMembers,
+      runItems,
+      organizationId,
+      versionId: version.id,
+      isPg,
+      nowIso,
+      snapshots,
+      seenSnapIds,
+    });
     for (const member of validatedMembers) {
       await recoverMemberWeeklyBaselines({
         member,
@@ -338,7 +352,8 @@ export const FleetRepository = {
     const missingRunItemIds = [...recoveredRunItemIds].filter(
       (id) => !existingRunItemIds.has(id),
     );
-    if (missingRunItemIds.length > 0) {
+    for (let i = 0; i < missingRunItemIds.length; i += 50) {
+      const chunk = missingRunItemIds.slice(i, i + 50);
       const extraItems = await db
         .select({
           id: fleetRunItems.id,
@@ -363,7 +378,7 @@ export const FleetRepository = {
             eq(fleetRuns.rosterVersionId, version.id),
           ),
         )
-        .where(inArray(fleetRunItems.id, missingRunItemIds));
+        .where(inArray(fleetRunItems.id, chunk));
       runItems.push(...extraItems);
     }
 

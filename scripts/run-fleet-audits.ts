@@ -312,9 +312,22 @@ async function main() {
     );
   }
 
-  // Sol R31 V3-02: Census active roster members BEFORE inner-joining projects so unlinked/archived/stale members cannot be silently dropped.
+  // Sol R31 V3-02, R32 V3-01: Census active roster members BEFORE inner-joining projects AND assert persisted count matches declared domain_count.
   let unmappedRosterCount = 0;
+  let shrunkenRosterMismatch = 0;
   if (rosterId) {
+    const persistedRows = runD1Query(
+      `SELECT COUNT(*) AS persisted_count FROM fleet_roster_members WHERE version_id = ${sqlText(rosterId)};`,
+      isRemote,
+    );
+    const persistedCount = Number(persistedRows[0]?.persisted_count ?? 0);
+    const declaredCount = Number(effectiveRoster?.domain_count ?? 0);
+    if (persistedCount !== declaredCount) {
+      shrunkenRosterMismatch = 1;
+      console.error(
+        `[ERROR] Effective roster '${rosterId}' integrity mismatch: persistedMembers (${persistedCount}) !== declaredCount (${declaredCount}).`,
+      );
+    }
     const rosterCensusRows = runD1Query(
       `SELECT rm.id AS member_id, rm.canonical_host, rm.project_id,
               p.id AS active_project_id
@@ -416,19 +429,19 @@ async function main() {
     const seenDomains = new Set<string>();
     const ambiguousDomains = new Set<string>();
     for (const c of candidates) {
-      const d = c.domain.toLowerCase();
+      const d = c.domain.trim().toLowerCase();
       if (seenDomains.has(d)) ambiguousDomains.add(d);
       seenDomains.add(d);
     }
     if (ambiguousDomains.size > 0) {
       ambiguousExcludedCount = candidates.filter((c) =>
-        ambiguousDomains.has(c.domain.toLowerCase()),
+        ambiguousDomains.has(c.domain.trim().toLowerCase()),
       ).length;
       console.warn(
         `[WARNING] Excluding ${ambiguousDomains.size} ambiguous domain(s) (${ambiguousExcludedCount} project row(s)) with duplicate bindings: ${Array.from(ambiguousDomains).join(", ")}`,
       );
       candidates = candidates.filter(
-        (c) => !ambiguousDomains.has(c.domain.toLowerCase()),
+        (c) => !ambiguousDomains.has(c.domain.trim().toLowerCase()),
       );
     }
   }
@@ -729,6 +742,9 @@ async function main() {
   console.log(`Binding Conflicts: ${bindingConflictCount}`);
   console.log(`Active Remaining: ${activeAudits.size}`);
   console.log(`Undispatched Remaining: ${undispatched.length}`);
+  console.log(
+    `Effective Roster Integrity Mismatches: ${shrunkenRosterMismatch}`,
+  );
   const incomplete =
     failedCount +
     bindingConflictCount +
@@ -736,6 +752,7 @@ async function main() {
     undispatched.length +
     skippedBusyCount +
     ambiguousExcludedCount +
+    shrunkenRosterMismatch +
     (!targetDomainFilter ? unmappedRosterCount : 0);
   const emptyBulkPopulation =
     !targetDomainFilter && eligiblePreRecencyCount === 0;

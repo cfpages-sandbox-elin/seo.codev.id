@@ -402,7 +402,7 @@ export const runFleetAuditTool = {
         directNodeArgv,
         executionCommand,
       },
-      text: `${message}\nNative Process Contract (shell: false, cross-platform): executable="node", argv=${JSON.stringify(directNodeArgv)}\nPackage Manager Tuple: executable="pnpm", argv=${JSON.stringify(argv)} (Windows resolves pnpm via .cmd/.ps1 shims)\nPowerShell 7+ Display Command (shell="pwsh"): \`${executionCommand}\`\nNote: Windows PowerShell 5.1 strips literal double quotes under Legacy argument passing; prefer directNodeExecutable + directNodeArgv or PowerShell 7+.`,
+      text: `${message}\nNative Process Contract (shell: false, cross-platform): executable="node", argv=${JSON.stringify(directNodeArgv)}\nPackage Manager Tuple: executable="pnpm", argv=${JSON.stringify(argv)} (Windows resolves pnpm via .cmd/.ps1 shims)\nPowerShell 7.3+ Display Command (shell="pwsh", requires $PSNativeCommandArgumentPassing = 'Standard' or 'Windows'): \`${executionCommand}\`\nNote: Windows PowerShell 5.1 and PowerShell 7.3+ Legacy mode ($PSNativeCommandArgumentPassing = 'Legacy') strip literal double quotes; prefer directNodeExecutable + directNodeArgv or PowerShell 7.3+ Standard/Windows mode.`,
     });
   },
 };

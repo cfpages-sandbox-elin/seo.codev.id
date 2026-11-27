@@ -16,7 +16,8 @@ import {
   existsSync,
   mkdirSync,
 } from "node:fs";
-import { resolve } from "node:path";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
 import { parseArgs } from "node:util";
@@ -35,6 +36,7 @@ import {
   buildSqliteEffectiveRosterSql,
   sqlText,
   normalizeGitRelativePath,
+  parseUtcTimestampMs,
   selectEffectiveRosterVersion,
   executeD1SqlBatches,
   acquireVerifiedBlob,
@@ -51,8 +53,10 @@ import { deterministicAuditRowId } from "../src/server/lib/audit/ids";
 import { getIssueDescriptor } from "../src/shared/audit-issues";
 import { sqliteUtcTimeSql } from "../src/server/features/fleet/services/fleetConstants";
 
-const ENV_FILE = resolve(".env.selfhost");
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const ENV_FILE = resolve(REPO_ROOT, ".env.selfhost");
 const FLEET_MANIFEST_FILE = resolve(
+  REPO_ROOT,
   "src/server/features/fleet/data/fleetManifest.json",
 );
 const PROJECTS_GITHUB_FILE = resolve(
@@ -323,14 +327,14 @@ export type RosterSource = Readonly<{
   publishRoot: string;
 }>;
 
-export function findMatchingCompletedAudit(
+export function buildFindMatchingCompletedAuditSql(
   projectId: string,
   repoName: string,
   publishRoot: string,
   commitSha: string,
   rosterSourceOrVersionId?: RosterSource | string | null,
-  isRemote = true,
-): CompletedAuditMatch | null {
+  clockIso?: string,
+): string {
   const normalizedRoot = normalizeGitRelativePath(publishRoot || ".");
   const rosterSource: RosterSource | null =
     typeof rosterSourceOrVersionId === "object" &&
@@ -342,6 +346,14 @@ export function findMatchingCompletedAudit(
     (typeof rosterSourceOrVersionId === "string"
       ? rosterSourceOrVersionId
       : null);
+
+  const clockExpr = clockIso
+    ? `julianday(${sqlText(clockIso)})`
+    : "julianday('now')";
+  const aCompSql = sqliteUtcTimeSql("a.completed_at");
+  const rCompSql = sqliteUtcTimeSql("r.completed_at");
+  const friCompSql = sqliteUtcTimeSql("fri.completed_at");
+  const fsObsSql = sqliteUtcTimeSql("fs.observed_at");
 
   const rosterSourceSql = rosterSource
     ? `AND json_valid(a.config)
@@ -365,8 +377,7 @@ export function findMatchingCompletedAudit(
       ? `AND r.roster_version_id = ${sqlText(effectiveRosterId)} AND rm.version_id = ${sqlText(effectiveRosterId)}`
       : "";
 
-  const rows = runD1Query(
-    `SELECT a.id, a.config,
+  return `SELECT cand.id, cand.config,
             (
               SELECT CASE
                 WHEN COUNT(DISTINCT r.id) = 1
@@ -374,70 +385,95 @@ export function findMatchingCompletedAudit(
                  AND COUNT(DISTINCT fs.id) = 1
                  AND (
                    SELECT COUNT(*) FROM fleet_run_items fri_all
-                   WHERE fri_all.audit_id = a.id
+                   WHERE fri_all.audit_id = cand.id
                      AND fri_all.primary_series_key = 'diagnostic'
                  ) = 1
                 THEN 1
                 ELSE 0
               END
-              FROM fleet_runs r
-              JOIN fleet_run_items fri ON fri.run_id = r.id
-              JOIN fleet_snapshots fs ON fs.run_item_id = fri.id
+              FROM (
+                SELECT r.id, r.organization_id, r.roster_version_id, r.status, ${rCompSql} AS r_t
+                FROM fleet_runs r
+              ) r
+              JOIN (
+                SELECT fri.id, fri.run_id, fri.member_id, fri.project_id, fri.audit_id, fri.primary_series_key, fri.status, ${friCompSql} AS fri_t
+                FROM fleet_run_items fri
+              ) fri ON fri.run_id = r.id
+              JOIN (
+                SELECT fs.id, fs.run_item_id, fs.member_id, fs.project_id, fs.canonical_host, fs.series_key, fs.coverage, fs.score, fs.grade, ${fsObsSql} AS fs_t
+                FROM fleet_snapshots fs
+              ) fs ON fs.run_item_id = fri.id
               JOIN fleet_roster_members rm ON fri.member_id = rm.id
               JOIN fleet_roster_versions rv ON rv.id = rm.version_id
-              JOIN projects pr ON pr.id = a.project_id AND pr.archived_at IS NULL
-              WHERE fri.audit_id = a.id
-                AND fri.primary_series_key = 'diagnostic'
-                AND fs.series_key = 'diagnostic'
-                AND r.status = 'completed'
-                AND fri.status = 'completed'
-                AND r.roster_version_id = rv.id
-                AND rv.organization_id = r.organization_id
-                AND rv.id = ${buildSqliteEffectiveRosterSql("r.organization_id")}
-                AND rm.enrollment_state = 'active'
-                AND fri.project_id = a.project_id
-                AND fs.project_id = a.project_id
-                AND fs.member_id = fri.member_id
-                AND rm.project_id = pr.id
-                AND lower(trim(pr.domain)) = lower(trim(rm.canonical_host))
-                AND lower(trim(fs.canonical_host)) = lower(trim(rm.canonical_host))
-                AND json_valid(a.config)
-                AND json_extract(a.config, '$.source') = 'github_repository_direct'
-                AND json_extract(a.config, '$.repoName') = rm.repo_name
-                AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(rm.publish_root, '.')
-                AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
-                AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(rm.publish_root, '.')
-                AND json_extract(a.config, '$.rosterSource.versionId') = rv.id
-                AND json_extract(a.config, '$.rosterSource.memberId') = rm.id
-                AND json_extract(a.config, '$.rosterSource.projectId') = pr.id
-                AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(rm.canonical_host))
-                AND json_extract(a.config, '$.rosterSource.repoName') = rm.repo_name
-                AND r.organization_id = 'shared-workspace'
-                AND fs.coverage = 100
-                AND fs.score BETWEEN 0 AND 100
+              JOIN projects pr ON pr.id = cand.project_id AND pr.archived_at IS NULL
+              WHERE (fri.audit_id = cand.id AND fri.primary_series_key = 'diagnostic')
+                AND (fs.series_key = 'diagnostic' AND r.status = 'completed' AND fri.status = 'completed')
+                AND (r.roster_version_id = rv.id AND rv.organization_id = r.organization_id AND rv.id = ${buildSqliteEffectiveRosterSql("r.organization_id", clockExpr)})
+                AND (rm.enrollment_state = 'active' AND fri.project_id = cand.project_id AND fs.project_id = cand.project_id AND fs.member_id = fri.member_id AND rm.project_id = pr.id)
+                AND (lower(trim(pr.domain)) = lower(trim(rm.canonical_host)) AND lower(trim(fs.canonical_host)) = lower(trim(rm.canonical_host)))
+                AND (json_extract(cand.config, '$.repoName') = rm.repo_name AND coalesce(json_extract(cand.config, '$.publishRoot'), '.') = coalesce(rm.publish_root, '.'))
+                AND (json_type(cand.config, '$.rosterSource.publishRoot') = 'text' AND json_extract(cand.config, '$.rosterSource.publishRoot') = coalesce(rm.publish_root, '.'))
+                AND (json_extract(cand.config, '$.rosterSource.versionId') = rv.id AND json_extract(cand.config, '$.rosterSource.memberId') = rm.id AND json_extract(cand.config, '$.rosterSource.projectId') = pr.id)
+                AND (lower(trim(json_extract(cand.config, '$.rosterSource.canonicalHost'))) = lower(trim(rm.canonical_host)) AND json_extract(cand.config, '$.rosterSource.repoName') = rm.repo_name)
+                AND (r.organization_id = 'shared-workspace' AND fs.coverage = 100 AND fs.score BETWEEN 0 AND 100)
                 AND fs.grade = (CASE WHEN fs.score >= 90 THEN 'A' WHEN fs.score >= 80 THEN 'B' WHEN fs.score >= 70 THEN 'C' WHEN fs.score >= 60 THEN 'D' ELSE 'F' END)
+                AND (r.r_t IS NOT NULL AND r.r_t <= ${clockExpr} AND fri.fri_t IS NOT NULL AND fri.fri_t <= ${clockExpr})
+                AND (fs.fs_t IS NOT NULL AND fs.fs_t <= cand.a_t AND fs.fs_t <= fri.fri_t)
                 ${tripleFilter}
             ) AS has_verified_triple
-     FROM audits a
-     WHERE a.project_id = ${sqlText(projectId)}
-       AND a.status = 'completed'
-       AND a.workflow_instance_id LIKE 'github-audit-%'
-       AND a.pages_total > 0
-       AND a.pages_crawled = a.pages_total
-       AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
+     FROM (
+       SELECT a.*, ${aCompSql} AS a_t
+       FROM audits a
+       WHERE a.project_id = ${sqlText(projectId)}
+         AND a.status = 'completed'
+         AND a.workflow_instance_id LIKE 'github-audit-%'
+         AND a.pages_total > 0
+         AND a.pages_crawled = a.pages_total
+         AND json_valid(a.config)
+         AND json_extract(a.config, '$.source') = 'github_repository_direct'
+         AND json_extract(a.config, '$.commitSha') = ${sqlText(commitSha)}
+         AND json_extract(a.config, '$.repoName') = ${sqlText(repoName)}
+         AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = ${sqlText(normalizedRoot)}
+         ${rosterSourceSql}
+     ) cand
+     WHERE cand.a_t IS NOT NULL AND cand.a_t <= ${clockExpr}
+       AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = cand.id) = cand.pages_total
        AND NOT EXISTS (
          SELECT 1 FROM audit_issues i
-         WHERE i.audit_id = a.id AND i.page_id IS NOT NULL
-           AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id)
+         WHERE i.audit_id = cand.id AND i.page_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = cand.id)
        )
-       AND json_valid(a.config)
-       AND json_extract(a.config, '$.source') = 'github_repository_direct'
-       AND json_extract(a.config, '$.commitSha') = ${sqlText(commitSha)}
-       AND json_extract(a.config, '$.repoName') = ${sqlText(repoName)}
-       AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = ${sqlText(normalizedRoot)}
-       ${rosterSourceSql}
-     ORDER BY ${sqliteUtcTimeSql("a.completed_at")} DESC NULLS LAST, a.id COLLATE BINARY DESC
-     LIMIT 1;`,
+     ORDER BY cand.a_t DESC NULLS LAST, cand.id COLLATE BINARY DESC
+     LIMIT 1;`;
+}
+
+export function findMatchingCompletedAudit(
+  projectId: string,
+  repoName: string,
+  publishRoot: string,
+  commitSha: string,
+  rosterSourceOrVersionId?: RosterSource | string | null,
+  isRemote = true,
+): CompletedAuditMatch | null {
+  const normalizedRoot = normalizeGitRelativePath(publishRoot || ".");
+  const rosterSource: RosterSource | null =
+    typeof rosterSourceOrVersionId === "object" &&
+    rosterSourceOrVersionId !== null
+      ? rosterSourceOrVersionId
+      : null;
+  const effectiveRosterId =
+    rosterSource?.versionId ??
+    (typeof rosterSourceOrVersionId === "string"
+      ? rosterSourceOrVersionId
+      : null);
+  const rows = runD1Query(
+    buildFindMatchingCompletedAuditSql(
+      projectId,
+      repoName,
+      publishRoot,
+      commitSha,
+      rosterSourceOrVersionId,
+    ),
     isRemote,
   );
 
@@ -1247,6 +1283,7 @@ async function auditRepository(
       ? `Audit incomplete: ${errorCode} (processed ${processedCount} of ${htmlFiles.length} pages)`
       : null;
 
+    const completedAtIso = new Date().toISOString();
     const casSql = `UPDATE audits
        SET status = ${sqlText(finalStatus)},
            current_phase = ${sqlText(finalStatus)},
@@ -1254,7 +1291,7 @@ async function auditRepository(
            pages_total = ${htmlFiles.length},
            error_code = ${errorCode ? sqlText(errorCode) : "NULL"},
            error_detail = ${errorDetail ? sqlText(errorDetail) : "NULL"},
-           completed_at = ${sqlText(new Date().toISOString())}
+           completed_at = ${sqlText(completedAtIso)}
        WHERE id = ${sqlText(auditId)}
          AND status = 'running'
          AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = ${sqlText(auditId)}) = ${crawledPages.length}
@@ -1411,8 +1448,6 @@ async function auditRepository(
             : processedCount > 0
               ? "partial"
               : "failed";
-          const nowIso = new Date().toISOString();
-
           const isVerified = publishGuardedDiagnosticTriple(
             auditId,
             projectId,
@@ -1426,7 +1461,7 @@ async function auditRepository(
               coverage,
               isComplete,
               processedCount,
-              observedAt: nowIso,
+              observedAt: completedAtIso,
             },
             isRemote,
           );
@@ -1522,26 +1557,11 @@ function deterministicUuid(seed: string): string {
   ].join("-");
 }
 
-// Sol Round 21 F02: Atomic guarded diagnostic publication joining eligible relations before write
-function publishGuardedDiagnosticTriple(
+export function computeDiagnosticTripleIds(
   auditId: string,
-  projectId: string,
-  domain: string,
-  memberId: string,
   versionId: string,
-  organizationId: string,
-  metrics: {
-    score: number;
-    grade: string;
-    coverage: number;
-    isComplete: boolean;
-    processedCount: number;
-    observedAt?: string;
-  },
-  isRemote = true,
-): boolean {
-  const { score, grade, coverage, isComplete, processedCount, observedAt } =
-    metrics;
+  memberId: string,
+) {
   const runId =
     "run_" +
     crypto
@@ -1563,15 +1583,46 @@ function publishGuardedDiagnosticTriple(
       .update(`${auditId}:${versionId}:${memberId}:snap`)
       .digest("hex")
       .slice(0, 16);
+  return { runId, runItemId, snapshotId };
+}
 
-  // Sol Round 24 P1-04: Incomplete or budget-limited runs skip diagnostic publication explicitly
-  if (!isComplete) {
-    console.log(
-      `[DIAGNOSTIC] Audit ${auditId} is incomplete (${isComplete ? "complete" : "incomplete"}). Skipping diagnostic fleet publication.`,
-    );
-    return false;
+export function buildDiagnosticTripleStatements(params: {
+  auditId: string;
+  projectId: string;
+  domain: string;
+  memberId: string;
+  versionId: string;
+  organizationId: string;
+  score: number;
+  grade: string;
+  coverage: number;
+  observedAt: string;
+  clockIso?: string;
+}): string[] | null {
+  const {
+    auditId,
+    projectId,
+    domain,
+    memberId,
+    versionId,
+    organizationId,
+    score,
+    grade,
+    coverage,
+    observedAt,
+    clockIso = new Date().toISOString(),
+  } = params;
+  const obsMs = parseUtcTimestampMs(observedAt);
+  const clockMs = parseUtcTimestampMs(clockIso);
+  if (!Number.isFinite(obsMs) || !Number.isFinite(clockMs) || obsMs > clockMs) {
+    return null;
   }
-  const nowIso = observedAt || new Date().toISOString();
+
+  const { runId, runItemId, snapshotId } = computeDiagnosticTripleIds(
+    auditId,
+    versionId,
+    memberId,
+  );
   const sAudit = sqlText(auditId);
   const sMember = sqlText(memberId);
   const sVersion = sqlText(versionId);
@@ -1581,13 +1632,16 @@ function publishGuardedDiagnosticTriple(
   const sRun = sqlText(runId);
   const sItem = sqlText(runItemId);
   const sSnap = sqlText(snapshotId);
-  const sNow = sqlText(nowIso);
+  const sNow = sqlText(observedAt);
   const sGrade = sqlText(grade);
-  const effectiveVerSql = buildSqliteEffectiveRosterSql("p.org");
+  // Sol R32 V1-02/V1-03: Freeze one UTC clock across the transaction, evaluate effectiveVerSql once in stmt1
+  // (guaranteed atomic across stmt1..stmt3 by stmt4 rollback guard), and use pre-validated UTC ISO julianday for p.ts
+  // so 253-char hosts + 291-char member IDs stay well under D1's 14,999-byte & Windows 30k limits.
+  const txClockSql = `julianday(${sqlText(clockIso)})`;
+  const obsJulianSql = `julianday(${sqlText(new Date(obsMs).toISOString())})`;
+  const effectiveVerSql = buildSqliteEffectiveRosterSql("p.org", txClockSql);
+  const aCompSql = sqliteUtcTimeSql("a.t");
 
-  // Sol Round 24 P1-04, Round 27 A1, Round 30 V1-02/V1-03: Bind every string literal ONCE per statement
-  // via CTE `args` so 253-char hosts + importer-shaped IDs stay well under D1's 14,999-byte atomic batch budget,
-  // and guard nullable FKs via SQLite null-safe `IS NOT`.
   const compactSql = (q: string) => q.replace(/\s+/g, " ").trim();
   const stmt1 = compactSql(`
     WITH args AS (
@@ -1598,11 +1652,13 @@ function publishGuardedDiagnosticTriple(
     eligible AS (
       SELECT a.id, pr.id AS project_id, m.id AS member_id, m.version_id, v.organization_id, p.rid, p.ts
       FROM args p
-      JOIN audits a ON a.id = p.aid
+      JOIN (SELECT id, project_id, status, pages_crawled, pages_total, workflow_instance_id, config, completed_at AS t FROM audits) a ON a.id = p.aid
       JOIN projects pr ON pr.id = a.project_id AND pr.archived_at IS NULL
       JOIN fleet_roster_members m ON m.project_id = pr.id AND m.id = p.mid
       JOIN fleet_roster_versions v ON v.id = m.version_id
       WHERE a.status = 'completed' AND a.pages_crawled = a.pages_total AND a.pages_total > 0
+        AND ${aCompSql} IS NOT NULL AND ${aCompSql} <= ${txClockSql}
+        AND ${obsJulianSql} <= ${aCompSql} AND ${obsJulianSql} <= ${txClockSql}
         AND pr.id = p.pid AND pr.organization_id = p.org AND v.organization_id = p.org
         AND m.enrollment_state = 'active' AND m.version_id = p.vid
         AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
@@ -1635,76 +1691,96 @@ function publishGuardedDiagnosticTriple(
     ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = excluded.completed_at;
   `);
   const stmt2 = compactSql(`
-    WITH args AS (
-      SELECT ${sAudit} AS aid, ${sMember} AS mid, ${sOrg} AS org, ${sProject} AS pid,
-             lower(trim(${sDomain})) AS dom, ${sRun} AS rid, ${sItem} AS iid, ${sSnap} AS sid, ${sNow} AS ts
-    )
     INSERT INTO fleet_run_items (id, run_id, member_id, project_id, audit_id, primary_series_key, status, attempt_count, started_at, completed_at)
-    SELECT p.iid, fr.id, m.id, pr.id, a.id, 'diagnostic', 'completed', 1, fr.completed_at, fr.completed_at
-    FROM args p
-    JOIN fleet_runs fr ON fr.id = p.rid
-    JOIN audits a ON a.id = p.aid
-    JOIN projects pr ON pr.id = a.project_id AND pr.id = p.pid AND pr.archived_at IS NULL AND pr.organization_id = fr.organization_id
-    JOIN fleet_roster_members m ON m.id = p.mid AND m.project_id = pr.id AND m.version_id = fr.roster_version_id AND m.enrollment_state = 'active'
-    JOIN fleet_roster_versions v ON v.id = m.version_id AND v.organization_id = fr.organization_id
-    WHERE fr.organization_id = p.org AND fr.status = 'completed' AND fr.completed_at = p.ts
-      AND v.id = ${effectiveVerSql}
-      AND a.status = 'completed' AND a.pages_crawled = a.pages_total AND a.pages_total > 0
-      AND a.workflow_instance_id LIKE 'github-audit-%'
-      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
-      AND ${coverage} = 100
-      AND ${score} BETWEEN 0 AND 100
-      AND ${sGrade} = (CASE WHEN ${score} >= 90 THEN 'A' WHEN ${score} >= 80 THEN 'B' WHEN ${score} >= 70 THEN 'C' WHEN ${score} >= 60 THEN 'D' ELSE 'F' END)
-      AND NOT EXISTS (SELECT 1 FROM audit_issues i WHERE i.audit_id = a.id AND i.page_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = i.page_id AND p2.audit_id = a.id))
-      AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
-      AND lower(trim(m.canonical_host)) = p.dom
-      AND json_valid(a.config) AND json_extract(a.config, '$.source') = 'github_repository_direct'
-      AND json_extract(a.config, '$.repoName') = m.repo_name
-      AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
-      AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
-      AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
-      AND json_extract(a.config, '$.rosterSource.versionId') = v.id
-      AND json_extract(a.config, '$.rosterSource.memberId') = m.id
-      AND json_extract(a.config, '$.rosterSource.projectId') = pr.id
-      AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
-      AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
-      AND (SELECT COUNT(*) FROM fleet_run_items o WHERE o.audit_id = a.id AND o.primary_series_key = 'diagnostic' AND o.id IS NOT p.iid) = 0
-      AND NOT EXISTS (SELECT 1 FROM fleet_snapshots fs_bad WHERE fs_bad.id = p.sid AND (fs_bad.run_item_id IS NOT p.iid OR fs_bad.member_id IS NOT m.id OR fs_bad.project_id IS NOT pr.id OR lower(trim(coalesce(fs_bad.canonical_host, ''))) IS NOT lower(trim(m.canonical_host)) OR fs_bad.series_key IS NOT 'diagnostic'))
+    SELECT ${sItem}, fr.id, m.id, pr.id, a.id, 'diagnostic', 'completed', 1, fr.completed_at, fr.completed_at
+    FROM fleet_runs fr
+    JOIN audits a ON a.id = ${sAudit}
+    JOIN projects pr ON pr.id = a.project_id AND pr.id = ${sProject} AND pr.archived_at IS NULL AND pr.organization_id = fr.organization_id
+    JOIN fleet_roster_members m ON m.id = ${sMember} AND m.project_id = pr.id AND m.version_id = fr.roster_version_id AND m.enrollment_state = 'active'
+    WHERE fr.id = ${sRun} AND fr.organization_id = ${sOrg} AND fr.roster_version_id = ${sVersion} AND fr.status = 'completed' AND fr.completed_at = ${sNow}
+      AND a.status = 'completed' AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
+      AND (SELECT COUNT(*) FROM fleet_run_items o WHERE o.audit_id = a.id AND o.primary_series_key = 'diagnostic' AND o.id IS NOT ${sItem}) = 0
     ON CONFLICT(id) DO UPDATE SET status = 'completed', completed_at = excluded.completed_at;
   `);
   const stmt3 = compactSql(`
-    WITH args AS (
-      SELECT ${sItem} AS iid, ${sSnap} AS sid, ${sOrg} AS org, lower(trim(${sDomain})) AS dom, ${sNow} AS ts
-    )
     INSERT INTO fleet_snapshots (id, run_item_id, member_id, project_id, canonical_host, score, grade, coverage, series_key, score_technical, score_internal_links, score_on_page, score_mobile_perf, score_schema, score_ai_readiness, observed_at)
-    SELECT p.sid, fri.id, fri.member_id, fri.project_id, m.canonical_host, ${score}, ${sGrade}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, fri.completed_at
-    FROM args p
-    JOIN fleet_run_items fri ON fri.id = p.iid
+    SELECT ${sSnap}, fri.id, fri.member_id, fri.project_id, m.canonical_host, ${score}, ${sGrade}, ${coverage}, 'diagnostic', NULL, NULL, NULL, NULL, NULL, NULL, fri.completed_at
+    FROM fleet_run_items fri
     JOIN fleet_runs fr ON fr.id = fri.run_id
     JOIN audits a ON a.id = fri.audit_id
     JOIN projects pr ON pr.id = fri.project_id AND pr.archived_at IS NULL AND pr.organization_id = fr.organization_id
     JOIN fleet_roster_members m ON m.id = fri.member_id AND m.project_id = pr.id AND m.version_id = fr.roster_version_id AND m.enrollment_state = 'active'
-    JOIN fleet_roster_versions v ON v.id = m.version_id AND v.organization_id = fr.organization_id
-    WHERE fr.organization_id = p.org AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' AND fri.completed_at = p.ts
-      AND fr.status = 'completed' AND fr.completed_at = p.ts
-      AND v.id = ${effectiveVerSql}
-      AND a.status = 'completed' AND a.pages_crawled = a.pages_total AND a.pages_total > 0 AND a.workflow_instance_id LIKE 'github-audit-%'
-      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
-      AND ${coverage} = 100
-      AND ${score} BETWEEN 0 AND 100
+    WHERE fri.id = ${sItem} AND fri.primary_series_key = 'diagnostic' AND fri.status = 'completed' AND fri.completed_at = ${sNow}
+      AND fr.status = 'completed' AND fr.completed_at = ${sNow} AND a.status = 'completed'
+      AND ${coverage} = 100 AND ${score} BETWEEN 0 AND 100
       AND ${sGrade} = (CASE WHEN ${score} >= 90 THEN 'A' WHEN ${score} >= 80 THEN 'B' WHEN ${score} >= 70 THEN 'C' WHEN ${score} >= 60 THEN 'D' ELSE 'F' END)
       AND lower(trim(pr.domain)) = lower(trim(m.canonical_host))
-      AND lower(trim(m.canonical_host)) = p.dom
-      AND json_valid(a.config) AND json_extract(a.config, '$.source') = 'github_repository_direct'
-      AND json_extract(a.config, '$.repoName') = m.repo_name
-      AND json_extract(a.config, '$.rosterSource.versionId') = v.id
-      AND json_extract(a.config, '$.rosterSource.memberId') = m.id
-      AND json_extract(a.config, '$.rosterSource.projectId') = pr.id
-      AND (SELECT COUNT(*) FROM fleet_run_items o WHERE o.audit_id = a.id AND o.primary_series_key = 'diagnostic' AND o.id IS NOT fri.id) = 0
     ON CONFLICT(id) DO UPDATE SET score = ${score}, grade = ${sGrade}, coverage = ${coverage}, observed_at = excluded.observed_at;
   `);
+  // Transactional completeness invariant: abort & roll back the atomic batch if any partial triple state exists
+  const stmt4 = compactSql(`
+    SELECT CASE WHEN EXISTS (SELECT 1 FROM fleet_runs WHERE id = ${sRun})
+      AND (NOT EXISTS (SELECT 1 FROM fleet_run_items WHERE id = ${sItem} AND run_id = ${sRun})
+        OR NOT EXISTS (SELECT 1 FROM fleet_snapshots WHERE id = ${sSnap} AND run_item_id = ${sItem}))
+      THEN json_extract('{', '$') ELSE 1 END;
+  `);
+  return [stmt1, stmt2, stmt3, stmt4];
+}
 
-  const diagnosticSql = [stmt1, stmt2, stmt3];
+// Sol Round 21 F02: Atomic guarded diagnostic publication joining eligible relations before write
+export function publishGuardedDiagnosticTriple(
+  auditId: string,
+  projectId: string,
+  domain: string,
+  memberId: string,
+  versionId: string,
+  organizationId: string,
+  metrics: {
+    score: number;
+    grade: string;
+    coverage: number;
+    isComplete: boolean;
+    processedCount: number;
+    observedAt?: string;
+  },
+  isRemote = true,
+): boolean {
+  const { score, grade, coverage, isComplete, processedCount, observedAt } =
+    metrics;
+  const { runId, runItemId, snapshotId } = computeDiagnosticTripleIds(
+    auditId,
+    versionId,
+    memberId,
+  );
+
+  // Sol Round 24 P1-04: Incomplete or budget-limited runs skip diagnostic publication explicitly
+  if (!isComplete) {
+    console.log(
+      `[DIAGNOSTIC] Audit ${auditId} is incomplete (${isComplete ? "complete" : "incomplete"}). Skipping diagnostic fleet publication.`,
+    );
+    return false;
+  }
+  const clockIso = new Date().toISOString();
+  const nowIso = observedAt || clockIso;
+  const diagnosticSql = buildDiagnosticTripleStatements({
+    auditId,
+    projectId,
+    domain,
+    memberId,
+    versionId,
+    organizationId,
+    score,
+    grade,
+    coverage,
+    observedAt: nowIso,
+    clockIso,
+  });
+  if (!diagnosticSql) {
+    console.error(
+      `[DIAGNOSTIC] Rejecting invalid or future observedAt '${nowIso}' for ${auditId}.`,
+    );
+    return false;
+  }
 
   executeD1SqlBatches(diagnosticSql, isRemote, { atomic: true });
   const isVerified = verifyDiagnosticTriple(
@@ -1742,7 +1818,7 @@ function publishGuardedDiagnosticTriple(
   return true;
 }
 
-function verifyDiagnosticTriple(
+export function buildVerifyDiagnosticTripleSql(
   runId: string,
   runItemId: string,
   snapshotId: string,
@@ -1754,66 +1830,62 @@ function verifyDiagnosticTriple(
   canonicalHost: string,
   expectedRunStatus = "completed",
   expectedItemStatus = "completed",
-  isRemote = true,
-): boolean {
-  const effectiveVerSql = buildSqliteEffectiveRosterSql("r.organization_id");
-  const query = `
+  clockIso?: string,
+): string {
+  const clockExpr = clockIso
+    ? `julianday(${sqlText(clockIso)})`
+    : "julianday('now')";
+  const effectiveVerSql = buildSqliteEffectiveRosterSql(
+    "r.organization_id",
+    clockExpr,
+  );
+  const aCompSql = sqliteUtcTimeSql("a.completed_at");
+  const rCompSql = sqliteUtcTimeSql("r.completed_at");
+  const iCompSql = sqliteUtcTimeSql("i.completed_at");
+  const sObsSql = sqliteUtcTimeSql("s.observed_at");
+  return `
     SELECT r.id as run_id, i.id as item_id, s.id as snap_id
-    FROM fleet_runs r
-    JOIN fleet_run_items i ON i.run_id = r.id
-    JOIN fleet_snapshots s ON s.run_item_id = i.id
-    JOIN audits a ON a.id = i.audit_id
+    FROM (
+      SELECT r.id, r.organization_id, r.roster_version_id, r.status, ${rCompSql} AS r_t
+      FROM fleet_runs r
+      WHERE r.id = ${sqlText(runId)}
+    ) r
+    JOIN (
+      SELECT i.id, i.run_id, i.audit_id, i.member_id, i.project_id, i.primary_series_key, i.status, ${iCompSql} AS i_t
+      FROM fleet_run_items i
+      WHERE i.id = ${sqlText(runItemId)}
+    ) i ON i.run_id = r.id
+    JOIN (
+      SELECT s.id, s.run_item_id, s.member_id, s.project_id, s.canonical_host, s.series_key, s.coverage, s.score, s.grade, ${sObsSql} AS s_t
+      FROM fleet_snapshots s
+      WHERE s.id = ${sqlText(snapshotId)}
+    ) s ON s.run_item_id = i.id
+    JOIN (
+      SELECT a.id, a.project_id, a.status, a.pages_total, a.pages_crawled, a.workflow_instance_id, a.config, ${aCompSql} AS a_t
+      FROM audits a
+      WHERE a.id = ${sqlText(auditId)}
+    ) a ON a.id = i.audit_id
     JOIN projects pr ON pr.id = a.project_id AND pr.archived_at IS NULL
     JOIN fleet_roster_members m ON m.id = i.member_id
     JOIN fleet_roster_versions v ON v.id = m.version_id
-    WHERE r.id = ${sqlText(runId)}
-      AND i.id = ${sqlText(runItemId)}
-      AND s.id = ${sqlText(snapshotId)}
-      AND r.organization_id = ${sqlText(orgId)}
-      AND r.roster_version_id = ${sqlText(rosterId)}
-      AND v.id = ${sqlText(rosterId)}
-      AND v.organization_id = r.organization_id
-      AND v.id = ${effectiveVerSql}
-      AND m.id = ${sqlText(memberId)}
-      AND m.project_id = pr.id
-      AND m.enrollment_state = 'active'
-      AND pr.organization_id = r.organization_id
-      AND i.audit_id = ${sqlText(auditId)}
-      AND i.member_id = ${sqlText(memberId)}
-      AND i.project_id = ${sqlText(projectId)}
-      AND s.member_id = ${sqlText(memberId)}
-      AND s.project_id = ${sqlText(projectId)}
-      AND lower(trim(s.canonical_host)) = lower(trim(${sqlText(canonicalHost)}))
-      AND lower(trim(m.canonical_host)) = lower(trim(pr.domain))
-      AND lower(trim(m.canonical_host)) = lower(trim(${sqlText(canonicalHost)}))
-      AND i.primary_series_key = 'diagnostic'
-      AND s.series_key = 'diagnostic'
-      AND r.status = ${sqlText(expectedRunStatus)}
-      AND i.status = ${sqlText(expectedItemStatus)}
-      AND a.status = 'completed'
-      AND a.pages_total > 0
-      AND a.pages_crawled = a.pages_total
-      AND a.workflow_instance_id LIKE 'github-audit-%'
-      AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total
+    WHERE (r.organization_id = ${sqlText(orgId)} AND r.roster_version_id = ${sqlText(rosterId)} AND v.id = ${sqlText(rosterId)})
+      AND (v.organization_id = r.organization_id AND v.id = ${effectiveVerSql})
+      AND (m.id = ${sqlText(memberId)} AND m.project_id = pr.id AND m.enrollment_state = 'active' AND pr.organization_id = r.organization_id)
+      AND (i.member_id = ${sqlText(memberId)} AND i.project_id = ${sqlText(projectId)} AND s.member_id = ${sqlText(memberId)} AND s.project_id = ${sqlText(projectId)})
+      AND (lower(trim(s.canonical_host)) = lower(trim(${sqlText(canonicalHost)})) AND lower(trim(m.canonical_host)) = lower(trim(pr.domain)) AND lower(trim(m.canonical_host)) = lower(trim(${sqlText(canonicalHost)})))
+      AND (i.primary_series_key = 'diagnostic' AND s.series_key = 'diagnostic' AND r.status = ${sqlText(expectedRunStatus)} AND i.status = ${sqlText(expectedItemStatus)} AND a.status = 'completed')
+      AND (a.a_t IS NOT NULL AND a.a_t <= ${clockExpr} AND r.r_t IS NOT NULL AND r.r_t <= ${clockExpr})
+      AND (i.i_t IS NOT NULL AND i.i_t <= ${clockExpr} AND s.s_t IS NOT NULL AND s.s_t <= a.a_t AND s.s_t <= i.i_t)
+      AND (a.pages_total > 0 AND a.pages_crawled = a.pages_total AND a.workflow_instance_id LIKE 'github-audit-%' AND (SELECT COUNT(*) FROM audit_pages WHERE audit_id = a.id) = a.pages_total)
       AND NOT EXISTS (
         SELECT 1 FROM audit_issues ai
         WHERE ai.audit_id = a.id AND ai.page_id IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM audit_pages p2 WHERE p2.id = ai.page_id AND p2.audit_id = a.id)
       )
-      AND fs.coverage = 100
-      AND fs.score BETWEEN 0 AND 100
-      AND fs.grade = (CASE WHEN fs.score >= 90 THEN 'A' WHEN fs.score >= 80 THEN 'B' WHEN fs.score >= 70 THEN 'C' WHEN fs.score >= 60 THEN 'D' ELSE 'F' END)
-      AND json_valid(a.config)
-      AND json_extract(a.config, '$.source') = 'github_repository_direct'
-      AND json_extract(a.config, '$.repoName') = m.repo_name
-      AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.')
-      AND json_type(a.config, '$.rosterSource.publishRoot') = 'text'
-      AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.')
-      AND json_extract(a.config, '$.rosterSource.versionId') = v.id
-      AND json_extract(a.config, '$.rosterSource.memberId') = m.id
-      AND json_extract(a.config, '$.rosterSource.projectId') = pr.id
-      AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host))
-      AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name
+      AND (s.coverage = 100 AND s.score BETWEEN 0 AND 100 AND s.grade = (CASE WHEN s.score >= 90 THEN 'A' WHEN s.score >= 80 THEN 'B' WHEN s.score >= 70 THEN 'C' WHEN s.score >= 60 THEN 'D' ELSE 'F' END))
+      AND (json_valid(a.config) AND json_extract(a.config, '$.source') = 'github_repository_direct' AND json_extract(a.config, '$.repoName') = m.repo_name AND coalesce(json_extract(a.config, '$.publishRoot'), '.') = coalesce(m.publish_root, '.'))
+      AND (json_type(a.config, '$.rosterSource.publishRoot') = 'text' AND json_extract(a.config, '$.rosterSource.publishRoot') = coalesce(m.publish_root, '.') AND json_extract(a.config, '$.rosterSource.versionId') = v.id)
+      AND (json_extract(a.config, '$.rosterSource.memberId') = m.id AND json_extract(a.config, '$.rosterSource.projectId') = pr.id AND lower(trim(json_extract(a.config, '$.rosterSource.canonicalHost'))) = lower(trim(m.canonical_host)) AND json_extract(a.config, '$.rosterSource.repoName') = m.repo_name)
       AND 1 = (
         SELECT CASE
           WHEN COUNT(DISTINCT fr.id) = 1 AND COUNT(DISTINCT fri.id) = 1 AND COUNT(DISTINCT fs.id) = 1
@@ -1837,6 +1909,35 @@ function verifyDiagnosticTriple(
           AND fri.status = ${sqlText(expectedItemStatus)}
       );
   `;
+}
+
+export function verifyDiagnosticTriple(
+  runId: string,
+  runItemId: string,
+  snapshotId: string,
+  auditId: string,
+  orgId: string,
+  rosterId: string,
+  memberId: string,
+  projectId: string,
+  canonicalHost: string,
+  expectedRunStatus = "completed",
+  expectedItemStatus = "completed",
+  isRemote = true,
+): boolean {
+  const query = buildVerifyDiagnosticTripleSql(
+    runId,
+    runItemId,
+    snapshotId,
+    auditId,
+    orgId,
+    rosterId,
+    memberId,
+    projectId,
+    canonicalHost,
+    expectedRunStatus,
+    expectedItemStatus,
+  );
   const res = runD1Query(query, isRemote);
   return res.length === 1;
 }
@@ -1972,7 +2073,14 @@ function repairDiagnosticObservation(
               : "F";
     const coverage =
       Math.round((crawled / Math.max(1, total)) * 100 * 100) / 100;
-    const observedAt = completed_at || new Date().toISOString();
+    const completedMs = parseUtcTimestampMs(completed_at);
+    if (!Number.isFinite(completedMs) || completedMs > Date.now()) {
+      console.warn(
+        `[REPAIR] Skipping diagnostic repair for ${domain} (${auditId}): invalid or future parent completion timestamp '${completed_at ?? ""}'.`,
+      );
+      return false;
+    }
+    const observedAt = String(completed_at).trim();
 
     const isVerified = publishGuardedDiagnosticTriple(
       auditId,
@@ -2685,7 +2793,12 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("Fatal GitHub Fleet Audit Runner Error:", err);
-  process.exit(1);
-});
+if (
+  process.argv[1] &&
+  resolve(process.argv[1]) === resolve(fileURLToPath(import.meta.url))
+) {
+  main().catch((err) => {
+    console.error("Fatal GitHub Fleet Audit Runner Error:", err);
+    process.exit(1);
+  });
+}

@@ -32,12 +32,12 @@ async function reconcileOneIrregularRow(
   const { cutoffMs, remainingMs, isActive, withTimeout, reconcileRow } = ctx;
   if (!isActive() || remainingMs() < 250) return "budget_exhausted";
   const parsedMs = parseUtcTimestampMs(row.startedAt);
-  if (!row.workflowInstanceId) {
+  if (!row.workflowInstanceId || row.workflowInstanceId.trim().length === 0) {
     if (!Number.isFinite(parsedMs) || parsedMs < cutoffMs) {
       await withTimeout(
-        AuditRepository.failAudit(row.id, null, {
+        AuditRepository.failAudit(row.id, row.workflowInstanceId, {
           errorCode: "instance_lost",
-          errorDetail: "Legacy running audit has null workflow instance ID",
+          errorDetail: "Legacy running audit has missing workflow instance ID",
           failedPhase: row.currentPhase,
         }),
         Math.min(3_000, remainingMs()),

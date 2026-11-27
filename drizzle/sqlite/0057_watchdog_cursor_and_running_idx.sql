@@ -20,24 +20,36 @@ WHERE `status` = 'running'
         CASE
           WHEN instr(`started_at`, char(0)) = 0
            AND substr(`started_at`, 1, 4) > '0000'
-           AND substr(`started_at`, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
+           AND substr(`started_at`, 5, 1) = '-' AND substr(`started_at`, 8, 1) = '-' AND substr(`started_at`, 11, 1) = ' '
+           AND substr(`started_at`, 14, 1) = ':' AND substr(`started_at`, 17, 1) = ':'
+           AND (substr(`started_at`, 1, 4) || substr(`started_at`, 6, 2) || substr(`started_at`, 9, 2) || substr(`started_at`, 12, 2) || substr(`started_at`, 15, 2) || substr(`started_at`, 18, 2)) NOT GLOB '*[^0-9]*'
            AND substr(`started_at`, 12, 2) < '24'
            AND substr(`started_at`, 1, 19) = strftime('%Y-%m-%d %H:%M:%S', substr(`started_at`, 1, 19))
-           AND (length(`started_at`) = 19 OR (length(`started_at`) BETWEEN 21 AND 23 AND substr(`started_at`, 20) GLOB '.[0-9]*' AND substr(`started_at`, 21) NOT GLOB '*[^0-9]*'))
+           AND (length(`started_at`) = 19 OR (length(`started_at`) BETWEEN 21 AND 23 AND substr(`started_at`, 20, 1) = '.' AND substr(`started_at`, 21) NOT GLOB '*[^0-9]*'))
            AND julianday(`started_at`) IS NOT NULL
           THEN julianday(`started_at`)
           WHEN instr(`started_at`, char(0)) = 0
            AND substr(`started_at`, 1, 4) > '0000'
-           AND `started_at` GLOB '*Z'
-           AND substr(`started_at`, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-2][0-9]:[0-5][0-9]:[0-5][0-9]'
+           AND length(`started_at`) >= 20
+           AND unicode(substr(`started_at`, length(`started_at`), 1)) = 90
+           AND substr(`started_at`, 5, 1) = '-' AND substr(`started_at`, 8, 1) = '-' AND unicode(substr(`started_at`, 11, 1)) = 84
+           AND substr(`started_at`, 14, 1) = ':' AND substr(`started_at`, 17, 1) = ':'
+           AND (substr(`started_at`, 1, 4) || substr(`started_at`, 6, 2) || substr(`started_at`, 9, 2) || substr(`started_at`, 12, 2) || substr(`started_at`, 15, 2) || substr(`started_at`, 18, 2)) NOT GLOB '*[^0-9]*'
            AND substr(`started_at`, 12, 2) < '24'
            AND substr(`started_at`, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(`started_at`, 1, 19))
-           AND (length(`started_at`) = 20 OR (length(`started_at`) BETWEEN 22 AND 24 AND substr(`started_at`, 20, length(`started_at`) - 20) GLOB '.[0-9]*' AND substr(`started_at`, 21, length(`started_at`) - 21) NOT GLOB '*[^0-9]*'))
+           AND (length(`started_at`) = 20 OR (length(`started_at`) BETWEEN 22 AND 24 AND substr(`started_at`, 20, 1) = '.' AND substr(`started_at`, 21, length(`started_at`) - 21) NOT GLOB '*[^0-9]*'))
            AND julianday(`started_at`) IS NOT NULL
           THEN julianday(`started_at`)
           WHEN instr(`started_at`, char(0)) = 0
            AND substr(`started_at`, 1, 4) > '0000'
-           AND `started_at` GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*[+-][0-9][0-9]:[0-9][0-9]'
+           AND length(`started_at`) >= 25
+           AND substr(`started_at`, 5, 1) = '-' AND substr(`started_at`, 8, 1) = '-' AND unicode(substr(`started_at`, 11, 1)) = 84
+           AND substr(`started_at`, 14, 1) = ':' AND substr(`started_at`, 17, 1) = ':'
+           AND (substr(`started_at`, 1, 4) || substr(`started_at`, 6, 2) || substr(`started_at`, 9, 2) || substr(`started_at`, 12, 2) || substr(`started_at`, 15, 2) || substr(`started_at`, 18, 2)) NOT GLOB '*[^0-9]*'
+           AND substr(`started_at`, length(`started_at`) - 5, 1) IN ('+', '-')
+           AND substr(`started_at`, length(`started_at`) - 2, 1) = ':'
+           AND (substr(`started_at`, length(`started_at`) - 4, 2) || substr(`started_at`, length(`started_at`) - 1, 2)) NOT GLOB '*[^0-9]*'
+           AND (length(`started_at`) = 25 OR (length(`started_at`) BETWEEN 27 AND 29 AND substr(`started_at`, 20, 1) = '.' AND substr(`started_at`, 21, length(`started_at`) - 27) NOT GLOB '*[^0-9]*'))
            AND substr(`started_at`, 12, 2) < '24'
            AND substr(`started_at`, 1, 19) = strftime('%Y-%m-%dT%H:%M:%S', substr(`started_at`, 1, 19))
            AND julianday(`started_at`) IS NOT NULL
@@ -66,7 +78,17 @@ WHERE `status` = 'running'
 UPDATE `audits`
 SET `started_at` = strftime('%Y-%m-%dT%H:%M:%fZ', julianday(`started_at`))
 WHERE `status` = 'running'
-  AND NOT (`started_at` GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z');
+  AND NOT (
+    instr(`started_at`, char(0)) = 0
+    AND length(`started_at`) = 24
+    AND substr(`started_at`, 1, 4) > '0000'
+    AND unicode(substr(`started_at`, 11, 1)) = 84
+    AND unicode(substr(`started_at`, 24, 1)) = 90
+    AND substr(`started_at`, 5, 1) = '-' AND substr(`started_at`, 8, 1) = '-'
+    AND substr(`started_at`, 14, 1) = ':' AND substr(`started_at`, 17, 1) = ':' AND substr(`started_at`, 20, 1) = '.'
+    AND (substr(`started_at`, 1, 4) || substr(`started_at`, 6, 2) || substr(`started_at`, 9, 2) || substr(`started_at`, 12, 2) || substr(`started_at`, 15, 2) || substr(`started_at`, 18, 2) || substr(`started_at`, 21, 3)) NOT GLOB '*[^0-9]*'
+    AND substr(`started_at`, 12, 2) < '24'
+  );
 --> statement-breakpoint
 CREATE UNIQUE INDEX IF NOT EXISTS `audits_project_running_idx` ON `audits` (`project_id`) WHERE status = 'running';
 --> statement-breakpoint

@@ -201,4 +201,28 @@ describe("auditReconciler hardening (V4-01, V4-03, V4-04)", () => {
       vi.useRealTimers();
     }
   });
+
+  it("reclaims empty-string workflowInstanceId irregular audits using exact empty string match (Sol R32 V4-06)", async () => {
+    mocks.findIrregularRunningAudits.mockResolvedValueOnce([
+      {
+        id: "irr_empty_wf",
+        workflowInstanceId: "",
+        startedAt: "2026-01-01T00:00:00.000Z",
+        currentPhase: "crawling",
+      },
+    ]);
+    mocks.failAudit.mockResolvedValueOnce(true);
+    mocks.getStaleRunningAudits.mockResolvedValueOnce([]);
+
+    await reconcileStaleAudits();
+
+    expect(mocks.workflowGet).not.toHaveBeenCalled();
+    expect(mocks.failAudit).toHaveBeenCalledWith(
+      "irr_empty_wf",
+      "",
+      expect.objectContaining({
+        errorCode: "instance_lost",
+      }),
+    );
+  });
 });
